@@ -10,6 +10,7 @@ The backend supports:
 - discovered-link logging
 - full-text search and search context reports
 - source-linked observations for terms, motifs, places, materials, and processes
+- optional evidence-only AI retrieval using embeddings and cited corpus passages
 
 This repo can be pushed and tracked independently while still integrating with the original backend through the files listed in `INTEGRATION.md`.
 
@@ -76,6 +77,32 @@ storage/repository
 ```
 
 This folder is ignored by Git so the standalone repository stays lightweight.
+
+## Optional AI Retrieval
+
+Phase 4 AI features are optional. Exact search, extraction, and observations work without Ollama.
+
+To enable semantic search and Ask Corpus, run Ollama and set:
+
+```env
+REPOSITORY_OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_EMBEDDING_MODEL=nomic-embed-text
+OLLAMA_RETRIEVAL_MODEL=llama3.1
+```
+
+Recommended local models:
+
+```bash
+ollama pull nomic-embed-text
+ollama pull llama3.1
+```
+
+The AI layer is evidence-only:
+
+- semantic search returns retrieved passages with source/page/segment citations
+- Ask Corpus answers only from retrieved passages
+- responses must say when evidence is weak or absent
+- observations remain human-reviewed source records, not AI interpretations
 
 ## Standalone Repository Setup
 

@@ -1,4 +1,6 @@
 import os
+import json
+import math
 import re
 import sqlite3
 import uuid
@@ -13,6 +15,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from app.infra.settings import OLLAMA_BASE_URL
 
 
 router = APIRouter(prefix="/repository", tags=["repository"])
@@ -24,6 +27,10 @@ STORAGE_ROOT = os.getenv(
 )
 FILES_ROOT = os.path.join(STORAGE_ROOT, "files")
 DB_PATH = os.path.join(STORAGE_ROOT, "repository.sqlite")
+OLLAMA_REPOSITORY_BASE_URL = os.getenv("REPOSITORY_OLLAMA_BASE_URL", OLLAMA_BASE_URL).rstrip("/")
+OLLAMA_EMBEDDING_MODEL = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+OLLAMA_RETRIEVAL_MODEL = os.getenv("OLLAMA_RETRIEVAL_MODEL", "llama3.1")
+EMBEDDING_TEXT_LIMIT = 2000
 
 SOURCE_TYPES = {
     "publication",
@@ -123,6 +130,25 @@ class ObservationUpdate(BaseModel):
     context_quote: Optional[str] = None
     notes: Optional[str] = None
     observed_by: Optional[str] = Field(default=None, max_length=255)
+
+
+class SemanticSearchRequest(BaseModel):
+    query: str = Field(..., min_length=2, max_length=500)
+    material_id: Optional[str] = None
+    limit: int = Field(default=12, ge=1, le=50)
+    include_observations: bool = True
+
+
+class AskCorpusRequest(BaseModel):
+    question: str = Field(..., min_length=2, max_length=1000)
+    material_id: Optional[str] = None
+    max_results: int = Field(default=8, ge=1, le=20)
+
+
+class BuildSemanticIndexRequest(BaseModel):
+    material_id: Optional[str] = None
+    limit: int = Field(default=200, ge=1, le=1000)
+    force: bool = False
 
 @dataclass
 class SegmentInput:
@@ -299,6 +325,21 @@ def init_repository_db():
         )
         con.execute(
             """
+            CREATE TABLE IF NOT EXISTS segment_embeddings (
+                segment_id INTEGER PRIMARY KEY,
+                material_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                embedding_json TEXT NOT NULL,
+                embedded_at TEXT NOT NULL,
+                FOREIGN KEY(segment_id) REFERENCES extracted_segments(id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY(material_id) REFERENCES materials(id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+        con.execute(
+            """
             CREATE VIRTUAL TABLE IF NOT EXISTS extracted_segments_fts
             USING fts5(
                 content_text,
@@ -352,6 +393,9 @@ def init_repository_db():
         )
         con.execute(
             "CREATE INDEX IF NOT EXISTS idx_observations_type ON observations(observation_type)"
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_segment_embeddings_material ON segment_embeddings(material_id)"
         )
 
 
@@ -524,6 +568,337 @@ def ensure_segment_belongs_to_material(
             detail="source_segment_id does not belong to this material",
         )
     return row
+
+
+def normalize_vector(vector: list[float]) -> list[float]:
+    magnitude = math.sqrt(sum(value * value for value in vector))
+    if magnitude == 0:
+        return vector
+    return [value / magnitude for value in vector]
+
+
+def cosine_similarity(left: list[float], right: list[float]) -> float:
+    if not left or not right or len(left) != len(right):
+        return 0.0
+    return sum(a * b for a, b in zip(left, right))
+
+
+def citation_from_segment(row: sqlite3.Row) -> dict:
+    return {
+        "material_id": row["material_id"],
+        "material_title": row["material_title"],
+        "material_authors": row["material_authors"],
+        "material_year": row["material_year"],
+        "segment_id": row["segment_id"],
+        "page_ref": row["page_ref"],
+        "source_locator": row["source_locator"],
+    }
+
+
+def observation_from_row(row: sqlite3.Row) -> dict:
+    return dict(row)
+
+
+def get_related_observations_for_segments(
+    con: sqlite3.Connection,
+    segment_ids: list[int],
+    material_ids: list[str],
+    limit: int = 40,
+) -> list[dict]:
+    if not segment_ids and not material_ids:
+        return []
+
+    clauses = []
+    params: list[object] = []
+
+    if segment_ids:
+        placeholders = ",".join("?" for _ in segment_ids)
+        clauses.append(f"source_segment_id IN ({placeholders})")
+        params.extend(segment_ids)
+
+    if material_ids:
+        placeholders = ",".join("?" for _ in material_ids)
+        clauses.append(f"material_id IN ({placeholders})")
+        params.extend(material_ids)
+
+    rows = con.execute(
+        f"""
+        SELECT *
+        FROM observations
+        WHERE {" OR ".join(clauses)}
+        ORDER BY updated_at DESC
+        LIMIT ?
+        """,
+        (*params, limit),
+    ).fetchall()
+
+    return [observation_from_row(row) for row in rows]
+
+
+def ai_configured() -> bool:
+    return bool(OLLAMA_REPOSITORY_BASE_URL and OLLAMA_EMBEDDING_MODEL and OLLAMA_RETRIEVAL_MODEL)
+
+
+async def ollama_available() -> bool:
+    if not ai_configured():
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{OLLAMA_REPOSITORY_BASE_URL}/api/tags")
+        return response.status_code == 200
+    except Exception:
+        return False
+
+
+async def request_embedding(text: str) -> list[float]:
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"{OLLAMA_REPOSITORY_BASE_URL}/api/embeddings",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "model": OLLAMA_EMBEDDING_MODEL,
+                    "prompt": text[:EMBEDDING_TEXT_LIMIT],
+                },
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Ollama embedding service is not reachable from the backend. "
+                f"Check REPOSITORY_OLLAMA_BASE_URL ({OLLAMA_REPOSITORY_BASE_URL}) "
+                f"and that the `{OLLAMA_EMBEDDING_MODEL}` model is installed."
+            ),
+        ) from exc
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Ollama embedding error: {response.text[:500]}",
+        )
+
+    data = response.json()
+    embedding = data.get("embedding")
+    if not embedding:
+        raise HTTPException(
+            status_code=502,
+            detail="Ollama did not return an embedding. Check that the embedding model is installed.",
+        )
+    return normalize_vector(embedding)
+
+
+async def request_evidence_answer(question: str, evidence: list[dict]) -> str:
+    evidence_text = "\n\n".join(
+        (
+            f"[{index + 1}] {item['material_title']} "
+            f"({item.get('page_ref') or 'unknown page'}): "
+            f"{item['content_text'][:1600]}"
+        )
+        for index, item in enumerate(evidence)
+    )
+
+    system_prompt = (
+        "You are an evidence assistant for a research corpus. "
+        "Answer only from the provided passages. "
+        "Do not infer cultural meaning, symbolism, or relationships beyond the evidence. "
+        "If the evidence is weak or absent, say so. "
+        "Use citation numbers like [1], [2]. "
+        "End with a short 'Not established by current corpus' note when appropriate."
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            response = await client.post(
+                f"{OLLAMA_REPOSITORY_BASE_URL}/api/chat",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "model": OLLAMA_RETRIEVAL_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Question: {question}\n\n"
+                                f"Retrieved evidence:\n{evidence_text}"
+                            ),
+                        },
+                    ],
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.1,
+                    },
+                },
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Ollama chat service is not reachable from the backend. "
+                f"Check REPOSITORY_OLLAMA_BASE_URL ({OLLAMA_REPOSITORY_BASE_URL}) "
+                f"and that the `{OLLAMA_RETRIEVAL_MODEL}` model is installed."
+            ),
+        ) from exc
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Ollama answer error: {response.text[:500]}",
+        )
+
+    data = response.json()
+    return data.get("message", {}).get("content", "").strip()
+
+
+async def index_missing_segment_embeddings(
+    con: sqlite3.Connection,
+    material_id: Optional[str] = None,
+    limit: int = 200,
+    force: bool = False,
+) -> dict:
+    if not ai_configured():
+        return {
+            "provider_configured": False,
+            "indexed_count": 0,
+            "message": "Ollama retrieval settings are not configured.",
+        }
+
+    where = []
+    params: list[object] = []
+
+    if material_id:
+        where.append("es.material_id = ?")
+        params.append(material_id)
+
+    if not force:
+        where.append(
+            """
+            NOT EXISTS (
+                SELECT 1
+                FROM segment_embeddings se
+                WHERE se.segment_id = es.id
+                AND se.model = ?
+            )
+            """
+        )
+        params.append(OLLAMA_EMBEDDING_MODEL)
+
+    where_clause = f"WHERE {' AND '.join(where)}" if where else ""
+
+    rows = con.execute(
+        f"""
+        SELECT es.id, es.material_id, es.content_text
+        FROM extracted_segments es
+        {where_clause}
+        ORDER BY es.id ASC
+        LIMIT ?
+        """,
+        (*params, limit),
+    ).fetchall()
+
+    indexed_count = 0
+    ts = now_iso()
+
+    for row in rows:
+        embedding = await request_embedding(row["content_text"])
+        con.execute(
+            """
+            INSERT OR REPLACE INTO segment_embeddings (
+                segment_id, material_id, model, embedding_json, embedded_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                row["id"],
+                row["material_id"],
+                OLLAMA_EMBEDDING_MODEL,
+                json.dumps(embedding),
+                ts,
+            ),
+        )
+        indexed_count += 1
+
+    return {
+        "provider_configured": True,
+        "indexed_count": indexed_count,
+        "model": OLLAMA_EMBEDDING_MODEL,
+    }
+
+
+async def semantic_search_segments(payload: SemanticSearchRequest) -> dict:
+    query_embedding = await request_embedding(payload.query)
+
+    with get_connection() as con:
+        if payload.material_id:
+            ensure_material(con, payload.material_id)
+
+        index_result = await index_missing_segment_embeddings(
+            con,
+            material_id=payload.material_id,
+            limit=200,
+        )
+
+        where = "WHERE se.model = ?"
+        params: list[object] = [OLLAMA_EMBEDDING_MODEL]
+        if payload.material_id:
+            where += " AND se.material_id = ?"
+            params.append(payload.material_id)
+
+        rows = con.execute(
+            f"""
+            SELECT
+                se.embedding_json,
+                es.id AS segment_id,
+                es.material_id,
+                m.title AS material_title,
+                m.authors AS material_authors,
+                m.year AS material_year,
+                es.source_kind,
+                es.source_locator,
+                es.page_ref,
+                es.page_index,
+                es.content_text
+            FROM segment_embeddings se
+            JOIN extracted_segments es ON es.id = se.segment_id
+            JOIN materials m ON m.id = es.material_id
+            {where}
+            """,
+            params,
+        ).fetchall()
+
+        scored = []
+        for row in rows:
+            embedding = json.loads(row["embedding_json"])
+            score = cosine_similarity(query_embedding, embedding)
+            item = dict(row)
+            item.pop("embedding_json", None)
+            item["score"] = score
+            item["citation"] = citation_from_segment(row)
+            scored.append(item)
+
+        scored.sort(key=lambda item: item["score"], reverse=True)
+        results = scored[: payload.limit]
+
+        related_observations = []
+        if payload.include_observations:
+            related_observations = get_related_observations_for_segments(
+                con,
+                segment_ids=[int(item["segment_id"]) for item in results],
+                material_ids=list({item["material_id"] for item in results}),
+            )
+
+    return {
+        "query": payload.query,
+        "mode": "semantic_evidence_search",
+        "provider_configured": True,
+        "embedding_model": OLLAMA_EMBEDDING_MODEL,
+        "index_result": index_result,
+        "results": results,
+        "related_observations": related_observations,
+        "evidence_note": (
+            "Results are semantically retrieved passages. They are evidence candidates, "
+            "not interpretations."
+        ),
+    }
 
 
 def normalize_url(url: str):
@@ -1839,6 +2214,178 @@ async def get_material_extracted(material_id: str, limit: int = Query(200, ge=1,
         "segments": [dict(row) for row in segments],
         "discovered_links": [dict(row) for row in links],
         "runs": [dict(row) for row in runs],
+    }
+
+
+@router.get("/ai/status")
+async def get_ai_status():
+    init_repository_db()
+    is_ollama_available = await ollama_available()
+    with get_connection() as con:
+        try:
+            segment_count = con.execute(
+                "SELECT COUNT(*) FROM extracted_segments"
+            ).fetchone()[0]
+            embedded_count = con.execute(
+                """
+                SELECT COUNT(*)
+                FROM segment_embeddings
+                WHERE model = ?
+                """,
+                (OLLAMA_EMBEDDING_MODEL,),
+            ).fetchone()[0]
+        except sqlite3.OperationalError:
+            segment_count = 0
+            embedded_count = 0
+
+    return {
+        "provider_configured": is_ollama_available,
+        "provider": "ollama",
+        "ollama_base_url": OLLAMA_REPOSITORY_BASE_URL,
+        "embedding_model": OLLAMA_EMBEDDING_MODEL,
+        "chat_model": OLLAMA_RETRIEVAL_MODEL,
+        "segment_count": segment_count,
+        "embedded_segment_count": embedded_count,
+        "default_mode": "evidence_only",
+        "status_message": (
+            "Ollama is reachable."
+            if is_ollama_available
+            else "Ollama is not reachable from the backend. Exact search and observations still work."
+        ),
+    }
+
+
+@router.post("/ai/index")
+async def build_semantic_index(payload: BuildSemanticIndexRequest):
+    if not await ollama_available():
+        return {
+            "provider_configured": False,
+            "indexed_count": 0,
+            "message": "Ollama is not reachable from the backend.",
+        }
+    with get_connection() as con:
+        if payload.material_id:
+            ensure_material(con, payload.material_id)
+        result = await index_missing_segment_embeddings(
+            con,
+            material_id=payload.material_id,
+            limit=payload.limit,
+            force=payload.force,
+        )
+    return result
+
+
+@router.post("/ai/semantic-search")
+async def semantic_search(payload: SemanticSearchRequest):
+    if not await ollama_available():
+        return {
+            "query": payload.query,
+            "mode": "semantic_evidence_search",
+            "provider_configured": False,
+            "results": [],
+            "related_observations": [],
+            "evidence_note": (
+                "Semantic search is available when Ollama is configured and running."
+            ),
+        }
+
+    return await semantic_search_segments(payload)
+
+
+@router.post("/ai/ask")
+async def ask_corpus(payload: AskCorpusRequest):
+    if not await ollama_available():
+        return {
+            "question": payload.question,
+            "provider_configured": False,
+            "answer": (
+                "Ask Corpus is available when Ollama is configured and running."
+            ),
+            "citations": [],
+            "related_observations": [],
+            "evidence_note": "Ollama retrieval settings are not configured.",
+        }
+
+    semantic_payload = SemanticSearchRequest(
+        query=payload.question,
+        material_id=payload.material_id,
+        limit=payload.max_results,
+        include_observations=True,
+    )
+    retrieval = await semantic_search_segments(semantic_payload)
+    evidence = retrieval["results"]
+
+    if not evidence:
+        return {
+            "question": payload.question,
+            "provider_configured": True,
+            "answer": "No retrieved passages were available to answer from the current corpus.",
+            "citations": [],
+            "related_observations": retrieval["related_observations"],
+            "evidence_note": "Evidence-only mode found no passages.",
+        }
+
+    answer = await request_evidence_answer(payload.question, evidence)
+
+    return {
+        "question": payload.question,
+        "provider_configured": True,
+        "answer": answer,
+        "citations": [item["citation"] for item in evidence],
+        "retrieved_passages": evidence,
+        "related_observations": retrieval["related_observations"],
+        "evidence_note": (
+            "Answer generated in evidence-only mode from retrieved passages. "
+            "Interpretive claims remain for human review."
+        ),
+    }
+
+
+@router.post("/ai/evidence-report")
+async def generate_ai_evidence_report(payload: SemanticSearchRequest):
+    if not await ollama_available():
+        return {
+            "query": payload.query,
+            "provider_configured": False,
+            "themes": [],
+            "related_observations": [],
+            "evidence_note": (
+                "AI evidence reports are available when Ollama is configured and running."
+            ),
+        }
+
+    retrieval = await semantic_search_segments(payload)
+    grouped: dict[str, dict] = {}
+
+    for item in retrieval["results"]:
+        key = item["material_id"]
+        if key not in grouped:
+            grouped[key] = {
+                "theme": item["material_title"],
+                "material_id": item["material_id"],
+                "material_title": item["material_title"],
+                "citations": [],
+                "passages": [],
+            }
+        grouped[key]["citations"].append(item["citation"])
+        grouped[key]["passages"].append(
+            {
+                "segment_id": item["segment_id"],
+                "page_ref": item["page_ref"],
+                "score": item["score"],
+                "content_text": item["content_text"],
+            }
+        )
+
+    return {
+        "query": payload.query,
+        "provider_configured": True,
+        "themes": list(grouped.values()),
+        "related_observations": retrieval["related_observations"],
+        "evidence_note": (
+            "Grouped by source title for review. This report surfaces evidence candidates "
+            "and does not assign cultural meaning."
+        ),
     }
 
 

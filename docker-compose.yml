@@ -9,6 +9,9 @@ services:
       # Override REDIS_URL to point to the local redis container in compose
       - REDIS_URL=redis://redis:6379/0
       - PORT=${PORT:-8000}
+      - REPOSITORY_OLLAMA_BASE_URL=${REPOSITORY_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - OLLAMA_EMBEDDING_MODEL=${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
+      - OLLAMA_RETRIEVAL_MODEL=${OLLAMA_RETRIEVAL_MODEL:-llama3.1}
     volumes:
       - ./storage:/app/storage
     depends_on:
