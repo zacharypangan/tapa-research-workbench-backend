@@ -60,7 +60,7 @@ wheels = [
 ]
 
 [[package]]
-name = "backend"
+name = "tapa-research-workbench-backend"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

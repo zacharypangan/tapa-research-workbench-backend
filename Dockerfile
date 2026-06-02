@@ -9,6 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     gcc \
     g++ \
+    poppler-utils \
+    tesseract-ocr \
+    tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv for fast dependency management
@@ -18,7 +21,7 @@ RUN pip install uv
 COPY pyproject.toml uv.lock ./
 
 # Sync dependencies using uv (creates a .venv automatically)
-RUN uv sync --frozen
+RUN uv sync
 
 # Copy the rest of the application code
 COPY . .

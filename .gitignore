@@ -19,3 +19,6 @@ venv
 .pytest_cache
 .env
 server_log.txt
+storage/
+app/api/checkpoint/
+research_platform.duckdb

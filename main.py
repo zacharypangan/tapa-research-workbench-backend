@@ -2,9 +2,9 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.db import init_db
-from app.api import tiles, chat, data
+from app.api import tiles, chat, data, repository
 
-app = FastAPI(title="Research Platform Backend")
+app = FastAPI(title="Tapa Research Workbench Backend")
 
 # Base CORS origins
 origins = [
@@ -33,11 +33,13 @@ app.add_middleware(
 app.include_router(tiles.router, prefix="/api/v1")
 app.include_router(chat.router, prefix="/api/v1")
 app.include_router(data.router, prefix="/api/v1")
+app.include_router(repository.router, prefix="/api/v1")
 
 
 @app.on_event("startup")
 def on_startup():
     init_db()
+    repository.init_repository_db()
 
 
 @app.get("/health")
