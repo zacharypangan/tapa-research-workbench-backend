@@ -1,4 +1,6 @@
 import os
+import base64
+import hashlib
 import json
 import math
 import re
@@ -12,7 +14,7 @@ from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from app.infra.settings import OLLAMA_BASE_URL
@@ -26,11 +28,15 @@ STORAGE_ROOT = os.getenv(
     os.path.join(BASE_DIR, "storage", "repository"),
 )
 FILES_ROOT = os.path.join(STORAGE_ROOT, "files")
+IMAGES_ROOT = os.path.join(STORAGE_ROOT, "images")
 DB_PATH = os.path.join(STORAGE_ROOT, "repository.sqlite")
 OLLAMA_REPOSITORY_BASE_URL = os.getenv("REPOSITORY_OLLAMA_BASE_URL", OLLAMA_BASE_URL).rstrip("/")
 OLLAMA_EMBEDDING_MODEL = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
 OLLAMA_RETRIEVAL_MODEL = os.getenv("OLLAMA_RETRIEVAL_MODEL", "llama3.1")
+OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llava")
 EMBEDDING_TEXT_LIMIT = 2000
+MULTIMODAL_METHOD_VERSION = "multimodal_evidence_v2_context"
+IMAGE_INDEX_JOBS: dict[str, dict] = {}
 
 SOURCE_TYPES = {
     "publication",
@@ -114,6 +120,7 @@ class ObservationCreate(BaseModel):
     observation_type: str = "term"
     observed_text: str = Field(..., min_length=1, max_length=1000)
     source_segment_id: Optional[int] = None
+    source_image_id: Optional[str] = None
     source_page_ref: Optional[str] = Field(default=None, max_length=255)
     source_locator: Optional[str] = Field(default=None, max_length=2000)
     context_quote: Optional[str] = None
@@ -125,6 +132,7 @@ class ObservationUpdate(BaseModel):
     observation_type: Optional[str] = None
     observed_text: Optional[str] = Field(default=None, min_length=1, max_length=1000)
     source_segment_id: Optional[int] = None
+    source_image_id: Optional[str] = None
     source_page_ref: Optional[str] = Field(default=None, max_length=255)
     source_locator: Optional[str] = Field(default=None, max_length=2000)
     context_quote: Optional[str] = None
@@ -137,6 +145,7 @@ class SemanticSearchRequest(BaseModel):
     material_id: Optional[str] = None
     limit: int = Field(default=12, ge=1, le=50)
     include_observations: bool = True
+    auto_index: bool = False
 
 
 class AskCorpusRequest(BaseModel):
@@ -149,6 +158,16 @@ class BuildSemanticIndexRequest(BaseModel):
     material_id: Optional[str] = None
     limit: int = Field(default=200, ge=1, le=1000)
     force: bool = False
+
+
+class MultimodalSearchRequest(BaseModel):
+    query: str = Field(..., min_length=2, max_length=500)
+    material_id: Optional[str] = None
+    limit: int = Field(default=12, ge=1, le=50)
+    include_observations: bool = True
+    include_images: bool = True
+    auto_index_images: bool = False
+    image_index_limit: int = Field(default=0, ge=0, le=100)
 
 @dataclass
 class SegmentInput:
@@ -163,6 +182,24 @@ class SegmentInput:
 class ExtractionResult:
     segments: list[SegmentInput]
     warnings: list[str]
+
+
+@dataclass
+class ImageEvidenceInput:
+    file_id: Optional[str]
+    evidence_type: str
+    source_kind: str
+    source_locator: str
+    page_ref: str
+    page_index: int
+    image_path: str
+    mime_type: str
+    width: int
+    height: int
+    extraction_method: str
+    ocr_text: str = ""
+    visual_caption: str = ""
+    fingerprint: str = ""
 
 
 class HtmlTextAndLinksParser(HTMLParser):
@@ -203,6 +240,7 @@ class HtmlTextAndLinksParser(HTMLParser):
 
 def init_repository_db():
     os.makedirs(FILES_ROOT, exist_ok=True)
+    os.makedirs(IMAGES_ROOT, exist_ok=True)
     with get_connection() as con:
         con.execute(
             """
@@ -307,6 +345,7 @@ def init_repository_db():
                 id TEXT PRIMARY KEY,
                 material_id TEXT NOT NULL,
                 source_segment_id INTEGER,
+                source_image_id TEXT,
                 observation_type TEXT NOT NULL,
                 observed_text TEXT NOT NULL,
                 source_page_ref TEXT,
@@ -319,10 +358,13 @@ def init_repository_db():
                 FOREIGN KEY(material_id) REFERENCES materials(id)
                     ON DELETE CASCADE,
                 FOREIGN KEY(source_segment_id) REFERENCES extracted_segments(id)
+                    ON DELETE SET NULL,
+                FOREIGN KEY(source_image_id) REFERENCES image_evidence(id)
                     ON DELETE SET NULL
             )
             """
         )
+        ensure_column(con, "observations", "source_image_id", "source_image_id TEXT")
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS segment_embeddings (
@@ -332,6 +374,48 @@ def init_repository_db():
                 embedding_json TEXT NOT NULL,
                 embedded_at TEXT NOT NULL,
                 FOREIGN KEY(segment_id) REFERENCES extracted_segments(id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY(material_id) REFERENCES materials(id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS image_evidence (
+                id TEXT PRIMARY KEY,
+                material_id TEXT NOT NULL,
+                file_id TEXT,
+                evidence_type TEXT NOT NULL,
+                source_kind TEXT NOT NULL,
+                source_locator TEXT NOT NULL,
+                page_ref TEXT NOT NULL,
+                page_index INTEGER NOT NULL,
+                image_path TEXT NOT NULL,
+                mime_type TEXT,
+                width INTEGER,
+                height INTEGER,
+                extraction_method TEXT NOT NULL,
+                ocr_text TEXT,
+                visual_caption TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(material_id) REFERENCES materials(id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY(file_id) REFERENCES files(id)
+                    ON DELETE SET NULL
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS image_embeddings (
+                image_id TEXT PRIMARY KEY,
+                material_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                method_version TEXT NOT NULL,
+                embedding_json TEXT NOT NULL,
+                embedded_at TEXT NOT NULL,
+                FOREIGN KEY(image_id) REFERENCES image_evidence(id)
                     ON DELETE CASCADE,
                 FOREIGN KEY(material_id) REFERENCES materials(id)
                     ON DELETE CASCADE
@@ -397,13 +481,21 @@ def init_repository_db():
         con.execute(
             "CREATE INDEX IF NOT EXISTS idx_segment_embeddings_material ON segment_embeddings(material_id)"
         )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_image_evidence_material ON image_evidence(material_id)"
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_image_embeddings_material ON image_embeddings(material_id)"
+        )
 
 
 def get_connection():
     os.makedirs(STORAGE_ROOT, exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=30)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
+    con.execute("PRAGMA busy_timeout = 30000")
+    con.execute("PRAGMA journal_mode = WAL")
     return con
 
 def ensure_column(con: sqlite3.Connection, table_name: str, column_name: str, column_sql: str):
@@ -570,6 +662,29 @@ def ensure_segment_belongs_to_material(
     return row
 
 
+def ensure_image_belongs_to_material(
+    con: sqlite3.Connection,
+    material_id: str,
+    image_id: Optional[str],
+):
+    if not image_id:
+        return None
+    row = con.execute(
+        """
+        SELECT id, page_ref, source_locator, ocr_text, visual_caption, evidence_type
+        FROM image_evidence
+        WHERE id = ? AND material_id = ?
+        """,
+        (image_id, material_id),
+    ).fetchone()
+    if not row:
+        raise HTTPException(
+            status_code=400,
+            detail="source_image_id does not belong to this material",
+        )
+    return row
+
+
 def normalize_vector(vector: list[float]) -> list[float]:
     magnitude = math.sqrt(sum(value * value for value in vector))
     if magnitude == 0:
@@ -593,6 +708,16 @@ def citation_from_segment(row: sqlite3.Row) -> dict:
         "page_ref": row["page_ref"],
         "source_locator": row["source_locator"],
     }
+
+
+def image_url(material_id: str, image_id: str) -> str:
+    return f"/repository/materials/{material_id}/images/{image_id}"
+
+
+def image_from_row(row: sqlite3.Row) -> dict:
+    item = dict(row)
+    item["image_url"] = image_url(row["material_id"], row["image_id"] if "image_id" in row.keys() else row["id"])
+    return item
 
 
 def observation_from_row(row: sqlite3.Row) -> dict:
@@ -687,6 +812,221 @@ async def request_embedding(text: str) -> list[float]:
     return normalize_vector(embedding)
 
 
+def ocr_image_file(image_path: str) -> str:
+    try:
+        from PIL import Image
+        import pytesseract
+
+        with Image.open(image_path) as image:
+            return clean_extracted_text(pytesseract.image_to_string(image) or "")
+    except Exception:
+        return ""
+
+def normalize_image_label_text(text: str, max_labels: int = 12) -> str:
+    """
+    Convert a verbose vision response into a compact searchable label string.
+    Intended for preliminary image labels, not interpretation.
+    """
+
+    cleaned = clean_extracted_text(text)
+
+    if not cleaned:
+        return ""
+
+    # Remove common model preambles.
+    cleaned = re.sub(
+        r"^(the image|this image|the provided image|the image you've provided)\s+"
+        r"(appears to be|shows|contains|depicts|is)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove markdown emphasis and numbering.
+    cleaned = cleaned.replace("**", "")
+    cleaned = re.sub(r"\b\d+\.\s*", "", cleaned)
+
+    # Split by common separators.
+    candidates = re.split(r"[,;\n]|(?:\s+-\s+)", cleaned)
+
+    labels: list[str] = []
+
+    for candidate in candidates:
+        label = candidate.strip(" .:-").lower()
+        label = re.sub(r"\s+", " ", label)
+
+        # Drop long explanatory fragments.
+        if not label or len(label) > 60:
+            continue
+
+        # Drop vague phrases.
+        if label in {
+            "visible objects and features",
+            "visible features",
+            "here are the visible objects and features",
+            "not fully legible",
+            "cannot determine",
+        }:
+            continue
+
+        # Drop interpretive/uncertain phrases.
+        if any(
+            phrase in label
+            for phrase in [
+                "could be",
+                "might be",
+                "appears to",
+                "suggests",
+                "likely",
+                "possibly",
+                "purpose",
+                "imply",
+                "significance",
+            ]
+        ):
+            continue
+
+        if label not in labels:
+            labels.append(label)
+
+        if len(labels) >= max_labels:
+            break
+
+    return "; ".join(labels)
+
+def trim_context_text(text: str, max_chars: int) -> str:
+    cleaned = clean_extracted_text(text)
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[:max_chars].rsplit(" ", 1)[0].strip()
+
+
+def get_image_context_text(con: sqlite3.Connection, row: sqlite3.Row, max_chars: int = 1600) -> str:
+    exact_rows = con.execute(
+        """
+        SELECT page_ref, content_text
+        FROM extracted_segments
+        WHERE material_id = ?
+        AND source_locator = ?
+        AND page_index = ?
+        ORDER BY id ASC
+        LIMIT 6
+        """,
+        (row["material_id"], row["source_locator"], row["page_index"]),
+    ).fetchall()
+
+    if exact_rows:
+        context = "\n\n".join(
+            f"{item['page_ref']}: {item['content_text']}"
+            for item in exact_rows
+        )
+        return trim_context_text(
+            f"Exact same source and page/slide as image ({row['source_locator']} · {row['page_ref']}):\n{context}",
+            max_chars,
+        )
+
+    same_page_rows = con.execute(
+        """
+        SELECT source_locator, page_ref, content_text
+        FROM extracted_segments
+        WHERE material_id = ?
+        AND page_index = ?
+        ORDER BY id ASC
+        LIMIT 6
+        """,
+        (row["material_id"], row["page_index"]),
+    ).fetchall()
+
+    if same_page_rows:
+        context = "\n\n".join(
+            f"{item['source_locator']} · {item['page_ref']}: {item['content_text']}"
+            for item in same_page_rows
+        )
+        return trim_context_text(
+            f"Same page/slide context as image ({row['source_locator']} · {row['page_ref']}):\n{context}",
+            max_chars,
+        )
+
+    nearby_rows = con.execute(
+        """
+        SELECT source_locator, page_ref, content_text
+        FROM extracted_segments
+        WHERE material_id = ?
+        AND page_index BETWEEN ? AND ?
+        ORDER BY ABS(page_index - ?), id ASC
+        LIMIT 6
+        """,
+        (
+            row["material_id"],
+            max(0, int(row["page_index"]) - 1),
+            int(row["page_index"]) + 1,
+            row["page_index"],
+        ),
+    ).fetchall()
+
+    context = "\n\n".join(
+        f"{item['source_locator']} · {item['page_ref']}: {item['content_text']}"
+        for item in nearby_rows
+    )
+    return trim_context_text(
+        f"Nearby source context for image ({row['source_locator']} · {row['page_ref']}):\n{context}",
+        max_chars,
+    )
+
+
+async def request_image_caption(image_path: str, context_text: str = "") -> str:
+    if not OLLAMA_VISION_MODEL:
+        return ""
+    try:
+        with open(image_path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("ascii")
+        context_block = (
+            f"\n\nSource section text near this image:\n{context_text}\n"
+            if context_text
+            else ""
+        )
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            for _attempt in range(2):
+                response = await client.post(
+                    f"{OLLAMA_REPOSITORY_BASE_URL}/api/chat",
+                    headers={"Content-Type": "application/json"},
+                    json={
+                        "model": OLLAMA_VISION_MODEL,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": (
+                                    (
+                                        "Create preliminary searchable labels for this document image using the image and its nearby source text. "
+                                        "Return ONLY 5 to 10 short labels separated by semicolons. "
+                                        "Use observable terms only: object type, visible text labels, places, tools, materials, motifs, diagrams, maps, tables, or process cues. "
+                                        "Use the source text as grounding context from the same page/slide, not as a separate summary. "
+                                        "Include a source-text term only when it plausibly names something visible in this image or directly labels this figure/slide section. "
+                                        "Do not write sentences. Do not explain. Do not infer meaning or symbolism. "
+                                        "Do not use phrases like 'could be', 'might be', or 'appears to be'. "
+                                        "Example output: map; Fiji; Tonga; Pacific Ocean; scale bar; latitude lines; black-and-white figure"
+                                        f"{context_block}"
+                                    )
+                                ),
+                                "images": [encoded],
+                            }
+                        ],
+                        "stream": False,
+                        "options": {"temperature": 0.1},
+                    },
+                )
+                if response.status_code >= 400:
+                    continue
+                raw_caption = response.json().get("message", {}).get("content", "")
+                caption = normalize_image_label_text(raw_caption)
+                if caption:
+                    return caption
+        return ""
+    except Exception:
+        return ""
+
+
 async def request_evidence_answer(question: str, evidence: list[dict]) -> str:
     evidence_text = "\n\n".join(
         (
@@ -699,11 +1039,15 @@ async def request_evidence_answer(question: str, evidence: list[dict]) -> str:
 
     system_prompt = (
         "You are an evidence assistant for a research corpus. "
-        "Answer only from the provided passages. "
+        "Answer only from the provided passages, but support a wide range of research questions: "
+        "definitions, relationships between words or concepts, comparisons across sources, process steps, "
+        "material/place associations, terminology variants, and evidence gaps. "
         "Do not infer cultural meaning, symbolism, or relationships beyond the evidence. "
-        "If the evidence is weak or absent, say so. "
+        "When the question asks about a relationship, distinguish direct evidence from weaker co-occurrence. "
+        "If the evidence is weak, conflicting, or absent, say so plainly. "
         "Use citation numbers like [1], [2]. "
-        "End with a short 'Not established by current corpus' note when appropriate."
+        "End with a short evidence status note such as 'well supported', 'weakly supported', "
+        "or 'not established by current corpus'."
     )
 
     try:
@@ -815,6 +1159,7 @@ async def index_missing_segment_embeddings(
                 ts,
             ),
         )
+        con.commit()
         indexed_count += 1
 
     return {
@@ -831,11 +1176,27 @@ async def semantic_search_segments(payload: SemanticSearchRequest) -> dict:
         if payload.material_id:
             ensure_material(con, payload.material_id)
 
-        index_result = await index_missing_segment_embeddings(
-            con,
-            material_id=payload.material_id,
-            limit=200,
-        )
+        if payload.auto_index:
+            try:
+                index_result = await index_missing_segment_embeddings(
+                    con,
+                    material_id=payload.material_id,
+                    limit=50,
+                )
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower():
+                    raise
+                index_result = {
+                    "provider_configured": True,
+                    "indexed_count": 0,
+                    "message": "Search used the existing text index because another indexing job is running.",
+                }
+        else:
+            index_result = {
+                "provider_configured": True,
+                "indexed_count": 0,
+                "message": "Search used the existing text index. Use indexing preparation to add missing passages.",
+            }
 
         where = "WHERE se.model = ?"
         params: list[object] = [OLLAMA_EMBEDDING_MODEL]
@@ -872,6 +1233,9 @@ async def semantic_search_segments(payload: SemanticSearchRequest) -> dict:
             item = dict(row)
             item.pop("embedding_json", None)
             item["score"] = score
+            item["semantic_score"] = score
+            item["evidence_type"] = "text_passage"
+            item["retrieval_basis"] = "Text passage ranked by embedding similarity."
             item["citation"] = citation_from_segment(row)
             scored.append(item)
 
@@ -897,6 +1261,284 @@ async def semantic_search_segments(payload: SemanticSearchRequest) -> dict:
         "evidence_note": (
             "Results are semantically retrieved passages. They are evidence candidates, "
             "not interpretations."
+        ),
+    }
+
+
+def matched_terms_for_text(text: str, terms: list[str]) -> list[str]:
+    return [
+        term for term in terms
+        if build_term_pattern(term).search(text or "")
+    ]
+
+
+def image_embedding_text(row: sqlite3.Row) -> str:
+    parts = [
+        row["ocr_text"] or "",
+        row["visual_caption"] or "",
+        row["observation_labels"] if "observation_labels" in row.keys() else "",
+        row["page_ref"] or "",
+        row["source_locator"] or "",
+        row["evidence_type"] or "",
+    ]
+    return clean_extracted_text("\n\n".join(part for part in parts if part))
+
+
+async def index_missing_image_embeddings(
+    con: sqlite3.Connection,
+    material_id: Optional[str] = None,
+    limit: int = 100,
+    force: bool = False,
+) -> dict:
+    if not ai_configured():
+        return {
+            "provider_configured": False,
+            "indexed_count": 0,
+            "captioned_count": 0,
+            "message": "Ollama retrieval settings are not configured.",
+        }
+
+    where = []
+    params: list[object] = []
+
+    if material_id:
+        where.append("ie.material_id = ?")
+        params.append(material_id)
+
+    if not force:
+        where.append(
+            """
+            NOT EXISTS (
+                SELECT 1
+                FROM image_embeddings im
+                WHERE im.image_id = ie.id
+                AND im.model = ?
+                AND im.method_version = ?
+            )
+            """
+        )
+        params.extend([OLLAMA_EMBEDDING_MODEL, MULTIMODAL_METHOD_VERSION])
+
+    where_clause = f"WHERE {' AND '.join(where)}" if where else ""
+    scan_limit = max(limit * 20, 100)
+    rows = con.execute(
+        f"""
+        SELECT
+            ie.*,
+            (
+                SELECT GROUP_CONCAT(
+                    observations.observation_type || ': ' || observations.observed_text ||
+                    CASE
+                        WHEN observations.notes IS NOT NULL AND trim(observations.notes) != ''
+                        THEN ' - ' || observations.notes
+                        ELSE ''
+                    END,
+                    '\n'
+                )
+                FROM observations
+                WHERE observations.source_image_id = ie.id
+            ) AS observation_labels
+        FROM image_evidence ie
+        {where_clause}
+        ORDER BY ie.created_at ASC, ie.page_index ASC
+        LIMIT ?
+        """,
+        (*params, scan_limit),
+    ).fetchall()
+
+    indexed_count = 0
+    processed_image_count = 0
+    captioned_count = 0
+    caption_attempted_count = 0
+    caption_failed_count = 0
+    removed_blank_count = 0
+    ts = now_iso()
+
+    for row in rows:
+        if not is_informative_image(row["image_path"]):
+            remove_file_quietly(row["image_path"])
+            con.execute("DELETE FROM image_evidence WHERE id = ?", (row["id"],))
+            con.commit()
+            removed_blank_count += 1
+            continue
+        if processed_image_count >= limit:
+            break
+        processed_image_count += 1
+        ocr_text = row["ocr_text"] or ocr_image_file(row["image_path"])
+        context_text = get_image_context_text(con, row)
+        should_caption = force or not row["visual_caption"]
+        visual_caption = row["visual_caption"] or ""
+        if should_caption:
+            caption_attempted_count += 1
+            visual_caption = await request_image_caption(row["image_path"], context_text)
+            if visual_caption:
+                captioned_count += 1
+            else:
+                caption_failed_count += 1
+
+        con.execute(
+            """
+            UPDATE image_evidence
+            SET ocr_text = ?, visual_caption = ?
+            WHERE id = ?
+            """,
+            (ocr_text, visual_caption, row["id"]),
+        )
+        con.commit()
+
+        observation_labels = row["observation_labels"] if "observation_labels" in row.keys() else ""
+        index_text = clean_extracted_text(
+            "\n\n".join(part for part in [ocr_text, visual_caption, observation_labels] if part)
+        )
+        if not index_text:
+            con.commit()
+            continue
+
+        embedding = await request_embedding(index_text)
+        con.execute(
+            """
+            INSERT OR REPLACE INTO image_embeddings (
+                image_id, material_id, model, method_version, embedding_json, embedded_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row["id"],
+                row["material_id"],
+                OLLAMA_EMBEDDING_MODEL,
+                MULTIMODAL_METHOD_VERSION,
+                json.dumps(embedding),
+                ts,
+            ),
+        )
+        con.commit()
+        indexed_count += 1
+
+    return {
+        "provider_configured": True,
+        "indexed_count": indexed_count,
+        "processed_image_count": processed_image_count,
+        "captioned_count": captioned_count,
+        "caption_attempted_count": caption_attempted_count,
+        "caption_failed_count": caption_failed_count,
+        "removed_blank_count": removed_blank_count,
+        "model": OLLAMA_EMBEDDING_MODEL,
+        "vision_model": OLLAMA_VISION_MODEL,
+        "method_version": MULTIMODAL_METHOD_VERSION,
+    }
+
+
+async def search_image_evidence(payload: MultimodalSearchRequest) -> dict:
+    terms = parse_report_terms(payload.query)
+    query_embedding = await request_embedding(payload.query)
+
+    with get_connection() as con:
+        if payload.material_id:
+            ensure_material(con, payload.material_id)
+
+        index_result = (
+            await index_missing_image_embeddings(
+                con,
+                material_id=payload.material_id,
+                limit=payload.image_index_limit or 25,
+            )
+            if payload.auto_index_images and payload.image_index_limit > 0
+            else {
+                "provider_configured": True,
+                "indexed_count": 0,
+                "captioned_count": 0,
+                "message": "Image search used the existing image label index. Use image indexing to prepare more labels.",
+            }
+        )
+
+        where = "WHERE im.model = ? AND im.method_version = ?"
+        params: list[object] = [OLLAMA_EMBEDDING_MODEL, MULTIMODAL_METHOD_VERSION]
+        if payload.material_id:
+            where += " AND im.material_id = ?"
+            params.append(payload.material_id)
+
+        rows = con.execute(
+            f"""
+            SELECT
+                im.embedding_json,
+                ie.id AS image_id,
+                ie.material_id,
+                ie.file_id,
+                ie.evidence_type,
+                ie.source_kind,
+                ie.source_locator,
+                ie.page_ref,
+                ie.page_index,
+                ie.image_path,
+                ie.mime_type,
+                ie.width,
+                ie.height,
+                ie.extraction_method,
+                ie.ocr_text,
+                ie.visual_caption,
+                (
+                    SELECT GROUP_CONCAT(
+                        observations.observation_type || ': ' || observations.observed_text ||
+                        CASE
+                            WHEN observations.notes IS NOT NULL AND trim(observations.notes) != ''
+                            THEN ' - ' || observations.notes
+                            ELSE ''
+                        END,
+                        '\n'
+                    )
+                    FROM observations
+                    WHERE observations.source_image_id = ie.id
+                ) AS observation_labels,
+                m.title AS material_title,
+                m.authors AS material_authors,
+                m.year AS material_year
+            FROM image_embeddings im
+            JOIN image_evidence ie ON ie.id = im.image_id
+            JOIN materials m ON m.id = ie.material_id
+            {where}
+            """,
+            params,
+        ).fetchall()
+
+        results = []
+        for row in rows:
+            evidence_text = image_embedding_text(row)
+            matched_terms = matched_terms_for_text(evidence_text, terms)
+            semantic_score = cosine_similarity(query_embedding, json.loads(row["embedding_json"]))
+            if not matched_terms and semantic_score < 0.62:
+                continue
+            item = dict(row)
+            item.pop("embedding_json", None)
+            item.pop("image_path", None)
+            item["image_url"] = image_url(row["material_id"], row["image_id"])
+            item["semantic_score"] = semantic_score
+            item["score"] = semantic_score
+            item["matched_terms"] = matched_terms
+            item["contains_exact_term"] = bool(matched_terms)
+            item["retrieval_basis"] = (
+                f"OCR/caption matched: {', '.join(matched_terms)}; ranked with image-text embedding."
+                if matched_terms
+                else "Semantic image-text match from OCR/caption text; exact search token not found."
+            )
+            item["evidence_level"] = "direct_image_text_match" if matched_terms else "semantic_image_neighbor"
+            results.append(item)
+
+        results.sort(
+            key=lambda item: (
+                1 if item["matched_terms"] else 0,
+                item["semantic_score"],
+            ),
+            reverse=True,
+        )
+
+    return {
+        "query": payload.query,
+        "provider_configured": True,
+        "index_result": index_result,
+        "image_results": results[: payload.limit],
+        "evidence_note": (
+            "Image evidence is searched separately using OCR and local vision captions. "
+            "Captions describe visible evidence and are not interpretations."
         ),
     }
 
@@ -939,6 +1581,274 @@ def split_text_into_segments(text: str, chunk_size: int = 5000):
         chunks.append(current)
 
     return chunks
+
+
+def image_dimensions(image_path: str) -> tuple[int, int]:
+    try:
+        from PIL import Image
+
+        with Image.open(image_path) as image:
+            return image.size
+    except Exception:
+        return (0, 0)
+
+
+def is_informative_image(image_path: str) -> bool:
+    """
+    Skip blank extraction artifacts such as solid black masks or white spacer images.
+    The thresholds are intentionally conservative so low-contrast document photos
+    are kept while near-uniform rectangles are dropped.
+    """
+    try:
+        from PIL import Image, ImageStat
+
+        with Image.open(image_path) as image:
+            grayscale = image.convert("L").resize((64, 64))
+            stat = ImageStat.Stat(grayscale)
+            mean = stat.mean[0]
+            stddev = stat.stddev[0]
+            extrema = grayscale.getextrema()
+            dynamic_range = extrema[1] - extrema[0]
+            return not (
+                dynamic_range < 8
+                or stddev < 3
+                or (mean < 4 and stddev < 8)
+                or (mean > 251 and stddev < 8)
+            )
+    except Exception:
+        return True
+
+
+def image_fingerprint(image_path: str) -> str:
+    """
+    Normalized visual fingerprint for duplicate extraction artifacts.
+    This catches repeated embedded images even when the file bytes differ slightly.
+    """
+    try:
+        from PIL import Image
+
+        with Image.open(image_path) as image:
+            grayscale = image.convert("L").resize((16, 16))
+            pixels = list(grayscale.getdata())
+            mean = sum(pixels) / len(pixels)
+            bits = "".join("1" if pixel >= mean else "0" for pixel in pixels)
+            return hex(int(bits, 2))[2:].zfill(64)
+    except Exception:
+        try:
+            with open(image_path, "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+        except Exception:
+            return ""
+
+
+def hamming_distance_hex(left: str, right: str) -> int:
+    try:
+        return (int(left, 16) ^ int(right, 16)).bit_count()
+    except Exception:
+        return 999
+
+
+def is_duplicate_fingerprint(fingerprint: str, seen: set[str], threshold: int = 4) -> bool:
+    if not fingerprint:
+        return False
+    return any(
+        fingerprint == item or hamming_distance_hex(fingerprint, item) <= threshold
+        for item in seen
+    )
+
+
+def remove_file_quietly(path: str):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def material_image_dir(material_id: str, file_id: str):
+    image_dir = os.path.join(IMAGES_ROOT, material_id, file_id)
+    os.makedirs(image_dir, exist_ok=True)
+    return image_dir
+
+
+def extract_images_from_pdf(file_path: str, material_id: str, file_id: str, source_locator: str):
+    images: list[ImageEvidenceInput] = []
+    warnings: list[str] = []
+    seen_fingerprints: set[str] = set()
+    duplicate_count = 0
+    try:
+        import fitz
+
+        image_dir = material_image_dir(material_id, file_id)
+        doc = fitz.open(file_path)
+
+        for page_index in range(doc.page_count):
+            page = doc.load_page(page_index)
+            page_number = page_index + 1
+            page_text = clean_extracted_text(page.get_text("text") or "")
+
+            for image_index, image_info in enumerate(page.get_images(full=True), start=1):
+                xref = image_info[0]
+                extracted = doc.extract_image(xref)
+                image_bytes = extracted.get("image")
+                ext = extracted.get("ext") or "png"
+                if not image_bytes:
+                    continue
+
+                image_id = str(uuid.uuid4())
+                image_path = os.path.join(image_dir, f"{image_id}.{ext}")
+                with open(image_path, "wb") as f:
+                    f.write(image_bytes)
+                width, height = image_dimensions(image_path)
+                if width < 120 or height < 120 or not is_informative_image(image_path):
+                    remove_file_quietly(image_path)
+                    continue
+                fingerprint = image_fingerprint(image_path)
+                if is_duplicate_fingerprint(fingerprint, seen_fingerprints):
+                    remove_file_quietly(image_path)
+                    duplicate_count += 1
+                    continue
+                if fingerprint:
+                    seen_fingerprints.add(fingerprint)
+                images.append(
+                    ImageEvidenceInput(
+                        file_id=file_id,
+                        evidence_type="document_image",
+                        source_kind="file_pdf_image",
+                        source_locator=source_locator,
+                        page_ref=f"page:{page_number}.image:{image_index}",
+                        page_index=page_number,
+                        image_path=image_path,
+                        mime_type=f"image/{'jpeg' if ext.lower() == 'jpg' else ext.lower()}",
+                        width=width,
+                        height=height,
+                        extraction_method="pdf_embedded_image",
+                        fingerprint=fingerprint,
+                    )
+                )
+
+            if len(page_text) < 80 and page.get_images(full=True):
+                image_id = str(uuid.uuid4())
+                image_path = os.path.join(image_dir, f"{image_id}_page_{page_number}.png")
+                pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+                pix.save(image_path)
+                width, height = image_dimensions(image_path)
+                if width < 120 or height < 120 or not is_informative_image(image_path):
+                    remove_file_quietly(image_path)
+                    continue
+                fingerprint = image_fingerprint(image_path)
+                if is_duplicate_fingerprint(fingerprint, seen_fingerprints):
+                    remove_file_quietly(image_path)
+                    duplicate_count += 1
+                    continue
+                if fingerprint:
+                    seen_fingerprints.add(fingerprint)
+                images.append(
+                    ImageEvidenceInput(
+                        file_id=file_id,
+                        evidence_type="page_snapshot",
+                        source_kind="file_pdf_page_snapshot",
+                        source_locator=source_locator,
+                        page_ref=f"page:{page_number}.snapshot",
+                        page_index=page_number,
+                        image_path=image_path,
+                        mime_type="image/png",
+                        width=width,
+                        height=height,
+                        extraction_method="pdf_page_snapshot_text_poor",
+                        fingerprint=fingerprint,
+                    )
+                )
+
+        doc.close()
+    except Exception as exc:
+        warnings.append(f"PDF image extraction failed for `{source_locator}`: {str(exc)}")
+    if duplicate_count:
+        warnings.append(f"{source_locator}: skipped {duplicate_count} duplicate extracted images.")
+
+    return images, warnings
+
+
+def extract_images_from_pptx(file_path: str, material_id: str, file_id: str, source_locator: str):
+    images: list[ImageEvidenceInput] = []
+    warnings: list[str] = []
+    seen_fingerprints: set[str] = set()
+    duplicate_count = 0
+    try:
+        from pptx import Presentation  # type: ignore
+        from pptx.enum.shapes import MSO_SHAPE_TYPE  # type: ignore
+
+        image_dir = material_image_dir(material_id, file_id)
+        prs = Presentation(file_path)
+        for slide_index, slide in enumerate(prs.slides, start=1):
+            image_index = 0
+            for shape in slide.shapes:
+                if shape.shape_type != MSO_SHAPE_TYPE.PICTURE:
+                    continue
+                image_index += 1
+                image = shape.image
+                ext = image.ext or "png"
+                image_id = str(uuid.uuid4())
+                image_path = os.path.join(image_dir, f"{image_id}.{ext}")
+                with open(image_path, "wb") as f:
+                    f.write(image.blob)
+                width, height = image_dimensions(image_path)
+                if width < 80 or height < 80 or not is_informative_image(image_path):
+                    remove_file_quietly(image_path)
+                    continue
+                fingerprint = image_fingerprint(image_path)
+                if is_duplicate_fingerprint(fingerprint, seen_fingerprints):
+                    remove_file_quietly(image_path)
+                    duplicate_count += 1
+                    continue
+                if fingerprint:
+                    seen_fingerprints.add(fingerprint)
+                images.append(
+                    ImageEvidenceInput(
+                        file_id=file_id,
+                        evidence_type="slide_image",
+                        source_kind="file_slide_image",
+                        source_locator=source_locator,
+                        page_ref=f"slide:{slide_index}.image:{image_index}",
+                        page_index=slide_index,
+                        image_path=image_path,
+                        mime_type=f"image/{'jpeg' if ext.lower() == 'jpg' else ext.lower()}",
+                        width=width,
+                        height=height,
+                        extraction_method="pptx_picture_shape",
+                        fingerprint=fingerprint,
+                    )
+                )
+    except Exception as exc:
+        warnings.append(f"Slide image extraction failed for `{source_locator}`: {str(exc)}")
+    if duplicate_count:
+        warnings.append(f"{source_locator}: skipped {duplicate_count} duplicate extracted images.")
+    return images, warnings
+
+
+def extract_images_from_file(file_path: str, filename: str, material_id: str, file_id: str):
+    lower = filename.lower()
+    if lower.endswith(".pdf"):
+        return extract_images_from_pdf(file_path, material_id, file_id, filename)
+    if lower.endswith(".pptx") or lower.endswith(".ppt"):
+        return extract_images_from_pptx(file_path, material_id, file_id, filename)
+    return [], []
+
+
+def dedupe_image_inputs(images: list[ImageEvidenceInput]) -> tuple[list[ImageEvidenceInput], int]:
+    seen: set[str] = set()
+    unique_images: list[ImageEvidenceInput] = []
+    duplicate_count = 0
+    for image in images:
+        fingerprint = image.fingerprint or image_fingerprint(image.image_path)
+        image.fingerprint = fingerprint
+        if is_duplicate_fingerprint(fingerprint, seen):
+            remove_file_quietly(image.image_path)
+            duplicate_count += 1
+            continue
+        if fingerprint:
+            seen.add(fingerprint)
+        unique_images.append(image)
+    return unique_images, duplicate_count
 
 
 def extract_text_from_pdf(file_path: str):
@@ -1902,6 +2812,28 @@ async def download_file(material_id: str, file_id: str):
     )
 
 
+@router.get("/materials/{material_id}/images/{image_id}")
+async def download_image_evidence(material_id: str, image_id: str):
+    with get_connection() as con:
+        row = con.execute(
+            """
+            SELECT *
+            FROM image_evidence
+            WHERE material_id = ? AND id = ?
+            """,
+            (material_id, image_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Image evidence not found")
+    if not os.path.exists(row["image_path"]):
+        raise HTTPException(status_code=404, detail="Stored image evidence is missing")
+    return FileResponse(
+        row["image_path"],
+        media_type=row["mime_type"] or "image/png",
+        filename=os.path.basename(row["image_path"]),
+    )
+
+
 @router.get("/collections")
 async def list_collections():
     with get_connection() as con:
@@ -1920,6 +2852,7 @@ async def list_collections():
 @router.post("/materials/{material_id}/extract")
 async def extract_material_text(
     material_id: str,
+    background_tasks: BackgroundTasks,
     payload: ExtractRequest,
     force: bool = False,
 ):
@@ -1938,12 +2871,38 @@ async def extract_material_text(
         ).fetchall()
 
         if force:
+            old_images = con.execute(
+                """
+                SELECT image_path
+                FROM image_evidence
+                WHERE material_id = ?
+                """,
+                (material_id,),
+            ).fetchall()
+            for image in old_images:
+                remove_file_quietly(image["image_path"])
+            con.execute(
+                "DELETE FROM segment_embeddings WHERE material_id = ?",
+                (material_id,),
+            )
+            con.execute(
+                "DELETE FROM image_embeddings WHERE material_id = ?",
+                (material_id,),
+            )
             con.execute(
                 "DELETE FROM extracted_segments WHERE material_id = ?",
                 (material_id,),
             )
             con.execute(
+                "DELETE FROM image_evidence WHERE material_id = ?",
+                (material_id,),
+            )
+            con.execute(
                 "DELETE FROM discovered_links WHERE material_id = ?",
+                (material_id,),
+            )
+            con.execute(
+                "DELETE FROM extraction_runs WHERE material_id = ?",
                 (material_id,),
             )
         else:
@@ -1963,6 +2922,7 @@ async def extract_material_text(
                 )
             
     all_segments: list[tuple[str | None, SegmentInput]] = []
+    all_images: list[ImageEvidenceInput] = []
     extraction_warnings: list[str] = []
     for file_row in files:
         file_extraction = extract_text_from_file(
@@ -1977,6 +2937,17 @@ async def extract_material_text(
         for seg in file_extraction.segments:
             seg.source_locator = file_row["original_filename"]
             all_segments.append((file_row["id"], seg))
+
+        image_extraction, image_warnings = extract_images_from_file(
+            file_row["stored_path"],
+            file_row["original_filename"],
+            material_id,
+            file_row["id"],
+        )
+        for image in image_extraction:
+            image.ocr_text = ocr_image_file(image.image_path)
+        all_images.extend(image_extraction)
+        extraction_warnings.extend(image_warnings)
         if len(all_segments) >= payload.max_segments:
             break
 
@@ -2010,6 +2981,11 @@ async def extract_material_text(
                 )
 
     all_segments = all_segments[: payload.max_segments]
+    all_images, duplicate_image_count = dedupe_image_inputs(all_images)
+    if duplicate_image_count:
+        extraction_warnings.append(
+            f"Skipped {duplicate_image_count} duplicate image artifacts across this material."
+        )
 
     run_status = "ok" if all_segments else "empty"
     run_message = "; ".join(extraction_warnings[:10]) if extraction_warnings else None
@@ -2033,6 +3009,37 @@ async def extract_material_text(
                     segment.page_index,
                     segment.content_text,
                     len(segment.content_text),
+                    ts,
+                ),
+            )
+
+        for image in all_images:
+            image_id = str(uuid.uuid4())
+            con.execute(
+                """
+                INSERT INTO image_evidence (
+                    id, material_id, file_id, evidence_type, source_kind,
+                    source_locator, page_ref, page_index, image_path, mime_type,
+                    width, height, extraction_method, ocr_text, visual_caption, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    image_id,
+                    material_id,
+                    image.file_id,
+                    image.evidence_type,
+                    image.source_kind,
+                    image.source_locator,
+                    image.page_ref,
+                    image.page_index,
+                    image.image_path,
+                    image.mime_type,
+                    image.width,
+                    image.height,
+                    image.extraction_method,
+                    image.ocr_text,
+                    image.visual_caption,
                     ts,
                 ),
             )
@@ -2081,10 +3088,33 @@ async def extract_material_text(
         )
         con.execute("UPDATE materials SET updated_at = ? WHERE id = ?", (ts, material_id))
 
+    image_label_job_id = None
+    if all_images:
+        image_label_job_id = str(uuid.uuid4())
+        IMAGE_INDEX_JOBS[image_label_job_id] = {
+            "job_id": image_label_job_id,
+            "status": "queued",
+            "created_at": now_iso(),
+            "material_id": material_id,
+            "limit": max(len(all_images), 1),
+            "force": True,
+        }
+        label_payload = BuildSemanticIndexRequest(
+            material_id=material_id,
+            limit=max(len(all_images), 1),
+            force=True,
+        )
+        if background_tasks:
+            background_tasks.add_task(run_image_index_job, image_label_job_id, label_payload)
+        else:
+            await run_image_index_job(image_label_job_id, label_payload)
+
     return {
         "run_id": run_id,
         "material_id": material_id,
         "extracted_segment_count": len(all_segments),
+        "image_evidence_count": len(all_images),
+        "image_label_job_id": image_label_job_id,
         "discovered_link_count": len(link_logs),
         "status": run_status,
         "warnings": extraction_warnings,
@@ -2092,6 +3122,7 @@ async def extract_material_text(
 
 @router.post("/extract-ready")
 async def extract_ready_materials(
+    background_tasks: BackgroundTasks,
     limit: int = Query(25, ge=1, le=100),
     force: bool = False,
     include_links: bool = True,
@@ -2134,6 +3165,7 @@ async def extract_ready_materials(
         try:
             result = await extract_material_text(
                 material_id=material_id,
+                background_tasks=background_tasks,
                 payload=payload,
                 force=force,
             )
@@ -2198,6 +3230,17 @@ async def get_material_extracted(material_id: str, limit: int = Query(200, ge=1,
             """,
             (material_id,),
         ).fetchall()
+        images = con.execute(
+            """
+            SELECT id AS image_id, material_id, file_id, evidence_type,
+                source_kind, source_locator, page_ref, page_index, image_path, mime_type,
+                width, height, extraction_method, ocr_text, visual_caption, created_at
+            FROM image_evidence
+            WHERE material_id = ?
+            ORDER BY page_index ASC, created_at ASC
+            """,
+            (material_id,),
+        ).fetchall()
         runs = con.execute(
             """
             SELECT id, include_links, max_link_depth, max_link_pages,
@@ -2213,6 +3256,14 @@ async def get_material_extracted(material_id: str, limit: int = Query(200, ge=1,
     return {
         "segments": [dict(row) for row in segments],
         "discovered_links": [dict(row) for row in links],
+        "images": [
+            {
+                **{key: value for key, value in dict(row).items() if key != "image_path"},
+                "image_url": image_url(row["material_id"], row["image_id"]),
+            }
+            for row in images
+            if is_informative_image(row["image_path"])
+        ],
         "runs": [dict(row) for row in runs],
     }
 
@@ -2234,9 +3285,23 @@ async def get_ai_status():
                 """,
                 (OLLAMA_EMBEDDING_MODEL,),
             ).fetchone()[0]
+            image_count = con.execute(
+                "SELECT COUNT(*) FROM image_evidence"
+            ).fetchone()[0]
+            embedded_image_count = con.execute(
+                """
+                SELECT COUNT(*)
+                FROM image_embeddings
+                WHERE model = ?
+                AND method_version = ?
+                """,
+                (OLLAMA_EMBEDDING_MODEL, MULTIMODAL_METHOD_VERSION),
+            ).fetchone()[0]
         except sqlite3.OperationalError:
             segment_count = 0
             embedded_count = 0
+            image_count = 0
+            embedded_image_count = 0
 
     return {
         "provider_configured": is_ollama_available,
@@ -2246,6 +3311,8 @@ async def get_ai_status():
         "chat_model": OLLAMA_RETRIEVAL_MODEL,
         "segment_count": segment_count,
         "embedded_segment_count": embedded_count,
+        "image_evidence_count": image_count,
+        "embedded_image_count": embedded_image_count,
         "default_mode": "evidence_only",
         "status_message": (
             "Ollama is reachable."
@@ -2275,6 +3342,99 @@ async def build_semantic_index(payload: BuildSemanticIndexRequest):
     return result
 
 
+@router.post("/ai/image-index")
+async def build_image_index(payload: BuildSemanticIndexRequest):
+    if not await ollama_available():
+        return {
+            "provider_configured": False,
+            "indexed_count": 0,
+            "captioned_count": 0,
+            "message": "Ollama is not reachable from the backend.",
+        }
+    with get_connection() as con:
+        if payload.material_id:
+            ensure_material(con, payload.material_id)
+        result = await index_missing_image_embeddings(
+            con,
+            material_id=payload.material_id,
+            limit=payload.limit,
+            force=payload.force,
+        )
+    return result
+
+
+async def run_image_index_job(job_id: str, payload: BuildSemanticIndexRequest):
+    IMAGE_INDEX_JOBS[job_id] = {
+        **IMAGE_INDEX_JOBS.get(job_id, {}),
+        "status": "running",
+        "started_at": now_iso(),
+    }
+    try:
+        if not await ollama_available():
+            IMAGE_INDEX_JOBS[job_id].update(
+                {
+                    "status": "error",
+                    "finished_at": now_iso(),
+                    "result": {
+                        "provider_configured": False,
+                        "indexed_count": 0,
+                        "captioned_count": 0,
+                        "removed_blank_count": 0,
+                        "message": "Ollama is not reachable from the backend.",
+                    },
+                }
+            )
+            return
+
+        with get_connection() as con:
+            if payload.material_id:
+                ensure_material(con, payload.material_id)
+            result = await index_missing_image_embeddings(
+                con,
+                material_id=payload.material_id,
+                limit=payload.limit,
+                force=payload.force,
+            )
+        IMAGE_INDEX_JOBS[job_id].update(
+            {
+                "status": "done",
+                "finished_at": now_iso(),
+                "result": result,
+            }
+        )
+    except Exception as exc:
+        IMAGE_INDEX_JOBS[job_id].update(
+            {
+                "status": "error",
+                "finished_at": now_iso(),
+                "error": str(exc),
+            }
+        )
+
+
+@router.post("/ai/image-index/start")
+async def start_image_index_job(payload: BuildSemanticIndexRequest, background_tasks: BackgroundTasks):
+    job_id = str(uuid.uuid4())
+    IMAGE_INDEX_JOBS[job_id] = {
+        "job_id": job_id,
+        "status": "queued",
+        "created_at": now_iso(),
+        "material_id": payload.material_id,
+        "limit": payload.limit,
+        "force": payload.force,
+    }
+    background_tasks.add_task(run_image_index_job, job_id, payload)
+    return IMAGE_INDEX_JOBS[job_id]
+
+
+@router.get("/ai/image-index/jobs/{job_id}")
+async def get_image_index_job(job_id: str):
+    job = IMAGE_INDEX_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Image index job not found")
+    return job
+
+
 @router.post("/ai/semantic-search")
 async def semantic_search(payload: SemanticSearchRequest):
     if not await ollama_available():
@@ -2290,6 +3450,53 @@ async def semantic_search(payload: SemanticSearchRequest):
         }
 
     return await semantic_search_segments(payload)
+
+
+@router.post("/ai/multimodal-search")
+async def multimodal_search(payload: MultimodalSearchRequest):
+    if not await ollama_available():
+        return {
+            "query": payload.query,
+            "mode": "multimodal_evidence_search",
+            "provider_configured": False,
+            "results": [],
+            "image_results": [],
+            "related_observations": [],
+            "evidence_note": (
+                "Multimodal search is available when Ollama is configured and running."
+            ),
+        }
+
+    text_payload = SemanticSearchRequest(
+        query=payload.query,
+        material_id=payload.material_id,
+        limit=payload.limit,
+        include_observations=payload.include_observations,
+    )
+    text_results = await semantic_search_segments(text_payload)
+    image_results = (
+        await search_image_evidence(payload)
+        if payload.include_images
+        else {"image_results": [], "index_result": None}
+    )
+
+    return {
+        "query": payload.query,
+        "mode": "multimodal_evidence_search",
+        "provider_configured": True,
+        "embedding_model": OLLAMA_EMBEDDING_MODEL,
+        "vision_model": OLLAMA_VISION_MODEL,
+        "method_version": MULTIMODAL_METHOD_VERSION,
+        "text_index_result": text_results.get("index_result"),
+        "image_index_result": image_results.get("index_result"),
+        "results": text_results["results"],
+        "image_results": image_results["image_results"],
+        "related_observations": text_results["related_observations"],
+        "evidence_note": (
+            "Text passages and document images are searched separately, then shown as citable evidence. "
+            "Image captions are observable descriptions, not interpretations."
+        ),
+    }
 
 
 @router.post("/ai/ask")
@@ -2313,6 +3520,15 @@ async def ask_corpus(payload: AskCorpusRequest):
         include_observations=True,
     )
     retrieval = await semantic_search_segments(semantic_payload)
+    image_retrieval = await search_image_evidence(
+        MultimodalSearchRequest(
+            query=payload.question,
+            material_id=payload.material_id,
+            limit=min(payload.max_results, 6),
+            include_observations=True,
+            include_images=True,
+        )
+    )
     evidence = retrieval["results"]
 
     if not evidence:
@@ -2333,6 +3549,7 @@ async def ask_corpus(payload: AskCorpusRequest):
         "answer": answer,
         "citations": [item["citation"] for item in evidence],
         "retrieved_passages": evidence,
+        "image_results": image_retrieval["image_results"],
         "related_observations": retrieval["related_observations"],
         "evidence_note": (
             "Answer generated in evidence-only mode from retrieved passages. "
@@ -2355,6 +3572,15 @@ async def generate_ai_evidence_report(payload: SemanticSearchRequest):
         }
 
     retrieval = await semantic_search_segments(payload)
+    image_retrieval = await search_image_evidence(
+        MultimodalSearchRequest(
+            query=payload.query,
+            material_id=payload.material_id,
+            limit=payload.limit,
+            include_observations=payload.include_observations,
+            include_images=True,
+        )
+    )
     grouped: dict[str, dict] = {}
 
     for item in retrieval["results"]:
@@ -2366,6 +3592,7 @@ async def generate_ai_evidence_report(payload: SemanticSearchRequest):
                 "material_title": item["material_title"],
                 "citations": [],
                 "passages": [],
+                "image_passages": [],
             }
         grouped[key]["citations"].append(item["citation"])
         grouped[key]["passages"].append(
@@ -2377,10 +3604,24 @@ async def generate_ai_evidence_report(payload: SemanticSearchRequest):
             }
         )
 
+    for item in image_retrieval["image_results"]:
+        key = item["material_id"]
+        if key not in grouped:
+            grouped[key] = {
+                "theme": item["material_title"],
+                "material_id": item["material_id"],
+                "material_title": item["material_title"],
+                "citations": [],
+                "passages": [],
+                "image_passages": [],
+            }
+        grouped[key].setdefault("image_passages", []).append(item)
+
     return {
         "query": payload.query,
         "provider_configured": True,
         "themes": list(grouped.values()),
+        "image_results": image_retrieval["image_results"],
         "related_observations": retrieval["related_observations"],
         "evidence_note": (
             "Grouped by source title for review. This report surfaces evidence candidates "
@@ -2447,6 +3688,11 @@ async def create_material_observation(material_id: str, payload: ObservationCrea
             material_id,
             payload.source_segment_id,
         )
+        image = ensure_image_belongs_to_material(
+            con,
+            material_id,
+            payload.source_image_id,
+        )
 
         source_page_ref = payload.source_page_ref
         source_locator = payload.source_locator
@@ -2456,20 +3702,33 @@ async def create_material_observation(material_id: str, payload: ObservationCrea
             source_page_ref = source_page_ref or segment["page_ref"]
             source_locator = source_locator or segment["source_locator"]
             context_quote = context_quote or segment["content_text"]
+        if image:
+            source_page_ref = source_page_ref or image["page_ref"]
+            source_locator = source_locator or image["source_locator"]
+            context_quote = context_quote or clean_extracted_text(
+                "\n\n".join(
+                    part for part in [
+                        image["visual_caption"] or "",
+                        image["ocr_text"] or "",
+                    ]
+                    if part
+                )
+            )
 
         con.execute(
             """
             INSERT INTO observations (
-                id, material_id, source_segment_id, observation_type,
+                id, material_id, source_segment_id, source_image_id, observation_type,
                 observed_text, source_page_ref, source_locator, context_quote,
                 notes, observed_by, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 observation_id,
                 material_id,
                 payload.source_segment_id,
+                payload.source_image_id,
                 payload.observation_type,
                 observed_text,
                 source_page_ref,
@@ -2482,6 +3741,11 @@ async def create_material_observation(material_id: str, payload: ObservationCrea
             ),
         )
         con.execute("UPDATE materials SET updated_at = ? WHERE id = ?", (ts, material_id))
+        if payload.source_image_id:
+            con.execute(
+                "DELETE FROM image_embeddings WHERE image_id = ?",
+                (payload.source_image_id,),
+            )
         row = con.execute(
             "SELECT * FROM observations WHERE id = ?",
             (observation_id,),
@@ -2526,6 +3790,12 @@ async def update_material_observation(
                 material_id,
                 updates["source_segment_id"],
             )
+        if "source_image_id" in updates:
+            ensure_image_belongs_to_material(
+                con,
+                material_id,
+                updates["source_image_id"],
+            )
 
         updates["updated_at"] = now_iso()
         assignments = ", ".join(f"{key} = ?" for key in updates.keys())
@@ -2538,6 +3808,19 @@ async def update_material_observation(
             "UPDATE materials SET updated_at = ? WHERE id = ?",
             (updates["updated_at"], material_id),
         )
+        affected_image_ids = {
+            image_id
+            for image_id in [
+                existing["source_image_id"],
+                updates.get("source_image_id"),
+            ]
+            if image_id
+        }
+        for image_id in affected_image_ids:
+            con.execute(
+                "DELETE FROM image_embeddings WHERE image_id = ?",
+                (image_id,),
+            )
         row = con.execute(
             "SELECT * FROM observations WHERE id = ?",
             (observation_id,),
@@ -2552,7 +3835,7 @@ async def delete_material_observation(material_id: str, observation_id: str):
         ensure_material(con, material_id)
         row = con.execute(
             """
-            SELECT id
+            SELECT id, source_image_id
             FROM observations
             WHERE id = ? AND material_id = ?
             """,
@@ -2565,6 +3848,11 @@ async def delete_material_observation(material_id: str, observation_id: str):
             "DELETE FROM observations WHERE id = ? AND material_id = ?",
             (observation_id, material_id),
         )
+        if row["source_image_id"]:
+            con.execute(
+                "DELETE FROM image_embeddings WHERE image_id = ?",
+                (row["source_image_id"],),
+            )
         con.execute(
             "UPDATE materials SET updated_at = ? WHERE id = ?",
             (now_iso(), material_id),

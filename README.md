@@ -88,6 +88,7 @@ To enable semantic search and Ask Corpus, run Ollama and set:
 REPOSITORY_OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_EMBEDDING_MODEL=nomic-embed-text
 OLLAMA_RETRIEVAL_MODEL=llama3.1
+OLLAMA_VISION_MODEL=llava
 ```
 
 Recommended local models:
@@ -95,11 +96,13 @@ Recommended local models:
 ```bash
 ollama pull nomic-embed-text
 ollama pull llama3.1
+ollama pull llava
 ```
 
 The AI layer is evidence-only:
 
 - semantic search returns retrieved passages with source/page/segment citations
+- multimodal search keeps document images separate and retrieves them through OCR plus local vision captions
 - Ask Corpus answers only from retrieved passages
 - responses must say when evidence is weak or absent
 - observations remain human-reviewed source records, not AI interpretations
