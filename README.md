@@ -102,10 +102,10 @@ OLLAMA_VISION_MODEL=llava
 Recommended local models:
 
 ```bash
-ollama pull nomic-embed-text
-ollama pull llama3.1
-ollama pull llava
+./scripts/setup_ollama_models.sh
 ```
+
+The setup script checks that Ollama is installed and reachable, then pulls `nomic-embed-text`, `llama3.1`, and `llava`, preloads the review model, and prints when Local AI is ready. Override the defaults with `OLLAMA_EMBEDDING_MODEL`, `OLLAMA_RETRIEVAL_MODEL`, or `OLLAMA_VISION_MODEL` when needed. The frontend also serves nontechnical setup downloads under `/local-ai/` for macOS and Windows users.
 
 For the first shared-team Railway deployment, leave `REPOSITORY_OLLAMA_BASE_URL` and `OLLAMA_BASE_URL` empty unless the backend can reach a private Ollama host. The repository AI status endpoint will report AI as unavailable while exact search, uploads, extraction, observations, and downloadable reports continue to work.
 
