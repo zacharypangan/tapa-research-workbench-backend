@@ -6,7 +6,6 @@ import math
 import re
 import sqlite3
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from html import unescape
 from html.parser import HTMLParser
@@ -16,191 +15,48 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
-from app.infra.settings import OLLAMA_BASE_URL
+from app.repository.schemas import (
+    AskCorpusRequest,
+    BuildSemanticIndexRequest,
+    ExtractRequest,
+    ExtractionResult,
+    ImageEvidenceInput,
+    MaterialCreate,
+    MaterialUpdate,
+    MultimodalSearchRequest,
+    ObservationCreate,
+    ObservationUpdate,
+    SearchReportRequest,
+    SegmentInput,
+    SemanticSearchRequest,
+)
+from app.repository.search_reports import (
+    build_term_pattern,
+    enrich_evidence_classification,
+    find_term_contexts_in_segment,
+    matched_terms_for_text,
+    maybe_parse_wordlist_rows,
+    parse_report_terms,
+)
+from app.repository.settings import (
+    DB_PATH,
+    EMBEDDING_TEXT_LIMIT,
+    FILES_ROOT,
+    IMAGE_INDEX_JOBS,
+    IMAGES_ROOT,
+    MULTIMODAL_METHOD_VERSION,
+    OBSERVATION_TYPES,
+    OLLAMA_EMBEDDING_MODEL,
+    OLLAMA_REPOSITORY_BASE_URL,
+    OLLAMA_RETRIEVAL_MODEL,
+    OLLAMA_VISION_MODEL,
+    SOURCE_TYPES,
+    STATUSES,
+    STORAGE_ROOT,
+)
 
 
 router = APIRouter(prefix="/repository", tags=["repository"])
-
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-STORAGE_ROOT = os.getenv(
-    "REPOSITORY_STORAGE_ROOT",
-    os.path.join(BASE_DIR, "storage", "repository"),
-)
-FILES_ROOT = os.path.join(STORAGE_ROOT, "files")
-IMAGES_ROOT = os.path.join(STORAGE_ROOT, "images")
-DB_PATH = os.path.join(STORAGE_ROOT, "repository.sqlite")
-OLLAMA_REPOSITORY_BASE_URL = os.getenv("REPOSITORY_OLLAMA_BASE_URL", OLLAMA_BASE_URL).rstrip("/")
-OLLAMA_EMBEDDING_MODEL = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
-OLLAMA_RETRIEVAL_MODEL = os.getenv("OLLAMA_RETRIEVAL_MODEL", "llama3.1")
-OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llava")
-EMBEDDING_TEXT_LIMIT = 2000
-MULTIMODAL_METHOD_VERSION = "multimodal_evidence_v2_context"
-IMAGE_INDEX_JOBS: dict[str, dict] = {}
-
-SOURCE_TYPES = {
-    "publication",
-    "ethnography",
-    "presentation",
-    "dictionary",
-    "anthropological_record",
-    "workshop_material",
-    "bibliography",
-    "pdf",
-    "slide",
-    "other",
-}
-
-STATUSES = {
-    "uploaded",
-    "needs_metadata",
-    "metadata_complete",
-    "needs_review",
-    "ready_for_text_extraction",
-}
-
-OBSERVATION_TYPES = {
-    "term",
-    "motif",
-    "place",
-    "material",
-    "process",
-    "other",
-}
-
-
-class MaterialCreate(BaseModel):
-    title: str = Field(default="Untitled material", max_length=500)
-    authors: Optional[str] = Field(default=None, max_length=1000)
-    year: Optional[str] = Field(default=None, max_length=64)
-    source_type: str = "other"
-    collection: Optional[str] = Field(default=None, max_length=255)
-    abstract_or_notes: Optional[str] = None
-    source_url: Optional[str] = Field(default=None, max_length=2000)
-    language: Optional[str] = Field(default=None, max_length=255)
-    region: Optional[str] = Field(default=None, max_length=255)
-    uploaded_by: Optional[str] = Field(default=None, max_length=255)
-    raw_reference: Optional[str] = None
-    keywords: Optional[str] = None
-    auto_keywords: Optional[str] = None
-    status: str = "needs_metadata"
-
-
-class MaterialUpdate(BaseModel):
-    title: Optional[str] = Field(default=None, max_length=500)
-    authors: Optional[str] = Field(default=None, max_length=1000)
-    year: Optional[str] = Field(default=None, max_length=64)
-    source_type: Optional[str] = None
-    collection: Optional[str] = Field(default=None, max_length=255)
-    abstract_or_notes: Optional[str] = None
-    source_url: Optional[str] = Field(default=None, max_length=2000)
-    language: Optional[str] = Field(default=None, max_length=255)
-    region: Optional[str] = Field(default=None, max_length=255)
-    uploaded_by: Optional[str] = Field(default=None, max_length=255)
-    raw_reference: Optional[str] = None
-    keywords: Optional[str] = None
-    auto_keywords: Optional[str] = None
-    status: Optional[str] = None
-
-
-class ExtractRequest(BaseModel):
-    include_links: bool = True
-    max_link_depth: int = Field(default=1, ge=0, le=3)
-    max_link_pages: int = Field(default=20, ge=1, le=200)
-    max_segments: int = Field(default=1000, ge=1, le=5000)
-
-class SearchReportRequest(BaseModel):
-    query: str = Field(..., min_length=2, max_length=500)
-    context_window: int = Field(default=1, ge=0, le=3)
-    max_results: int = Field(default=200, ge=1, le=1000)
-    material_id: Optional[str] = None
-
-
-class ObservationCreate(BaseModel):
-    observation_type: str = "term"
-    observed_text: str = Field(..., min_length=1, max_length=1000)
-    source_segment_id: Optional[int] = None
-    source_image_id: Optional[str] = None
-    source_page_ref: Optional[str] = Field(default=None, max_length=255)
-    source_locator: Optional[str] = Field(default=None, max_length=2000)
-    context_quote: Optional[str] = None
-    notes: Optional[str] = None
-    observed_by: Optional[str] = Field(default=None, max_length=255)
-
-
-class ObservationUpdate(BaseModel):
-    observation_type: Optional[str] = None
-    observed_text: Optional[str] = Field(default=None, min_length=1, max_length=1000)
-    source_segment_id: Optional[int] = None
-    source_image_id: Optional[str] = None
-    source_page_ref: Optional[str] = Field(default=None, max_length=255)
-    source_locator: Optional[str] = Field(default=None, max_length=2000)
-    context_quote: Optional[str] = None
-    notes: Optional[str] = None
-    observed_by: Optional[str] = Field(default=None, max_length=255)
-
-
-class SemanticSearchRequest(BaseModel):
-    query: str = Field(..., min_length=2, max_length=500)
-    material_id: Optional[str] = None
-    limit: int = Field(default=12, ge=1, le=50)
-    include_observations: bool = True
-    auto_index: bool = False
-
-
-class AskCorpusRequest(BaseModel):
-    question: str = Field(..., min_length=2, max_length=1000)
-    material_id: Optional[str] = None
-    max_results: int = Field(default=8, ge=1, le=20)
-
-
-class BuildSemanticIndexRequest(BaseModel):
-    material_id: Optional[str] = None
-    limit: int = Field(default=200, ge=1, le=1000)
-    force: bool = False
-
-
-class MultimodalSearchRequest(BaseModel):
-    query: str = Field(..., min_length=2, max_length=500)
-    material_id: Optional[str] = None
-    limit: int = Field(default=12, ge=1, le=50)
-    include_observations: bool = True
-    include_images: bool = True
-    auto_index_images: bool = False
-    image_index_limit: int = Field(default=0, ge=0, le=100)
-
-@dataclass
-class SegmentInput:
-    source_kind: str
-    source_locator: str
-    page_ref: str
-    page_index: int
-    content_text: str
-
-
-@dataclass
-class ExtractionResult:
-    segments: list[SegmentInput]
-    warnings: list[str]
-
-
-@dataclass
-class ImageEvidenceInput:
-    file_id: Optional[str]
-    evidence_type: str
-    source_kind: str
-    source_locator: str
-    page_ref: str
-    page_index: int
-    image_path: str
-    mime_type: str
-    width: int
-    height: int
-    extraction_method: str
-    ocr_text: str = ""
-    visual_caption: str = ""
-    fingerprint: str = ""
-
 
 class HtmlTextAndLinksParser(HTMLParser):
     def __init__(self):
@@ -1263,13 +1119,6 @@ async def semantic_search_segments(payload: SemanticSearchRequest) -> dict:
             "not interpretations."
         ),
     }
-
-
-def matched_terms_for_text(text: str, terms: list[str]) -> list[str]:
-    return [
-        term for term in terms
-        if build_term_pattern(term).search(text or "")
-    ]
 
 
 def image_embedding_text(row: sqlite3.Row) -> str:
@@ -2380,128 +2229,6 @@ async def crawl_and_extract_links(
                 pending.append((normalized_child, depth + 1, str(response.url)))
     return segments, links_log
 
-def parse_report_terms(query: str) -> list[str]:
-    """
-    Parse comma/newline/semicolon separated search terms.
-    Example:
-    paper mulberry, tapa cloth, tapa beater, beat
-    """
-    parts = re.split(r"[,;\n]+", query or "")
-    terms = []
-
-    for part in parts:
-        cleaned = re.sub(r"\s+", " ", part).strip()
-        if cleaned and cleaned.lower() not in {term.lower() for term in terms}:
-            terms.append(cleaned)
-
-    return terms
-
-
-def build_term_pattern(term: str) -> re.Pattern:
-    """
-    Build a conservative regex for a term or phrase.
-    Special case: beat also matches beats, beating, beaten.
-    """
-    cleaned = re.sub(r"\s+", " ", term.strip().lower())
-
-    if cleaned in {"beat", "beat verb", "beat (verb)"}:
-        return re.compile(r"\b(beat|beats|beating|beaten)\b", re.IGNORECASE)
-
-    escaped_parts = [re.escape(part) for part in cleaned.split()]
-    phrase_pattern = r"\s+".join(escaped_parts)
-
-    return re.compile(rf"\b{phrase_pattern}\b", re.IGNORECASE)
-
-
-def split_context_paragraphs(text: str) -> list[str]:
-    """
-    Split extracted text into paragraph-like units.
-    Falls back to sentence grouping if the text has no paragraph breaks.
-    """
-    cleaned = clean_extracted_text(text)
-
-    if not cleaned:
-        return []
-
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", cleaned) if p.strip()]
-
-    if len(paragraphs) > 1:
-        return paragraphs
-
-    # Fallback for extraction outputs that became one long paragraph.
-    sentences = re.split(r"(?<=[.!?])\s+", cleaned)
-    grouped = []
-    current = ""
-
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-
-        if len(current) + len(sentence) + 1 <= 900:
-            current = f"{current} {sentence}".strip()
-        else:
-            if current:
-                grouped.append(current)
-            current = sentence
-
-    if current:
-        grouped.append(current)
-
-    return grouped or [cleaned]
-
-
-def find_term_contexts_in_segment(
-    content_text: str,
-    terms: list[str],
-    context_window: int,
-) -> list[dict]:
-    """
-    Return one result per paragraph containing at least one searched term.
-    Includes paragraphs before and after the match.
-    """
-    paragraphs = split_context_paragraphs(content_text)
-    patterns = [(term, build_term_pattern(term)) for term in terms]
-
-    results = []
-
-    for index, paragraph in enumerate(paragraphs):
-        matched_terms = [
-            term for term, pattern in patterns
-            if pattern.search(paragraph)
-        ]
-
-        if not matched_terms:
-            continue
-
-        before_start = max(0, index - context_window)
-        after_end = min(len(paragraphs), index + context_window + 1)
-
-        before_paragraphs = paragraphs[before_start:index]
-        after_paragraphs = paragraphs[index + 1:after_end]
-
-        context_text = "\n\n".join(before_paragraphs + [paragraph] + after_paragraphs)
-
-        terms_in_context = [
-            term for term, pattern in patterns
-            if pattern.search(context_text)
-        ]
-
-        results.append(
-            {
-                "paragraph_index": index,
-                "matched_terms": matched_terms,
-                "terms_in_context": terms_in_context,
-                "all_terms_in_context": len(terms_in_context) == len(terms),
-                "before": "\n\n".join(before_paragraphs),
-                "match": paragraph,
-                "after": "\n\n".join(after_paragraphs),
-                "context_text": context_text,
-            }
-        )
-
-    return results
-
 @router.get("/source-types")
 async def get_source_types():
     return {"source_types": sorted(SOURCE_TYPES)}
@@ -3582,6 +3309,7 @@ async def generate_ai_evidence_report(payload: SemanticSearchRequest):
         )
     )
     grouped: dict[str, dict] = {}
+    terms = parse_report_terms(payload.query)
 
     for item in retrieval["results"]:
         key = item["material_id"]
@@ -3593,15 +3321,26 @@ async def generate_ai_evidence_report(payload: SemanticSearchRequest):
                 "citations": [],
                 "passages": [],
                 "image_passages": [],
+                "_max_score": 0.0,
             }
-        grouped[key]["citations"].append(item["citation"])
-        grouped[key]["passages"].append(
+        classified = enrich_evidence_classification(
             {
                 "segment_id": item["segment_id"],
                 "page_ref": item["page_ref"],
                 "score": item["score"],
                 "content_text": item["content_text"],
-            }
+            },
+            item["content_text"],
+            terms,
+            item.get("source_kind") or "",
+            item.get("source_locator") or "",
+        )
+        grouped[key]["citations"].append(item["citation"])
+        grouped[key]["passages"].append(classified)
+        grouped[key]["_max_score"] = max(
+            grouped[key]["_max_score"],
+            float(item.get("semantic_score") or item.get("score") or 0),
+            float(classified.get("domain_relevance_score") or 0),
         )
 
     for item in image_retrieval["image_results"]:
@@ -3614,14 +3353,89 @@ async def generate_ai_evidence_report(payload: SemanticSearchRequest):
                 "citations": [],
                 "passages": [],
                 "image_passages": [],
+                "_max_score": 0.0,
             }
-        grouped[key].setdefault("image_passages", []).append(item)
+        image_text = clean_extracted_text(
+            "\n\n".join(
+                part for part in [
+                    item.get("ocr_text") or "",
+                    item.get("visual_caption") or "",
+                    item.get("source_locator") or "",
+                    item.get("page_ref") or "",
+                ]
+                if part
+            )
+        )
+        classified_image = enrich_evidence_classification(
+            item,
+            image_text,
+            terms,
+            item.get("source_kind") or "",
+            item.get("source_locator") or "",
+        )
+        grouped[key].setdefault("image_passages", []).append(classified_image)
+        grouped[key]["_max_score"] = max(
+            grouped[key]["_max_score"],
+            float(item.get("semantic_score") or item.get("score") or 0),
+            float(classified_image.get("domain_relevance_score") or 0),
+        )
+
+    themes = []
+    relevance_rank = {"high": 0, "medium": 1, "low": 2}
+    for group in grouped.values():
+        evidence_items = group["passages"] + group.get("image_passages", [])
+        high_count = sum(1 for item in evidence_items if item.get("research_relevance") == "high")
+        medium_count = sum(1 for item in evidence_items if item.get("research_relevance") == "medium")
+        low_count = sum(1 for item in evidence_items if item.get("research_relevance") == "low")
+        sense_counts: dict[str, int] = {}
+        for item in evidence_items:
+            sense = item.get("sense") or "needs_review"
+            sense_counts[sense] = sense_counts.get(sense, 0) + 1
+        group["high_relevance_count"] = high_count
+        group["medium_relevance_count"] = medium_count
+        group["low_relevance_count"] = low_count
+        group["dominant_senses"] = [
+            sense for sense, _count in sorted(
+                sense_counts.items(),
+                key=lambda entry: (-entry[1], entry[0]),
+            )[:3]
+        ]
+        group["passages"].sort(
+            key=lambda item: (
+                relevance_rank.get(item.get("research_relevance"), 3),
+                -float(item.get("domain_relevance_score") or 0),
+                -float(item.get("score") or 0),
+            )
+        )
+        group["image_passages"].sort(
+            key=lambda item: (
+                relevance_rank.get(item.get("research_relevance"), 3),
+                -float(item.get("domain_relevance_score") or 0),
+                -float(item.get("score") or 0),
+            )
+        )
+        themes.append(group)
+
+    themes.sort(
+        key=lambda group: (
+            -group["high_relevance_count"],
+            -group["medium_relevance_count"],
+            -float(group.get("_max_score") or 0),
+            group["material_title"].lower(),
+        )
+    )
+    for group in themes:
+        group.pop("_max_score", None)
 
     return {
         "query": payload.query,
         "provider_configured": True,
-        "themes": list(grouped.values()),
-        "image_results": image_retrieval["image_results"],
+        "themes": themes,
+        "image_results": [
+            image
+            for group in themes
+            for image in group.get("image_passages", [])
+        ],
         "related_observations": retrieval["related_observations"],
         "evidence_note": (
             "Grouped by source title for review. This report surfaces evidence candidates "
@@ -3971,7 +3785,7 @@ async def generate_search_report(payload: SearchReportRequest):
         )
 
         for context in contexts:
-            report_results.append(
+            result = enrich_evidence_classification(
                 {
                     "segment_id": row["segment_id"],
                     "material_id": row["material_id"],
@@ -3983,14 +3797,31 @@ async def generate_search_report(payload: SearchReportRequest):
                     "page_ref": row["page_ref"],
                     "page_index": row["page_index"],
                     **context,
-                }
+                },
+                context["context_text"],
+                terms,
+                row["source_kind"] or "",
+                row["source_locator"] or "",
             )
 
-            if len(report_results) >= payload.max_results:
-                break
+            wordlist_rows = maybe_parse_wordlist_rows(context["context_text"], terms)
+            if wordlist_rows:
+                result["wordlist_rows"] = wordlist_rows
 
-        if len(report_results) >= payload.max_results:
-            break
+            report_results.append(result)
+
+    relevance_rank = {"high": 0, "medium": 1, "low": 2}
+    report_results.sort(
+        key=lambda item: (
+            relevance_rank.get(item.get("research_relevance"), 3),
+            -float(item.get("domain_relevance_score") or 0),
+            (item.get("material_title") or "").lower(),
+            item.get("page_index") if item.get("page_index") is not None else 999999,
+            item.get("segment_id") or 0,
+            item.get("paragraph_index") or 0,
+        )
+    )
+    report_results = report_results[: payload.max_results]
 
     cooccurrence_count = sum(
         1 for item in report_results

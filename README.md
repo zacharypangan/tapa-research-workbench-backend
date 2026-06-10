@@ -78,6 +78,14 @@ storage/repository
 
 This folder is ignored by Git so the standalone repository stays lightweight.
 
+For Railway deployment, attach a persistent volume at `/app/storage` and set:
+
+```env
+REPOSITORY_STORAGE_ROOT=/app/storage/repository
+```
+
+This keeps `repository.sqlite`, uploaded files, and extracted images across restarts and deploys.
+
 ## Optional AI Retrieval
 
 Phase 4 AI features are optional. Exact search, extraction, and observations work without Ollama.
@@ -98,6 +106,8 @@ ollama pull nomic-embed-text
 ollama pull llama3.1
 ollama pull llava
 ```
+
+For the first shared-team Railway deployment, leave `REPOSITORY_OLLAMA_BASE_URL` and `OLLAMA_BASE_URL` empty unless the backend can reach a private Ollama host. The repository AI status endpoint will report AI as unavailable while exact search, uploads, extraction, observations, and downloadable reports continue to work.
 
 The AI layer is evidence-only:
 
@@ -120,6 +130,24 @@ git push -u origin main
 ## Integration
 
 See `INTEGRATION.md` for the files to port back into the original project.
+
+## Deployment
+
+Use Vercel for the Vite frontend and Railway for this Dockerized backend. See `DEPLOYMENT.md` for the exact settings.
+
+After deploying the backend, run:
+
+```bash
+python scripts/smoke_deploy.py https://<railway-backend-domain>
+```
+
+The smoke check verifies:
+
+```text
+GET /health
+GET /api/v1/repository/statuses
+GET /api/v1/repository/materials
+```
 
 ## Managing Python Version
 
