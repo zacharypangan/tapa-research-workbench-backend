@@ -64,6 +64,27 @@ OLLAMA_REPOSITORY_API_KEY = os.getenv(
     os.getenv("OLLAMA_API_KEY", ""),
 ).strip()
 
+EMBEDDING_PROVIDER = os.getenv(
+    "REPOSITORY_EMBEDDING_PROVIDER",
+    os.getenv("EMBEDDING_PROVIDER", "ollama"),
+).strip().lower()
+
+GEMINI_API_KEY = os.getenv(
+    "REPOSITORY_GEMINI_API_KEY",
+    os.getenv("GEMINI_API_KEY", ""),
+).strip()
+
+GEMINI_EMBEDDING_MODEL = os.getenv(
+    "REPOSITORY_GEMINI_EMBEDDING_MODEL",
+    os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001"),
+).strip()
+
+GEMINI_EMBEDDING_DIMENSIONS = int(os.getenv("REPOSITORY_GEMINI_EMBEDDING_DIMENSIONS", "768"))
+GEMINI_API_BASE_URL = os.getenv(
+    "REPOSITORY_GEMINI_API_BASE_URL",
+    "https://generativelanguage.googleapis.com/v1beta",
+).rstrip("/")
+
 
 def effective_ollama_base_url() -> str:
     if OLLAMA_REPOSITORY_BASE_URL:
@@ -108,11 +129,36 @@ def ollama_status_message(is_available: bool = False) -> str:
         return "Ollama Cloud is not configured. Exact search and observations still work."
     if ollama_base_requires_auth(base_url) and not OLLAMA_REPOSITORY_API_KEY:
         return "Ollama Cloud API key is missing. Exact search and observations still work."
-    if not OLLAMA_EMBEDDING_MODEL or not OLLAMA_RETRIEVAL_MODEL:
-        return "Ollama Cloud model settings are incomplete. Exact search and observations still work."
+    if not OLLAMA_RETRIEVAL_MODEL:
+        return "Ollama Cloud chat model setting is incomplete. Exact search and observations still work."
     if is_available:
-        return "Ollama Cloud is ready for assisted review."
+        return "Ollama Cloud generation is ready for assisted review."
     return "Ollama Cloud is configured but not reachable from the backend. Exact search and observations still work."
+
+
+def active_embedding_provider() -> str:
+    return EMBEDDING_PROVIDER or "ollama"
+
+
+def active_embedding_model_name() -> str:
+    if active_embedding_provider() == "gemini":
+        return f"gemini:{GEMINI_EMBEDDING_MODEL}:{GEMINI_EMBEDDING_DIMENSIONS}"
+    return OLLAMA_EMBEDDING_MODEL
+
+
+def embedding_status_message(is_available: bool = False) -> str:
+    provider = active_embedding_provider()
+    if provider == "gemini":
+        if not GEMINI_API_KEY:
+            return "Gemini embedding API key is missing. Semantic search and related-reference search are unavailable."
+        if not GEMINI_EMBEDDING_MODEL:
+            return "Gemini embedding model is missing."
+        return "Gemini embeddings are ready." if is_available else "Gemini embeddings are configured but not reachable."
+    if provider == "ollama":
+        if not ai_embedding_configured():
+            return "Ollama embeddings are not configured."
+        return "Ollama embeddings are ready." if is_available else "Ollama embeddings are configured but not reachable."
+    return f"Unsupported embedding provider: {provider}"
 
 
 class HtmlTextAndLinksParser(HTMLParser):
@@ -673,43 +719,85 @@ def get_related_observations_for_segments(
     return [observation_from_row(row) for row in rows]
 
 
-def ai_configured() -> bool:
+def ai_chat_configured() -> bool:
     base_url = effective_ollama_base_url()
     return bool(
         base_url
-        and OLLAMA_EMBEDDING_MODEL
         and OLLAMA_RETRIEVAL_MODEL
         and (not ollama_base_requires_auth(base_url) or OLLAMA_REPOSITORY_API_KEY)
     )
 
 
-async def check_ollama_readiness() -> tuple[bool, str]:
-    if not ai_configured():
+def ai_embedding_configured() -> bool:
+    provider = active_embedding_provider()
+    if provider == "gemini":
+        return bool(GEMINI_API_KEY and GEMINI_EMBEDDING_MODEL)
+    if provider == "ollama":
+        base_url = effective_ollama_base_url()
+        return bool(
+            base_url
+            and OLLAMA_EMBEDDING_MODEL
+            and (not ollama_base_requires_auth(base_url) or OLLAMA_REPOSITORY_API_KEY)
+        )
+    return False
+
+
+# Kept for compatibility with existing indexing/search code.
+# In this file, "ai_configured" now means "embedding provider is configured".
+def ai_configured() -> bool:
+    return ai_embedding_configured()
+
+
+async def check_ollama_generation_readiness() -> tuple[bool, str]:
+    if not ai_chat_configured():
         return False, ollama_status_message()
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.post(
-                ollama_endpoint("embed"),
+                ollama_endpoint("generate"),
                 headers=ollama_headers(),
-                json={"model": OLLAMA_EMBEDDING_MODEL, "input": "health check"},
+                json={
+                    "model": OLLAMA_RETRIEVAL_MODEL,
+                    "prompt": "Reply with OK.",
+                    "stream": False,
+                },
             )
         if response.status_code == 200:
-            return True, "Embedding health check succeeded."
+            return True, "Ollama generation health check succeeded."
         try:
             detail = response.json().get("error", response.text)
         except Exception:
             detail = response.text
-        return False, f"Embedding health check failed with HTTP {response.status_code}: {str(detail)[:160]}"
+        return False, f"Ollama generation health check failed with HTTP {response.status_code}: {str(detail)[:160]}"
     except Exception as exc:
-        return False, f"Embedding health check could not reach Ollama Cloud: {type(exc).__name__}"
+        return False, f"Ollama generation health check could not reach provider: {type(exc).__name__}"
+
+
+async def check_embedding_readiness() -> tuple[bool, str]:
+    if not ai_embedding_configured():
+        return False, embedding_status_message()
+    try:
+        embedding = await request_embedding("health check", task_type="RETRIEVAL_QUERY")
+        if embedding:
+            return True, "Embedding health check succeeded."
+        return False, "Embedding health check returned an empty vector."
+    except HTTPException as exc:
+        return False, str(exc.detail)[:240]
+    except Exception as exc:
+        return False, f"Embedding health check failed: {type(exc).__name__}"
+
+
+async def check_ollama_readiness() -> tuple[bool, str]:
+    # Compatibility wrapper: older routes used this to mean embedding readiness.
+    return await check_embedding_readiness()
 
 
 async def ollama_available() -> bool:
-    is_ready, _ = await check_ollama_readiness()
+    is_ready, _ = await check_embedding_readiness()
     return is_ready
 
 
-async def request_embedding(text: str) -> list[float]:
+async def request_ollama_embedding(text: str) -> list[float]:
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
@@ -724,7 +812,7 @@ async def request_embedding(text: str) -> list[float]:
         raise HTTPException(
             status_code=502,
             detail=(
-                "Ollama Cloud embedding service is not reachable from the backend. "
+                "Ollama embedding service is not reachable from the backend. "
                 "Check REPOSITORY_OLLAMA_BASE_URL, REPOSITORY_OLLAMA_API_KEY, "
                 f"and the `{OLLAMA_EMBEDDING_MODEL}` model setting."
             ),
@@ -744,9 +832,73 @@ async def request_embedding(text: str) -> list[float]:
     if not embedding:
         raise HTTPException(
             status_code=502,
-            detail="Ollama Cloud did not return an embedding. Check the embedding model setting.",
+            detail="Ollama did not return an embedding. Check the embedding model setting.",
         )
     return normalize_vector(embedding)
+
+
+async def request_gemini_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list[float]:
+    if not GEMINI_API_KEY:
+        raise HTTPException(
+            status_code=502,
+            detail="Gemini embedding API key is missing. Set REPOSITORY_GEMINI_API_KEY in Railway.",
+        )
+
+    model = GEMINI_EMBEDDING_MODEL or "gemini-embedding-001"
+    model_path = model if model.startswith("models/") else f"models/{model}"
+    endpoint = f"{GEMINI_API_BASE_URL}/{model_path}:embedContent"
+
+    payload = {
+        "model": model_path,
+        "content": {
+            "parts": [
+                {"text": text[:EMBEDDING_TEXT_LIMIT]},
+            ],
+        },
+        "taskType": task_type,
+        "outputDimensionality": GEMINI_EMBEDDING_DIMENSIONS,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                endpoint,
+                params={"key": GEMINI_API_KEY},
+                headers={"Content-Type": "application/json"},
+                json=payload,
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Gemini embedding service is not reachable from the backend.",
+        ) from exc
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini embedding error: {response.text[:500]}",
+        )
+
+    data = response.json()
+    values = data.get("embedding", {}).get("values")
+    if not values:
+        raise HTTPException(
+            status_code=502,
+            detail="Gemini did not return embedding values. Check the embedding model setting.",
+        )
+    return normalize_vector(values)
+
+
+async def request_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list[float]:
+    provider = active_embedding_provider()
+    if provider == "gemini":
+        return await request_gemini_embedding(text, task_type=task_type)
+    if provider == "ollama":
+        return await request_ollama_embedding(text)
+    raise HTTPException(
+        status_code=502,
+        detail=f"Unsupported embedding provider: {provider}",
+    )
 
 
 def ocr_image_file(image_path: str) -> str:
@@ -1040,7 +1192,7 @@ async def index_missing_segment_embeddings(
         return {
             "provider_configured": False,
             "indexed_count": 0,
-            "message": ollama_status_message(),
+            "message": embedding_status_message(),
         }
 
     where = []
@@ -1061,7 +1213,7 @@ async def index_missing_segment_embeddings(
             )
             """
         )
-        params.append(OLLAMA_EMBEDDING_MODEL)
+        params.append(active_embedding_model_name())
 
     where_clause = f"WHERE {' AND '.join(where)}" if where else ""
 
@@ -1091,7 +1243,7 @@ async def index_missing_segment_embeddings(
             (
                 row["id"],
                 row["material_id"],
-                OLLAMA_EMBEDDING_MODEL,
+                active_embedding_model_name(),
                 json.dumps(embedding),
                 ts,
             ),
@@ -1102,12 +1254,12 @@ async def index_missing_segment_embeddings(
     return {
         "provider_configured": True,
         "indexed_count": indexed_count,
-        "model": OLLAMA_EMBEDDING_MODEL,
+        "model": active_embedding_model_name(),
     }
 
 
 async def semantic_search_segments(payload: SemanticSearchRequest) -> dict:
-    query_embedding = await request_embedding(payload.query)
+    query_embedding = await request_embedding(payload.query, task_type="RETRIEVAL_QUERY")
 
     with get_connection() as con:
         if payload.material_id:
@@ -1136,7 +1288,7 @@ async def semantic_search_segments(payload: SemanticSearchRequest) -> dict:
             }
 
         where = "WHERE se.model = ?"
-        params: list[object] = [OLLAMA_EMBEDDING_MODEL]
+        params: list[object] = [active_embedding_model_name()]
         if payload.material_id:
             where += " AND se.material_id = ?"
             params.append(payload.material_id)
@@ -1191,7 +1343,7 @@ async def semantic_search_segments(payload: SemanticSearchRequest) -> dict:
         "query": payload.query,
         "mode": "semantic_evidence_search",
         "provider_configured": True,
-        "embedding_model": OLLAMA_EMBEDDING_MODEL,
+        "embedding_model": active_embedding_model_name(),
         "index_result": index_result,
         "results": results,
         "related_observations": related_observations,
@@ -1225,7 +1377,7 @@ async def index_missing_image_embeddings(
             "provider_configured": False,
             "indexed_count": 0,
             "captioned_count": 0,
-            "message": ollama_status_message(),
+            "message": embedding_status_message(),
         }
 
     where = []
@@ -1247,7 +1399,7 @@ async def index_missing_image_embeddings(
             )
             """
         )
-        params.extend([OLLAMA_EMBEDDING_MODEL, MULTIMODAL_METHOD_VERSION])
+        params.extend([active_embedding_model_name(), MULTIMODAL_METHOD_VERSION])
 
     where_clause = f"WHERE {' AND '.join(where)}" if where else ""
     scan_limit = max(limit * 20, 100)
@@ -1335,7 +1487,7 @@ async def index_missing_image_embeddings(
             (
                 row["id"],
                 row["material_id"],
-                OLLAMA_EMBEDDING_MODEL,
+                active_embedding_model_name(),
                 MULTIMODAL_METHOD_VERSION,
                 json.dumps(embedding),
                 ts,
@@ -1352,7 +1504,7 @@ async def index_missing_image_embeddings(
         "caption_attempted_count": caption_attempted_count,
         "caption_failed_count": caption_failed_count,
         "removed_blank_count": removed_blank_count,
-        "model": OLLAMA_EMBEDDING_MODEL,
+        "model": active_embedding_model_name(),
         "vision_model": OLLAMA_VISION_MODEL,
         "method_version": MULTIMODAL_METHOD_VERSION,
     }
@@ -1360,7 +1512,7 @@ async def index_missing_image_embeddings(
 
 async def search_image_evidence(payload: MultimodalSearchRequest) -> dict:
     terms = parse_report_terms(payload.query)
-    query_embedding = await request_embedding(payload.query)
+    query_embedding = await request_embedding(payload.query, task_type="RETRIEVAL_QUERY")
 
     with get_connection() as con:
         if payload.material_id:
@@ -3079,8 +3231,10 @@ async def get_material_extracted(material_id: str, limit: int = Query(200, ge=1,
 @router.get("/ai/status")
 async def get_ai_status():
     init_repository_db()
-    is_ollama_available, ollama_status_detail = await check_ollama_readiness()
+    is_chat_available, chat_status_detail = await check_ollama_generation_readiness()
+    is_embedding_available, embedding_status_detail = await check_embedding_readiness()
     ollama_base_url = effective_ollama_base_url()
+    embedding_model_name = active_embedding_model_name()
     with get_connection() as con:
         try:
             segment_count = con.execute(
@@ -3092,7 +3246,7 @@ async def get_ai_status():
                 FROM segment_embeddings
                 WHERE model = ?
                 """,
-                (OLLAMA_EMBEDDING_MODEL,),
+                (embedding_model_name,),
             ).fetchone()[0]
             image_count = con.execute(
                 "SELECT COUNT(*) FROM image_evidence"
@@ -3104,7 +3258,7 @@ async def get_ai_status():
                 WHERE model = ?
                 AND method_version = ?
                 """,
-                (OLLAMA_EMBEDDING_MODEL, MULTIMODAL_METHOD_VERSION),
+                (embedding_model_name, MULTIMODAL_METHOD_VERSION),
             ).fetchone()[0]
         except sqlite3.OperationalError:
             segment_count = 0
@@ -3113,20 +3267,33 @@ async def get_ai_status():
             embedded_image_count = 0
 
     return {
-        "provider_configured": is_ollama_available,
+        # Keep provider_configured true when generation works so the existing frontend
+        # can enable Assisted Review. Use embedding_configured for vector/RAG features.
+        "provider_configured": is_chat_available,
+        "chat_configured": is_chat_available,
+        "embedding_configured": is_embedding_available,
         "provider": ollama_provider_name(),
+        "chat_provider": ollama_provider_name(),
+        "embedding_provider": active_embedding_provider(),
         "ollama_base_url": ollama_base_url,
-        "embedding_model": OLLAMA_EMBEDDING_MODEL,
+        "embedding_model": embedding_model_name,
         "chat_model": OLLAMA_RETRIEVAL_MODEL,
         "segment_count": segment_count,
         "embedded_segment_count": embedded_count,
         "image_evidence_count": image_count,
         "embedded_image_count": embedded_image_count,
         "default_mode": "evidence_only",
-        "status_message": ollama_status_message(is_ollama_available),
-        "status_detail": ollama_status_detail,
+        "status_message": (
+            "Ollama Cloud generation and embeddings are ready."
+            if is_chat_available and is_embedding_available
+            else "Ollama Cloud generation is ready. Embeddings are not ready, so related-reference/vector search may be limited."
+            if is_chat_available
+            else "Ollama Cloud generation is not ready. Exact search and observations still work."
+        ),
+        "status_detail": chat_status_detail,
+        "chat_status_detail": chat_status_detail,
+        "embedding_status_detail": embedding_status_detail,
     }
-
 
 @router.post("/ai/index")
 async def build_semantic_index(payload: BuildSemanticIndexRequest):
@@ -3290,7 +3457,7 @@ async def multimodal_search(payload: MultimodalSearchRequest):
         "query": payload.query,
         "mode": "multimodal_evidence_search",
         "provider_configured": True,
-        "embedding_model": OLLAMA_EMBEDDING_MODEL,
+        "embedding_model": active_embedding_model_name(),
         "vision_model": OLLAMA_VISION_MODEL,
         "method_version": MULTIMODAL_METHOD_VERSION,
         "text_index_result": text_results.get("index_result"),
