@@ -688,7 +688,11 @@ async def ollama_available() -> bool:
         return False
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(ollama_endpoint("tags"), headers=ollama_headers())
+            response = await client.post(
+                ollama_endpoint("embed"),
+                headers=ollama_headers(),
+                json={"model": OLLAMA_EMBEDDING_MODEL, "input": "health check"},
+            )
         return response.status_code == 200
     except Exception:
         return False
