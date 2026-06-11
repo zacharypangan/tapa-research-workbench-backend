@@ -58,6 +58,63 @@ from app.repository.settings import (
 
 router = APIRouter(prefix="/repository", tags=["repository"])
 
+OLLAMA_CLOUD_API_BASE_URL = "https://ollama.com/api"
+OLLAMA_REPOSITORY_API_KEY = os.getenv(
+    "REPOSITORY_OLLAMA_API_KEY",
+    os.getenv("OLLAMA_API_KEY", ""),
+).strip()
+
+
+def effective_ollama_base_url() -> str:
+    if OLLAMA_REPOSITORY_BASE_URL:
+        return OLLAMA_REPOSITORY_BASE_URL.rstrip("/")
+    if OLLAMA_REPOSITORY_API_KEY:
+        return OLLAMA_CLOUD_API_BASE_URL
+    return ""
+
+
+def ollama_base_requires_auth(base_url: str) -> bool:
+    host = urlparse(base_url).netloc.lower()
+    return host.endswith("ollama.com")
+
+
+def ollama_headers() -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if OLLAMA_REPOSITORY_API_KEY:
+        headers["Authorization"] = f"Bearer {OLLAMA_REPOSITORY_API_KEY}"
+    return headers
+
+
+def ollama_endpoint(path: str) -> str:
+    base_url = effective_ollama_base_url()
+    clean_path = path.lstrip("/")
+    if clean_path.startswith("api/"):
+        clean_path = clean_path[4:]
+    if base_url.endswith("/api"):
+        return f"{base_url}/{clean_path}"
+    return f"{base_url}/api/{clean_path}"
+
+
+def ollama_provider_name() -> str:
+    base_url = effective_ollama_base_url()
+    if not base_url:
+        return "ollama-cloud"
+    return "ollama-cloud" if ollama_base_requires_auth(base_url) else "ollama"
+
+
+def ollama_status_message(is_available: bool = False) -> str:
+    base_url = effective_ollama_base_url()
+    if not base_url:
+        return "Ollama Cloud is not configured. Exact search and observations still work."
+    if ollama_base_requires_auth(base_url) and not OLLAMA_REPOSITORY_API_KEY:
+        return "Ollama Cloud API key is missing. Exact search and observations still work."
+    if not OLLAMA_EMBEDDING_MODEL or not OLLAMA_RETRIEVAL_MODEL:
+        return "Ollama Cloud model settings are incomplete. Exact search and observations still work."
+    if is_available:
+        return "Ollama Cloud is ready for assisted review."
+    return "Ollama Cloud is configured but not reachable from the backend. Exact search and observations still work."
+
+
 class HtmlTextAndLinksParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -617,7 +674,13 @@ def get_related_observations_for_segments(
 
 
 def ai_configured() -> bool:
-    return bool(OLLAMA_REPOSITORY_BASE_URL and OLLAMA_EMBEDDING_MODEL and OLLAMA_RETRIEVAL_MODEL)
+    base_url = effective_ollama_base_url()
+    return bool(
+        base_url
+        and OLLAMA_EMBEDDING_MODEL
+        and OLLAMA_RETRIEVAL_MODEL
+        and (not ollama_base_requires_auth(base_url) or OLLAMA_REPOSITORY_API_KEY)
+    )
 
 
 async def ollama_available() -> bool:
@@ -625,7 +688,7 @@ async def ollama_available() -> bool:
         return False
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(f"{OLLAMA_REPOSITORY_BASE_URL}/api/tags")
+            response = await client.get(ollama_endpoint("tags"), headers=ollama_headers())
         return response.status_code == 200
     except Exception:
         return False
@@ -635,20 +698,20 @@ async def request_embedding(text: str) -> list[float]:
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
-                f"{OLLAMA_REPOSITORY_BASE_URL}/api/embeddings",
-                headers={"Content-Type": "application/json"},
+                ollama_endpoint("embed"),
+                headers=ollama_headers(),
                 json={
                     "model": OLLAMA_EMBEDDING_MODEL,
-                    "prompt": text[:EMBEDDING_TEXT_LIMIT],
+                    "input": text[:EMBEDDING_TEXT_LIMIT],
                 },
             )
     except httpx.RequestError as exc:
         raise HTTPException(
             status_code=502,
             detail=(
-                "Ollama embedding service is not reachable from the backend. "
-                f"Check REPOSITORY_OLLAMA_BASE_URL ({OLLAMA_REPOSITORY_BASE_URL}) "
-                f"and that the `{OLLAMA_EMBEDDING_MODEL}` model is installed."
+                "Ollama Cloud embedding service is not reachable from the backend. "
+                "Check REPOSITORY_OLLAMA_BASE_URL, REPOSITORY_OLLAMA_API_KEY, "
+                f"and the `{OLLAMA_EMBEDDING_MODEL}` model setting."
             ),
         ) from exc
 
@@ -660,10 +723,13 @@ async def request_embedding(text: str) -> list[float]:
 
     data = response.json()
     embedding = data.get("embedding")
+    embeddings = data.get("embeddings")
+    if not embedding and isinstance(embeddings, list) and embeddings:
+        embedding = embeddings[0]
     if not embedding:
         raise HTTPException(
             status_code=502,
-            detail="Ollama did not return an embedding. Check that the embedding model is installed.",
+            detail="Ollama Cloud did not return an embedding. Check the embedding model setting.",
         )
     return normalize_vector(embedding)
 
@@ -845,8 +911,8 @@ async def request_image_caption(image_path: str, context_text: str = "") -> str:
         async with httpx.AsyncClient(timeout=120.0) as client:
             for _attempt in range(2):
                 response = await client.post(
-                    f"{OLLAMA_REPOSITORY_BASE_URL}/api/chat",
-                    headers={"Content-Type": "application/json"},
+                    ollama_endpoint("chat"),
+                    headers=ollama_headers(),
                     json={
                         "model": OLLAMA_VISION_MODEL,
                         "messages": [
@@ -909,8 +975,8 @@ async def request_evidence_answer(question: str, evidence: list[dict]) -> str:
     try:
         async with httpx.AsyncClient(timeout=90.0) as client:
             response = await client.post(
-                f"{OLLAMA_REPOSITORY_BASE_URL}/api/chat",
-                headers={"Content-Type": "application/json"},
+                ollama_endpoint("chat"),
+                headers=ollama_headers(),
                 json={
                     "model": OLLAMA_RETRIEVAL_MODEL,
                     "messages": [
@@ -933,9 +999,9 @@ async def request_evidence_answer(question: str, evidence: list[dict]) -> str:
         raise HTTPException(
             status_code=502,
             detail=(
-                "Ollama chat service is not reachable from the backend. "
-                f"Check REPOSITORY_OLLAMA_BASE_URL ({OLLAMA_REPOSITORY_BASE_URL}) "
-                f"and that the `{OLLAMA_RETRIEVAL_MODEL}` model is installed."
+                "Ollama Cloud chat service is not reachable from the backend. "
+                "Check REPOSITORY_OLLAMA_BASE_URL, REPOSITORY_OLLAMA_API_KEY, "
+                f"and the `{OLLAMA_RETRIEVAL_MODEL}` model setting."
             ),
         ) from exc
 
@@ -959,7 +1025,7 @@ async def index_missing_segment_embeddings(
         return {
             "provider_configured": False,
             "indexed_count": 0,
-            "message": "Ollama retrieval settings are not configured.",
+            "message": ollama_status_message(),
         }
 
     where = []
@@ -1144,7 +1210,7 @@ async def index_missing_image_embeddings(
             "provider_configured": False,
             "indexed_count": 0,
             "captioned_count": 0,
-            "message": "Ollama retrieval settings are not configured.",
+            "message": ollama_status_message(),
         }
 
     where = []
@@ -1386,7 +1452,7 @@ async def search_image_evidence(payload: MultimodalSearchRequest) -> dict:
         "index_result": index_result,
         "image_results": results[: payload.limit],
         "evidence_note": (
-            "Image evidence is searched separately using OCR and local vision captions. "
+            "Image evidence is searched separately using OCR and model-generated captions. "
             "Captions describe visible evidence and are not interpretations."
         ),
     }
@@ -2999,6 +3065,7 @@ async def get_material_extracted(material_id: str, limit: int = Query(200, ge=1,
 async def get_ai_status():
     init_repository_db()
     is_ollama_available = await ollama_available()
+    ollama_base_url = effective_ollama_base_url()
     with get_connection() as con:
         try:
             segment_count = con.execute(
@@ -3032,8 +3099,8 @@ async def get_ai_status():
 
     return {
         "provider_configured": is_ollama_available,
-        "provider": "ollama",
-        "ollama_base_url": OLLAMA_REPOSITORY_BASE_URL,
+        "provider": ollama_provider_name(),
+        "ollama_base_url": ollama_base_url,
         "embedding_model": OLLAMA_EMBEDDING_MODEL,
         "chat_model": OLLAMA_RETRIEVAL_MODEL,
         "segment_count": segment_count,
@@ -3041,11 +3108,7 @@ async def get_ai_status():
         "image_evidence_count": image_count,
         "embedded_image_count": embedded_image_count,
         "default_mode": "evidence_only",
-        "status_message": (
-            "Ollama is reachable."
-            if is_ollama_available
-            else "Ollama is not reachable from the backend. Exact search and observations still work."
-        ),
+        "status_message": ollama_status_message(is_ollama_available),
     }
 
 
@@ -3055,7 +3118,7 @@ async def build_semantic_index(payload: BuildSemanticIndexRequest):
         return {
             "provider_configured": False,
             "indexed_count": 0,
-            "message": "Ollama is not reachable from the backend.",
+            "message": ollama_status_message(),
         }
     with get_connection() as con:
         if payload.material_id:
@@ -3076,7 +3139,7 @@ async def build_image_index(payload: BuildSemanticIndexRequest):
             "provider_configured": False,
             "indexed_count": 0,
             "captioned_count": 0,
-            "message": "Ollama is not reachable from the backend.",
+            "message": ollama_status_message(),
         }
     with get_connection() as con:
         if payload.material_id:
@@ -3107,7 +3170,7 @@ async def run_image_index_job(job_id: str, payload: BuildSemanticIndexRequest):
                         "indexed_count": 0,
                         "captioned_count": 0,
                         "removed_blank_count": 0,
-                        "message": "Ollama is not reachable from the backend.",
+                        "message": ollama_status_message(),
                     },
                 }
             )
@@ -3172,7 +3235,7 @@ async def semantic_search(payload: SemanticSearchRequest):
             "results": [],
             "related_observations": [],
             "evidence_note": (
-                "Semantic search is available when Ollama is configured and running."
+                "Related-reference search is available when Ollama Cloud is configured and reachable."
             ),
         }
 
@@ -3190,7 +3253,7 @@ async def multimodal_search(payload: MultimodalSearchRequest):
             "image_results": [],
             "related_observations": [],
             "evidence_note": (
-                "Multimodal search is available when Ollama is configured and running."
+                "Text and image assisted review is available when Ollama Cloud is configured and reachable."
             ),
         }
 
@@ -3233,11 +3296,11 @@ async def ask_corpus(payload: AskCorpusRequest):
             "question": payload.question,
             "provider_configured": False,
             "answer": (
-                "Ask Corpus is available when Ollama is configured and running."
+                "Process References is available when Ollama Cloud is configured and reachable."
             ),
             "citations": [],
             "related_observations": [],
-            "evidence_note": "Ollama retrieval settings are not configured.",
+            "evidence_note": ollama_status_message(),
         }
 
     semantic_payload = SemanticSearchRequest(
@@ -3294,7 +3357,7 @@ async def generate_ai_evidence_report(payload: SemanticSearchRequest):
             "themes": [],
             "related_observations": [],
             "evidence_note": (
-                "AI evidence reports are available when Ollama is configured and running."
+                "Organized assisted review reports are available when Ollama Cloud is configured and reachable."
             ),
         }
 
