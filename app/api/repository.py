@@ -683,9 +683,9 @@ def ai_configured() -> bool:
     )
 
 
-async def ollama_available() -> bool:
+async def check_ollama_readiness() -> tuple[bool, str]:
     if not ai_configured():
-        return False
+        return False, ollama_status_message()
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.post(
@@ -693,9 +693,20 @@ async def ollama_available() -> bool:
                 headers=ollama_headers(),
                 json={"model": OLLAMA_EMBEDDING_MODEL, "input": "health check"},
             )
-        return response.status_code == 200
-    except Exception:
-        return False
+        if response.status_code == 200:
+            return True, "Embedding health check succeeded."
+        try:
+            detail = response.json().get("error", response.text)
+        except Exception:
+            detail = response.text
+        return False, f"Embedding health check failed with HTTP {response.status_code}: {str(detail)[:160]}"
+    except Exception as exc:
+        return False, f"Embedding health check could not reach Ollama Cloud: {type(exc).__name__}"
+
+
+async def ollama_available() -> bool:
+    is_ready, _ = await check_ollama_readiness()
+    return is_ready
 
 
 async def request_embedding(text: str) -> list[float]:
@@ -3068,7 +3079,7 @@ async def get_material_extracted(material_id: str, limit: int = Query(200, ge=1,
 @router.get("/ai/status")
 async def get_ai_status():
     init_repository_db()
-    is_ollama_available = await ollama_available()
+    is_ollama_available, ollama_status_detail = await check_ollama_readiness()
     ollama_base_url = effective_ollama_base_url()
     with get_connection() as con:
         try:
@@ -3113,6 +3124,7 @@ async def get_ai_status():
         "embedded_image_count": embedded_image_count,
         "default_mode": "evidence_only",
         "status_message": ollama_status_message(is_ollama_available),
+        "status_detail": ollama_status_detail,
     }
 
 
