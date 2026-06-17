@@ -106,6 +106,15 @@ class MultimodalSearchRequest(BaseModel):
     image_index_limit: int = Field(default=0, ge=0, le=100)
 
 
+class GraphBuildRequest(BaseModel):
+    material_id: Optional[str] = None
+    force: bool = True
+
+
+class GraphEdgeReviewRequest(BaseModel):
+    review_status: str = Field(..., pattern="^(accepted|rejected|needs_review)$")
+
+
 @dataclass
 class SegmentInput:
     source_kind: str
