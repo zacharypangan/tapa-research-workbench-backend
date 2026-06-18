@@ -29,9 +29,28 @@ from app.repository.schemas import (
     MultimodalSearchRequest,
     ObservationCreate,
     ObservationUpdate,
+    PlaceResolutionReviewRequest,
     SearchReportRequest,
     SegmentInput,
     SemanticSearchRequest,
+    TimeResolutionReviewRequest,
+)
+from app.repository.semantic_graph import (
+    build_semantic_graph,
+    init_semantic_graph_schema,
+    resolution_review_payload,
+    review_place_resolution,
+    review_semantic_candidate,
+    review_semantic_relation,
+    review_time_resolution,
+    semantic_candidates,
+    semantic_entity_detail,
+    semantic_entity_evidence,
+    semantic_graph_payload,
+    semantic_map,
+    semantic_related_materials,
+    semantic_relation_evidence,
+    semantic_timeline,
 )
 from app.repository.search_reports import (
     build_term_pattern,
@@ -511,6 +530,7 @@ def init_repository_db():
         con.execute(
             "CREATE INDEX IF NOT EXISTS idx_graph_edges_type ON repository_graph_edges(edge_type)"
         )
+        init_semantic_graph_schema(con)
 
 
 def get_connection():
@@ -1090,6 +1110,13 @@ def delete_graph_scope(con: sqlite3.Connection, material_id: Optional[str] = Non
         con.execute("DELETE FROM repository_graph_nodes")
         return
 
+    corpus_id = graph_corpus_node_id()
+    con.execute(
+        "DELETE FROM repository_graph_edges WHERE source_node_id = ? OR target_node_id = ?",
+        (corpus_id, corpus_id),
+    )
+    con.execute("DELETE FROM repository_graph_nodes WHERE id = ?", (corpus_id,))
+
     edge_rows = con.execute(
         "SELECT id, evidence_ref_json FROM repository_graph_edges"
     ).fetchall()
@@ -1163,16 +1190,6 @@ def add_concept_cooccurrence_edges(
 def build_repository_graph(con: sqlite3.Connection, material_id: Optional[str] = None) -> dict:
     review_overrides = load_graph_review_overrides(con)
     delete_graph_scope(con, material_id)
-    corpus_node = ensure_graph_node(
-        con,
-        "corpus",
-        "Research Repository",
-        {
-            "level": "corpus",
-            "summary": "All materials and evidence in this repository.",
-        },
-        stable_key="repository",
-    )
 
     where = "WHERE id = ?" if material_id else ""
     params: list[object] = [material_id] if material_id else []
@@ -1195,7 +1212,6 @@ def build_repository_graph(con: sqlite3.Connection, material_id: Optional[str] =
             {
                 "material_id": material["id"],
                 "level": "material",
-                "parent_id": corpus_node,
                 "source_type": material["source_type"],
                 "collection": material["collection"],
                 "year": material["year"],
@@ -1207,18 +1223,6 @@ def build_repository_graph(con: sqlite3.Connection, material_id: Optional[str] =
             stable_key=material["id"],
         )
         metadata_ref = graph_evidence_ref(material["id"], "metadata", title)
-        insert_graph_edge(
-            con,
-            corpus_node,
-            material_node,
-            "contains",
-            metadata_ref,
-            review_overrides,
-            weight=1.0,
-            confidence=1.0,
-            extraction_method="metadata",
-            review_status="accepted",
-        )
 
         concept_labels: set[str] = set()
 
@@ -1825,8 +1829,8 @@ def query_graph_network(
 GRAPH_SECTION_NODE_TYPES = {"segment", "image", "observation"}
 GRAPH_CONCEPT_NODE_TYPES = {"concept", "keyword", "place", "time_reference", "author"}
 GRAPH_LEVEL_NODE_TYPES = {
-    "overview": {"corpus", "material"},
-    "documents": {"corpus", "material", *GRAPH_SECTION_NODE_TYPES},
+    "overview": {"material"},
+    "documents": {"material", *GRAPH_SECTION_NODE_TYPES},
     "sections": {"material", *GRAPH_SECTION_NODE_TYPES, *GRAPH_CONCEPT_NODE_TYPES},
     "concepts": {"material", *GRAPH_SECTION_NODE_TYPES, *GRAPH_CONCEPT_NODE_TYPES},
 }
@@ -1834,10 +1838,8 @@ GRAPH_LEVEL_NODE_TYPES = {
 
 def graph_ui_level(node_type: str, properties: dict) -> str:
     level = properties.get("level")
-    if level in {"corpus", "material", "section", "concept"}:
+    if level in {"material", "section", "concept"}:
         return level
-    if node_type == "corpus":
-        return "corpus"
     if node_type == "material":
         return "material"
     if node_type in GRAPH_SECTION_NODE_TYPES:
@@ -1849,8 +1851,6 @@ def graph_node_summary(node_type: str, label: str, properties: dict, degree: int
     summary = properties.get("summary")
     if isinstance(summary, str) and summary.strip():
         return evidence_snippet(summary, max_chars=220)
-    if node_type == "corpus":
-        return f"Repository overview containing {degree} visible graph link(s)."
     if node_type == "material":
         return f"Document or source record with {degree} visible connection(s)."
     if node_type == "segment":
@@ -1884,8 +1884,6 @@ def graph_node_for_interactive(
     node_type = node["node_type"]
     level = graph_ui_level(node_type, properties)
     parent_id = properties.get("parent_id")
-    if not parent_id and node_type == "material":
-        parent_id = graph_corpus_node_id()
     return {
         "id": node["id"],
         "label": node["label"],
@@ -2085,12 +2083,18 @@ def query_graph_interactive(
         limit=limit,
     )
     extra_node_ids: set[str] = set()
-    corpus_row = con.execute(
-        "SELECT id FROM repository_graph_nodes WHERE id = ?",
-        (graph_corpus_node_id(),),
-    ).fetchone()
-    if corpus_row:
-        extra_node_ids.add(corpus_row["id"])
+    if level_key == "overview":
+        rows = con.execute(
+            """
+            SELECT id
+            FROM repository_graph_nodes
+            WHERE node_type = 'material'
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (min(limit, 40),),
+        ).fetchall()
+        extra_node_ids.update(row["id"] for row in rows)
     payload = graph_payload_from_edges(con, edges, extra_node_ids=extra_node_ids)
     payload.update(
         {
@@ -2229,6 +2233,377 @@ def query_graph_path(
         }
     )
     return payload
+
+
+def graph_material_lookup(con: sqlite3.Connection) -> dict[str, dict]:
+    rows = con.execute(
+        """
+        SELECT id, title, source_type, year, language, region, collection, status
+        FROM materials
+        """
+    ).fetchall()
+    return {
+        row["id"]: {
+            "material_id": row["id"],
+            "title": row["title"] or "Untitled material",
+            "source_type": row["source_type"],
+            "year": row["year"],
+            "language": row["language"],
+            "region": row["region"],
+            "collection": row["collection"],
+            "status": row["status"],
+        }
+        for row in rows
+    }
+
+
+def graph_discovery_rows(
+    con: sqlite3.Connection,
+    query: Optional[str] = None,
+    material_id: Optional[str] = None,
+    include_rejected: bool = False,
+    limit: int = 2500,
+) -> list[sqlite3.Row]:
+    rows = con.execute(
+        """
+        SELECT
+            e.*,
+            source.label AS source_label,
+            source.node_type AS source_type,
+            source.properties_json AS source_properties_json,
+            target.label AS target_label,
+            target.node_type AS target_type,
+            target.properties_json AS target_properties_json
+        FROM repository_graph_edges e
+        JOIN repository_graph_nodes source ON source.id = e.source_node_id
+        JOIN repository_graph_nodes target ON target.id = e.target_node_id
+        ORDER BY e.confidence DESC, e.weight DESC, e.created_at DESC
+        """
+    ).fetchall()
+    selected = []
+    for row in rows:
+        if not include_rejected and row["review_status"] == "rejected":
+            continue
+        if not graph_row_matches_material_or_query(row, material_id, query):
+            continue
+        selected.append(row)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def graph_material_id_for_edge(edge: dict, source_properties: dict, target_properties: dict) -> Optional[str]:
+    evidence_ref = edge.get("evidence_ref", {})
+    for value in [
+        evidence_ref.get("material_id"),
+        source_properties.get("material_id"),
+        target_properties.get("material_id"),
+    ]:
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def graph_compact_document(material_lookup: dict[str, dict], material_id: Optional[str]) -> Optional[dict]:
+    if not material_id:
+        return None
+    material = material_lookup.get(material_id)
+    if not material:
+        return {"material_id": material_id, "title": material_id}
+    return material
+
+
+def graph_discovery_summary(
+    con: sqlite3.Connection,
+    query: Optional[str] = None,
+    material_id: Optional[str] = None,
+    include_rejected: bool = False,
+    limit: int = 80,
+) -> dict:
+    if material_id:
+        ensure_material(con, material_id)
+    material_lookup = graph_material_lookup(con)
+    rows = graph_discovery_rows(
+        con,
+        query=query,
+        material_id=material_id,
+        include_rejected=include_rejected,
+        limit=max(400, limit * 40),
+    )
+    concept_map: dict[str, dict] = {}
+    document_map: dict[str, dict] = {}
+    review_queue = []
+
+    for row in rows:
+        edge = graph_edge_from_row(row)
+        source_properties = parse_graph_json(row["source_properties_json"], {})
+        target_properties = parse_graph_json(row["target_properties_json"], {})
+        source_type = row["source_type"]
+        target_type = row["target_type"]
+        edge_material_id = graph_material_id_for_edge(edge, source_properties, target_properties)
+        document = graph_compact_document(material_lookup, edge_material_id)
+        if document:
+            doc_item = document_map.setdefault(
+                edge_material_id,
+                {
+                    **document,
+                    "evidence_count": 0,
+                    "accepted_count": 0,
+                    "review_needed_count": 0,
+                    "concept_ids": set(),
+                    "sample_snippets": [],
+                },
+            )
+            doc_item["evidence_count"] += 1
+            if edge["review_status"] == "accepted":
+                doc_item["accepted_count"] += 1
+            if edge["review_status"] in {"needs_review", "unreviewed"}:
+                doc_item["review_needed_count"] += 1
+            snippet = edge.get("evidence_ref", {}).get("snippet")
+            if snippet and len(doc_item["sample_snippets"]) < 3:
+                doc_item["sample_snippets"].append(snippet)
+
+        concept_endpoint = None
+        if source_type in GRAPH_CONCEPT_NODE_TYPES:
+            concept_endpoint = ("source", row["source_node_id"], row["source_label"], source_type)
+        elif target_type in GRAPH_CONCEPT_NODE_TYPES:
+            concept_endpoint = ("target", row["target_node_id"], row["target_label"], target_type)
+
+        if concept_endpoint:
+            _side, concept_id, concept_label, concept_type = concept_endpoint
+            item = concept_map.setdefault(
+                concept_id,
+                {
+                    "node_id": concept_id,
+                    "label": concept_label,
+                    "node_type": concept_type,
+                    "document_ids": set(),
+                    "evidence_count": 0,
+                    "accepted_count": 0,
+                    "review_needed_count": 0,
+                    "snippets": [],
+                },
+            )
+            item["evidence_count"] += 1
+            if edge["review_status"] == "accepted":
+                item["accepted_count"] += 1
+            if edge["review_status"] in {"needs_review", "unreviewed"}:
+                item["review_needed_count"] += 1
+            if document:
+                item["document_ids"].add(edge_material_id)
+                document_map[edge_material_id]["concept_ids"].add(concept_id)
+            snippet = edge.get("evidence_ref", {}).get("snippet")
+            if snippet and len(item["snippets"]) < 3:
+                item["snippets"].append(snippet)
+
+        if edge["review_status"] in {"needs_review", "unreviewed"}:
+            review_queue.append(
+                {
+                    "edge": graph_edge_for_interactive(edge),
+                    "source_label": row["source_label"],
+                    "source_type": source_type,
+                    "target_label": row["target_label"],
+                    "target_type": target_type,
+                    "material": document,
+                    "reason": (
+                        "Weak or suggested relationship needs human review."
+                        if edge["extraction_method"] in {"cooccurrence", "semantic_proximity", "ai_suggested"}
+                        or edge["edge_type"] == "co_occurs_with"
+                        else "High-value relationship has not been accepted yet."
+                    ),
+                }
+            )
+
+    def concept_payload(item: dict) -> dict:
+        documents = [
+            material_lookup[doc_id]
+            for doc_id in sorted(item["document_ids"])
+            if doc_id in material_lookup
+        ]
+        return {
+            "node_id": item["node_id"],
+            "label": item["label"],
+            "node_type": item["node_type"],
+            "document_count": len(item["document_ids"]),
+            "evidence_count": item["evidence_count"],
+            "accepted_count": item["accepted_count"],
+            "review_needed_count": item["review_needed_count"],
+            "documents": documents[:8],
+            "snippets": item["snippets"],
+        }
+
+    top_concepts = sorted(
+        (concept_payload(item) for item in concept_map.values()),
+        key=lambda item: (
+            -item["document_count"],
+            -item["accepted_count"],
+            -item["evidence_count"],
+            item["label"].lower(),
+        ),
+    )
+    bridge_concepts = [item for item in top_concepts if item["document_count"] >= 2]
+
+    related_documents = []
+    if material_id and material_id in document_map:
+        source_concepts = document_map[material_id]["concept_ids"]
+        for doc_id, doc_item in document_map.items():
+            if doc_id == material_id:
+                continue
+            shared = source_concepts.intersection(doc_item["concept_ids"])
+            if not shared:
+                continue
+            shared_concepts = [
+                {
+                    "node_id": concept_id,
+                    "label": concept_map[concept_id]["label"],
+                    "node_type": concept_map[concept_id]["node_type"],
+                }
+                for concept_id in sorted(shared)
+                if concept_id in concept_map
+            ]
+            related_documents.append(
+                {
+                    "material": graph_compact_document(material_lookup, doc_id),
+                    "shared_concept_count": len(shared),
+                    "shared_concepts": shared_concepts[:10],
+                    "relationship_strength": min(1.0, len(shared) / 8),
+                    "reason": "Shared evidence concepts, places, times, or keywords.",
+                }
+            )
+        related_documents.sort(key=lambda item: (-item["shared_concept_count"], item["material"]["title"].lower()))
+
+    documents = []
+    for doc_item in document_map.values():
+        clean_item = {key: value for key, value in doc_item.items() if key != "concept_ids"}
+        documents.append(clean_item)
+    documents.sort(key=lambda item: (-item["accepted_count"], -item["evidence_count"], item["title"].lower()))
+
+    review_queue.sort(key=lambda item: (-float(item["edge"]["confidence"]), item["target_label"].lower()))
+    suggestions = []
+    if top_concepts:
+        suggestions.append(f"Start with \"{top_concepts[0]['label']}\" to see the broadest shared evidence theme.")
+    if documents:
+        suggestions.append(f"Inspect \"{documents[0]['title']}\" because it has the most connected evidence in this view.")
+    if review_queue:
+        suggestions.append(f"Review {len(review_queue)} suggested relationship(s) before treating them as claims.")
+    if query:
+        suggestions.append(f"Use \"Focus\" on {query!r} to keep only evidence paths connected to that search.")
+
+    return {
+        "query": query,
+        "material_id": material_id,
+        "top_concepts": top_concepts[:limit],
+        "bridge_concepts": bridge_concepts[:limit],
+        "top_documents": documents[:limit],
+        "related_documents": related_documents[:limit],
+        "review_queue": review_queue[:limit],
+        "summary": {
+            "document_count": len(document_map),
+            "concept_count": len(concept_map),
+            "bridge_concept_count": len(bridge_concepts),
+            "review_needed_count": len(review_queue),
+            "edge_sample_count": len(rows),
+        },
+        "suggestions": suggestions,
+        "evidence_note": "Discovery summaries rank existing evidence links; they do not create new claims.",
+    }
+
+
+def graph_related_documents_for_node(
+    con: sqlite3.Connection,
+    node: dict,
+    query: Optional[str] = None,
+    include_rejected: bool = False,
+    limit: int = 24,
+) -> list[dict]:
+    material_lookup = graph_material_lookup(con)
+    rows = graph_discovery_rows(
+        con,
+        query=query,
+        include_rejected=include_rejected,
+        limit=max(5000, limit * 200),
+    )
+    doc_concepts: dict[str, set[str]] = {}
+    concept_labels: dict[str, dict] = {}
+    direct_concept_docs: dict[str, int] = {}
+
+    for row in rows:
+        edge = graph_edge_from_row(row)
+        source_properties = parse_graph_json(row["source_properties_json"], {})
+        target_properties = parse_graph_json(row["target_properties_json"], {})
+        material_id = graph_material_id_for_edge(edge, source_properties, target_properties)
+        if not material_id:
+            continue
+
+        concept_id = None
+        concept_label = None
+        concept_type = None
+        if row["source_type"] in GRAPH_CONCEPT_NODE_TYPES:
+            concept_id = row["source_node_id"]
+            concept_label = row["source_label"]
+            concept_type = row["source_type"]
+        elif row["target_type"] in GRAPH_CONCEPT_NODE_TYPES:
+            concept_id = row["target_node_id"]
+            concept_label = row["target_label"]
+            concept_type = row["target_type"]
+        if not concept_id:
+            continue
+
+        doc_concepts.setdefault(material_id, set()).add(concept_id)
+        concept_labels[concept_id] = {
+            "node_id": concept_id,
+            "label": concept_label,
+            "node_type": concept_type,
+        }
+        if node["id"] == concept_id:
+            direct_concept_docs[material_id] = direct_concept_docs.get(material_id, 0) + 1
+
+    if node["node_type"] in GRAPH_CONCEPT_NODE_TYPES:
+        related = []
+        for material_id, evidence_count in direct_concept_docs.items():
+            related.append(
+                {
+                    "material": graph_compact_document(material_lookup, material_id),
+                    "shared_concept_count": 1,
+                    "shared_concepts": [
+                        {
+                            "node_id": node["id"],
+                            "label": node["label"],
+                            "node_type": node["node_type"],
+                        }
+                    ],
+                    "relationship_strength": min(1.0, evidence_count / 8),
+                    "reason": f"Evidence in this document mentions {node['label']}.",
+                }
+            )
+        related.sort(key=lambda item: (-item["relationship_strength"], item["material"]["title"].lower()))
+        return related[:limit]
+
+    properties = node.get("properties") or {}
+    material_id = properties.get("material_id") if node["node_type"] == "material" else None
+    if not isinstance(material_id, str) or not material_id:
+        return []
+
+    source_concepts = doc_concepts.get(material_id, set())
+    related = []
+    for other_material_id, other_concepts in doc_concepts.items():
+        if other_material_id == material_id:
+            continue
+        shared = source_concepts.intersection(other_concepts)
+        if not shared:
+            continue
+        shared_concepts = [concept_labels[concept_id] for concept_id in sorted(shared) if concept_id in concept_labels]
+        related.append(
+            {
+                "material": graph_compact_document(material_lookup, other_material_id),
+                "shared_concept_count": len(shared),
+                "shared_concepts": shared_concepts[:10],
+                "relationship_strength": min(1.0, len(shared) / 8),
+                "reason": "Documents share evidence concepts, places, times, authors, or keywords.",
+            }
+        )
+    related.sort(key=lambda item: (-item["shared_concept_count"], item["material"]["title"].lower()))
+    return related[:limit]
 
 
 def query_graph_timeline(
@@ -4342,6 +4717,7 @@ async def delete_material(material_id: str):
         ).fetchall()
         delete_graph_scope(con, material_id)
         con.execute("DELETE FROM materials WHERE id = ?", (material_id,))
+        build_semantic_graph(con)
 
     for row in file_rows:
         try:
@@ -5378,6 +5754,255 @@ async def build_knowledge_graph(payload: GraphBuildRequest):
     }
 
 
+@router.post("/graph/semantic/build")
+async def build_semantic_knowledge_graph(payload: GraphBuildRequest):
+    init_repository_db()
+    with get_connection() as con:
+        if payload.material_id:
+            ensure_material(con, payload.material_id)
+        corpus_id = graph_corpus_node_id()
+        con.execute(
+            "DELETE FROM repository_graph_edges WHERE source_node_id = ? OR target_node_id = ?",
+            (corpus_id, corpus_id),
+        )
+        con.execute("DELETE FROM repository_graph_nodes WHERE id = ?", (corpus_id,))
+        result = build_semantic_graph(con, material_id=payload.material_id)
+        build_id = str(uuid.uuid4())
+        scope = "semantic_material" if payload.material_id else "semantic_repository"
+        con.execute(
+            """
+            INSERT INTO repository_graph_builds (
+                id, scope, material_id, status, node_count, edge_count, message, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                build_id,
+                scope,
+                payload.material_id,
+                "done",
+                result["entity_count"],
+                result["relation_count"],
+                (
+                    f"Built semantic graph from {result['material_count']} material record(s); "
+                    f"{result['mention_count']} evidence mentions remain in the drill-down layer."
+                ),
+                now_iso(),
+            ),
+        )
+        con.commit()
+    return {
+        "build_id": build_id,
+        "scope": scope,
+        "material_id": payload.material_id,
+        "status": "done",
+        "node_count": result["entity_count"],
+        "edge_count": result["relation_count"],
+        **result,
+    }
+
+
+@router.get("/graph/semantic")
+async def get_semantic_knowledge_graph(
+    query: Optional[str] = Query(default=None, max_length=500),
+    view: str = Query(default="overview", pattern="^(overview|documents|concepts|places_time)$"),
+    include_generic: bool = False,
+    include_rejected: bool = False,
+    limit: int = Query(default=180, ge=1, le=500),
+):
+    init_repository_db()
+    with get_connection() as con:
+        return semantic_graph_payload(
+            con,
+            query=query,
+            view=view,
+            include_generic=include_generic,
+            include_rejected=include_rejected,
+            limit=limit,
+        )
+
+
+@router.get("/graph/semantic/timeline")
+async def get_semantic_knowledge_graph_timeline(
+    query: Optional[str] = Query(default=None, max_length=500),
+    material_id: Optional[str] = None,
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    init_repository_db()
+    with get_connection() as con:
+        if material_id:
+            ensure_material(con, material_id)
+        return semantic_timeline(con, query=query, material_id=material_id, limit=limit)
+
+
+@router.get("/graph/semantic/map")
+async def get_semantic_knowledge_graph_map(
+    query: Optional[str] = Query(default=None, max_length=500),
+    material_id: Optional[str] = None,
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    init_repository_db()
+    with get_connection() as con:
+        if material_id:
+            ensure_material(con, material_id)
+        return semantic_map(con, query=query, material_id=material_id, limit=limit)
+
+
+@router.get("/graph/entity/{entity_id}")
+async def get_semantic_graph_entity(
+    entity_id: str,
+    include_rejected: bool = False,
+):
+    init_repository_db()
+    with get_connection() as con:
+        return semantic_entity_detail(con, entity_id, include_rejected=include_rejected)
+
+
+@router.get("/graph/entity/{entity_id}/evidence")
+async def get_semantic_graph_entity_evidence(
+    entity_id: str,
+    limit: int = Query(default=50, ge=1, le=250),
+    offset: int = Query(default=0, ge=0),
+):
+    init_repository_db()
+    with get_connection() as con:
+        return semantic_entity_evidence(con, entity_id, limit=limit, offset=offset)
+
+
+@router.get("/graph/entity/{entity_id}/related-materials")
+async def get_semantic_graph_related_materials(
+    entity_id: str,
+    limit: int = Query(default=30, ge=1, le=100),
+):
+    init_repository_db()
+    with get_connection() as con:
+        return semantic_related_materials(con, entity_id, limit=limit)
+
+
+@router.get("/graph/relation/{relation_id}/evidence")
+async def get_semantic_graph_relation_evidence(
+    relation_id: str,
+    limit: int = Query(default=50, ge=1, le=250),
+    offset: int = Query(default=0, ge=0),
+):
+    init_repository_db()
+    with get_connection() as con:
+        return semantic_relation_evidence(con, relation_id, limit=limit, offset=offset)
+
+
+@router.get("/graph/candidates")
+async def get_semantic_graph_candidates(
+    status: Optional[str] = Query(default=None, pattern="^(accepted|needs_review|rejected)$"),
+    entity_id: Optional[str] = None,
+    query: Optional[str] = Query(default=None, max_length=500),
+    limit: int = Query(default=50, ge=1, le=250),
+):
+    init_repository_db()
+    with get_connection() as con:
+        return semantic_candidates(
+            con,
+            status=status,
+            entity_id_value=entity_id,
+            query=query,
+            limit=limit,
+        )
+
+
+@router.get("/graph/place-review")
+async def get_semantic_place_review(
+    status: Optional[str] = Query(default=None, pattern="^(resolved|ambiguous|unresolved|rejected)$"),
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    init_repository_db()
+    with get_connection() as con:
+        return resolution_review_payload(con, "place", status=status, limit=limit)
+
+
+@router.get("/graph/time-review")
+async def get_semantic_time_review(
+    status: Optional[str] = Query(default=None, pattern="^(resolved|ambiguous|invalid|needs_review|rejected)$"),
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    init_repository_db()
+    with get_connection() as con:
+        return resolution_review_payload(con, "time", status=status, limit=limit)
+
+
+@router.patch("/graph/semantic/relations/{relation_id}/review")
+async def review_semantic_graph_relation(relation_id: str, payload: GraphEdgeReviewRequest):
+    init_repository_db()
+    with get_connection() as con:
+        result = review_semantic_relation(con, relation_id, payload.review_status)
+        con.commit()
+        return result
+
+
+@router.patch("/graph/semantic/candidates/{candidate_id}/review")
+async def review_semantic_graph_candidate(candidate_id: str, payload: GraphEdgeReviewRequest):
+    init_repository_db()
+    with get_connection() as con:
+        result = review_semantic_candidate(con, candidate_id, payload.review_status)
+        con.commit()
+        return result
+
+
+@router.patch("/graph/place-review/{resolution_id}")
+async def review_semantic_place(
+    resolution_id: str,
+    payload: PlaceResolutionReviewRequest,
+):
+    init_repository_db()
+    with get_connection() as con:
+        result = review_place_resolution(
+            con,
+            resolution_id,
+            payload.resolution_status,
+            latitude=payload.latitude,
+            longitude=payload.longitude,
+            resolved_label=payload.resolved_label,
+            gazetteer_id=payload.gazetteer_id,
+            notes=payload.notes,
+        )
+        if payload.resolution_status in {"resolved", "rejected"}:
+            build_semantic_graph(con)
+            updated = con.execute(
+                "SELECT * FROM kg_place_resolution WHERE id = ?",
+                (resolution_id,),
+            ).fetchone()
+            if updated:
+                result = dict(updated)
+        con.commit()
+        return result
+
+
+@router.patch("/graph/time-review/{resolution_id}")
+async def review_semantic_time(
+    resolution_id: str,
+    payload: TimeResolutionReviewRequest,
+):
+    init_repository_db()
+    with get_connection() as con:
+        result = review_time_resolution(
+            con,
+            resolution_id,
+            payload.resolution_status,
+            start_year=payload.start_year,
+            end_year=payload.end_year,
+            resolved_label=payload.resolved_label,
+            notes=payload.notes,
+        )
+        if payload.resolution_status in {"resolved", "rejected"}:
+            build_semantic_graph(con)
+            updated = con.execute(
+                "SELECT * FROM kg_time_resolution WHERE id = ?",
+                (resolution_id,),
+            ).fetchone()
+            if updated:
+                result = dict(updated)
+        con.commit()
+        return result
+
+
 @router.get("/graph/network")
 async def get_knowledge_graph_network(
     query: Optional[str] = Query(default=None, max_length=500),
@@ -5482,6 +6107,106 @@ async def get_knowledge_graph_path(
             include_rejected=include_rejected,
             max_depth=max_depth,
         )
+
+
+@router.get("/graph/discovery")
+async def get_knowledge_graph_discovery(
+    query: Optional[str] = Query(default=None, max_length=500),
+    material_id: Optional[str] = None,
+    include_rejected: bool = False,
+    limit: int = Query(default=24, ge=1, le=100),
+):
+    init_repository_db()
+    with get_connection() as con:
+        return graph_discovery_summary(
+            con,
+            query=query,
+            material_id=material_id,
+            include_rejected=include_rejected,
+            limit=limit,
+        )
+
+
+@router.get("/graph/concepts/top")
+async def get_top_knowledge_graph_concepts(
+    query: Optional[str] = Query(default=None, max_length=500),
+    include_rejected: bool = False,
+    limit: int = Query(default=24, ge=1, le=100),
+):
+    init_repository_db()
+    with get_connection() as con:
+        discovery = graph_discovery_summary(
+            con,
+            query=query,
+            include_rejected=include_rejected,
+            limit=limit,
+        )
+        return {
+            "query": query,
+            "top_concepts": discovery["top_concepts"],
+            "bridge_concepts": discovery["bridge_concepts"],
+            "summary": discovery["summary"],
+            "evidence_note": discovery["evidence_note"],
+        }
+
+
+@router.get("/graph/review-queue")
+async def get_knowledge_graph_review_queue(
+    query: Optional[str] = Query(default=None, max_length=500),
+    material_id: Optional[str] = None,
+    include_rejected: bool = False,
+    limit: int = Query(default=24, ge=1, le=100),
+):
+    init_repository_db()
+    with get_connection() as con:
+        discovery = graph_discovery_summary(
+            con,
+            query=query,
+            material_id=material_id,
+            include_rejected=include_rejected,
+            limit=limit,
+        )
+        return {
+            "query": query,
+            "material_id": material_id,
+            "review_queue": discovery["review_queue"],
+            "summary": discovery["summary"],
+            "evidence_note": discovery["evidence_note"],
+        }
+
+
+@router.get("/graph/node/{node_id}/related-documents")
+async def get_knowledge_graph_related_documents(
+    node_id: str,
+    query: Optional[str] = Query(default=None, max_length=500),
+    include_rejected: bool = False,
+    limit: int = Query(default=24, ge=1, le=100),
+):
+    init_repository_db()
+    with get_connection() as con:
+        row = con.execute(
+            "SELECT * FROM repository_graph_nodes WHERE id = ?",
+            (node_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Knowledge graph node not found")
+        node = graph_node_from_row(row)
+        related_documents = graph_related_documents_for_node(
+            con,
+            node,
+            query=query,
+            include_rejected=include_rejected,
+            limit=limit,
+        )
+        return {
+            "node": graph_node_for_interactive(node, {}, {}, {}),
+            "related_documents": related_documents,
+            "summary": {
+                "related_document_count": len(related_documents),
+                "include_rejected": include_rejected,
+            },
+            "evidence_note": "Related documents are inferred from shared graph concepts and evidence links; no new claims are created.",
+        }
 
 
 @router.get("/graph/timeline")

@@ -115,6 +115,23 @@ class GraphEdgeReviewRequest(BaseModel):
     review_status: str = Field(..., pattern="^(accepted|rejected|needs_review)$")
 
 
+class PlaceResolutionReviewRequest(BaseModel):
+    resolution_status: str = Field(..., pattern="^(resolved|ambiguous|unresolved|rejected)$")
+    latitude: Optional[float] = Field(default=None, ge=-90, le=90)
+    longitude: Optional[float] = Field(default=None, ge=-180, le=180)
+    resolved_label: Optional[str] = Field(default=None, max_length=300)
+    gazetteer_id: Optional[str] = Field(default=None, max_length=300)
+    notes: Optional[str] = Field(default=None, max_length=2000)
+
+
+class TimeResolutionReviewRequest(BaseModel):
+    resolution_status: str = Field(..., pattern="^(resolved|ambiguous|invalid|needs_review|rejected)$")
+    start_year: Optional[int] = Field(default=None, ge=-100000, le=100000)
+    end_year: Optional[int] = Field(default=None, ge=-100000, le=100000)
+    resolved_label: Optional[str] = Field(default=None, max_length=300)
+    notes: Optional[str] = Field(default=None, max_length=2000)
+
+
 @dataclass
 class SegmentInput:
     source_kind: str
