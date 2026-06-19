@@ -10,6 +10,13 @@ from typing import Optional
 
 from fastapi import HTTPException
 
+from app.repository.semantic_rules import (
+    RELATION_RULES,
+    candidate_rule_id,
+    primary_relation_rule_id,
+    relation_rule_ids,
+)
+
 
 ENTITY_TYPES = {
     "material",
@@ -1044,6 +1051,7 @@ def add_relation_group(
     properties: Optional[dict] = None,
 ):
     key = (subject_id, predicate, object_id)
+    source_rule_ids = relation_rule_ids(predicate, extraction_method, properties)
     group = groups.setdefault(
         key,
         {
@@ -1053,6 +1061,7 @@ def add_relation_group(
             "statuses": [],
             "methods": set(),
             "properties": {},
+            "rule_ids": set(),
         },
     )
     group["evidence"][evidence_identity(evidence)] = evidence
@@ -1060,6 +1069,7 @@ def add_relation_group(
     group["statuses"].append(status)
     group["methods"].add(extraction_method)
     group["properties"].update(properties or {})
+    group["rule_ids"].update(source_rule_ids)
 
 
 def persist_relation_groups(
@@ -1080,6 +1090,18 @@ def persist_relation_groups(
         evidence_items = list(group["evidence"].values())
         material_ids = {item["material_id"] for item in evidence_items}
         confidence = sum(group["confidences"]) / max(1, len(group["confidences"]))
+        rule_ids = set(group["rule_ids"])
+        rule_ids.update(relation_rule_ids(predicate, extraction_method))
+        properties = dict(group["properties"])
+        properties.update(
+            {
+                "rule_ids": sorted(rule_ids),
+                "source_methods": methods,
+                "source_statuses": sorted(set(statuses)),
+                "confidence_aggregation": "arithmetic_mean",
+                "status_aggregation": "accepted_if_any_source_evidence_is_accepted_else_needs_review",
+            }
+        )
         con.execute(
             """
             INSERT INTO kg_relations (
@@ -1100,7 +1122,7 @@ def persist_relation_groups(
                 round(confidence, 4),
                 status,
                 extraction_method,
-                compact_json(group["properties"]),
+                compact_json(properties),
                 ts,
                 ts,
             ),
@@ -1329,7 +1351,12 @@ def persist_cooccurrence_candidates(
                     f"Concepts co-occur in {len(items)} independent evidence units "
                     f"across {len(material_ids)} documents."
                 ),
-                compact_json({"visible_by_default": False}),
+                compact_json(
+                    {
+                        "visible_by_default": False,
+                        "rule_id": candidate_rule_id("co_occurs_with", "cooccurrence"),
+                    }
+                ),
                 ts,
                 ts,
             ),
@@ -1367,6 +1394,9 @@ def promote_accepted_candidates(con: sqlite3.Connection):
     for row in rows:
         promoted_id = relation_id(row["subject_entity_id"], "related_to", row["object_entity_id"])
         decision = load_review_decisions(con).get(("relation", promoted_id), "accepted")
+        promoted_method = f"reviewed_{row['candidate_method']}"
+        promoted_rule_id = primary_relation_rule_id("related_to", promoted_method)
+        source_rule_id = candidate_rule_id(row["predicate"], row["candidate_method"])
         con.execute(
             """
             INSERT INTO kg_relations (
@@ -1392,11 +1422,16 @@ def promote_accepted_candidates(con: sqlite3.Connection):
                 row["document_count"],
                 row["confidence"],
                 decision,
-                f"reviewed_{row['candidate_method']}",
+                promoted_method,
                 compact_json(
                     {
                         "promoted_from_candidate_id": row["id"],
                         "original_predicate": row["predicate"],
+                        "rule_ids": [
+                            rule_id
+                            for rule_id in (promoted_rule_id, source_rule_id)
+                            if rule_id
+                        ],
                     }
                 ),
                 now_iso(),
@@ -2280,6 +2315,12 @@ def relation_evidence_preview(con: sqlite3.Connection, item_id: str) -> dict:
 
 
 def semantic_relation_from_row(con: sqlite3.Connection, row: sqlite3.Row) -> dict:
+    properties = parse_json(row["properties_json"], {})
+    matching_rule_ids = relation_rule_ids(
+        row["predicate"],
+        row["extraction_method"],
+        properties,
+    )
     return {
         "id": row["id"],
         "source": row["subject_entity_id"],
@@ -2291,7 +2332,13 @@ def semantic_relation_from_row(con: sqlite3.Connection, row: sqlite3.Row) -> dic
         "confidence": float(row["confidence"]),
         "status": row["assertion_status"],
         "extraction_method": row["extraction_method"],
-        "properties": parse_json(row["properties_json"], {}),
+        "rule_id": primary_relation_rule_id(
+            row["predicate"],
+            row["extraction_method"],
+            properties,
+        ),
+        "matching_rule_ids": matching_rule_ids,
+        "properties": properties,
         "evidence_preview": (
             f"{row['evidence_count']} evidence item"
             f"{'' if row['evidence_count'] == 1 else 's'} support this relationship."
@@ -2733,6 +2780,134 @@ def semantic_relation_evidence(con: sqlite3.Connection, item_id: str, limit: int
     }
 
 
+def explain_semantic_relation(con: sqlite3.Connection, item_id: str, limit: int = 100) -> dict:
+    row = con.execute(
+        """
+        SELECT
+            r.*,
+            subject.label AS subject_label,
+            subject.entity_type AS subject_type,
+            object.label AS object_label,
+            object.entity_type AS object_type
+        FROM kg_relations r
+        JOIN kg_entities subject ON subject.id = r.subject_entity_id
+        JOIN kg_entities object ON object.id = r.object_entity_id
+        WHERE r.id = ?
+        """,
+        (item_id,),
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Semantic graph relation not found")
+
+    properties = parse_json(row["properties_json"], {})
+    rule_id = primary_relation_rule_id(
+        row["predicate"],
+        row["extraction_method"],
+        properties,
+    )
+    rule = RELATION_RULES.get(rule_id)
+    if not rule:
+        raise HTTPException(status_code=500, detail="Semantic relation rule is not registered")
+    matching_rule_ids = relation_rule_ids(
+        row["predicate"],
+        row["extraction_method"],
+        properties,
+    )
+    evidence_rows = con.execute(
+        """
+        SELECT re.*, m.title AS material_title
+        FROM kg_relation_evidence re
+        JOIN materials m ON m.id = re.material_id
+        WHERE re.relation_id = ?
+        ORDER BY re.created_at ASC
+        LIMIT ?
+        """,
+        (item_id, limit),
+    ).fetchall()
+    review = con.execute(
+        """
+        SELECT decision, notes, updated_at
+        FROM kg_review_decisions
+        WHERE target_kind = 'relation' AND target_key = ?
+        """,
+        (item_id,),
+    ).fetchone()
+    status = row["assertion_status"]
+    if status == "needs_review":
+        recommended_action = (
+            "Inspect each evidence item and the rule caution. Accept only if the subject-object assertion is "
+            "defensible for the stated predicate; otherwise reject it or leave it in review."
+        )
+    elif status == "rejected":
+        recommended_action = (
+            "No action is required unless new evidence justifies reconsideration. Re-review before changing the "
+            "stored rejection."
+        )
+    elif rule["default_status"] == "needs_review":
+        recommended_action = (
+            "This rule normally requires review. Confirm that the accepted status reflects an explicit decision "
+            "or independent accepted evidence, and retain the review note for reproducibility."
+        )
+    else:
+        recommended_action = (
+            "No mandatory review is pending. For publication-quality analysis, verify the cited metadata or source "
+            "evidence and report this rule ID."
+        )
+
+    return {
+        "relation_id": row["id"],
+        "predicate": row["predicate"],
+        "rule_id": rule_id,
+        "matching_rule_ids": matching_rule_ids,
+        "plain_language_explanation": (
+            f"Subject '{row['subject_label']}' is linked to object '{row['object_label']}'. "
+            f"Under rule {rule_id}, this means {rule['meaning']}. "
+            f"The edge is supported by {row['evidence_count']} unique evidence item"
+            f"{'' if row['evidence_count'] == 1 else 's'} across {row['document_count']} document"
+            f"{'' if row['document_count'] == 1 else 's'}."
+        ),
+        "subject": {
+            "id": row["subject_entity_id"],
+            "label": row["subject_label"],
+            "type": row["subject_type"],
+        },
+        "object": {
+            "id": row["object_entity_id"],
+            "label": row["object_label"],
+            "type": row["object_type"],
+        },
+        "evidence_count": int(row["evidence_count"]),
+        "document_count": int(row["document_count"]),
+        "confidence": float(row["confidence"]),
+        "status": status,
+        "extraction_method": row["extraction_method"],
+        "evidence_items": [
+            {
+                "id": evidence["id"],
+                "evidence_type": evidence["evidence_type"],
+                "evidence_ref": {
+                    "material_id": evidence["material_id"],
+                    "material_title": evidence["material_title"],
+                    "segment_id": evidence["segment_id"],
+                    "image_id": evidence["image_id"],
+                    "observation_id": evidence["observation_id"],
+                    "page_ref": evidence["page_ref"],
+                    "source_locator": evidence["source_locator"],
+                    "source": evidence["evidence_type"],
+                    "snippet": evidence["snippet"],
+                },
+            }
+            for evidence in evidence_rows
+        ],
+        "methodological_caution": rule["limitation_caution"],
+        "what_it_does_not_mean": rule["does_not_mean"],
+        "recommended_review_action": recommended_action,
+        "rule": rule,
+        "properties": properties,
+        "review_decision": dict(review) if review else None,
+    }
+
+
 def candidate_from_row(con: sqlite3.Connection, row: sqlite3.Row) -> dict:
     labels = con.execute(
         "SELECT id, label, entity_type FROM kg_entities WHERE id IN (?, ?)",
@@ -2747,6 +2922,7 @@ def candidate_from_row(con: sqlite3.Connection, row: sqlite3.Row) -> dict:
         "target_entity": label_map.get(row["object_entity_id"]),
         "predicate": row["predicate"],
         "candidate_method": row["candidate_method"],
+        "rule_id": candidate_rule_id(row["predicate"], row["candidate_method"]),
         "evidence_count": row["evidence_count"],
         "document_count": row["document_count"],
         "confidence": row["confidence"],

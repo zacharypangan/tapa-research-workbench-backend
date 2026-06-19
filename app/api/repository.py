@@ -32,11 +32,14 @@ from app.repository.schemas import (
     PlaceResolutionReviewRequest,
     SearchReportRequest,
     SegmentInput,
+    SemanticRelationExplanationResponse,
+    SemanticRelationRulesResponse,
     SemanticSearchRequest,
     TimeResolutionReviewRequest,
 )
 from app.repository.semantic_graph import (
     build_semantic_graph,
+    explain_semantic_relation,
     init_semantic_graph_schema,
     resolution_review_payload,
     review_place_resolution,
@@ -52,6 +55,7 @@ from app.repository.semantic_graph import (
     semantic_relation_evidence,
     semantic_timeline,
 )
+from app.repository.semantic_rules import semantic_relation_rules_payload
 from app.repository.search_reports import (
     build_term_pattern,
     enrich_evidence_classification,
@@ -5846,6 +5850,27 @@ async def get_semantic_knowledge_graph_map(
         if material_id:
             ensure_material(con, material_id)
         return semantic_map(con, query=query, material_id=material_id, limit=limit)
+
+
+@router.get(
+    "/graph/semantic/rules",
+    response_model=SemanticRelationRulesResponse,
+)
+async def get_semantic_relation_rules():
+    return semantic_relation_rules_payload()
+
+
+@router.get(
+    "/graph/semantic/relations/{relation_id}/explain",
+    response_model=SemanticRelationExplanationResponse,
+)
+async def explain_semantic_graph_relation(
+    relation_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    init_repository_db()
+    with get_connection() as con:
+        return explain_semantic_relation(con, relation_id, limit=limit)
 
 
 @router.get("/graph/entity/{entity_id}")
