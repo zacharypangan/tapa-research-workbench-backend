@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
@@ -104,6 +104,90 @@ class MultimodalSearchRequest(BaseModel):
     include_images: bool = True
     auto_index_images: bool = False
     image_index_limit: int = Field(default=0, ge=0, le=100)
+
+
+class GraphBuildRequest(BaseModel):
+    material_id: Optional[str] = None
+    force: bool = True
+
+
+class GraphEdgeReviewRequest(BaseModel):
+    review_status: str = Field(..., pattern="^(accepted|rejected|needs_review)$")
+
+
+class SemanticRelationRuleResponse(BaseModel):
+    rule_id: str
+    predicate: str
+    relation_family: str
+    subject_type: str
+    object_type: str
+    trigger_condition: str
+    required_evidence: str
+    evidence_source_tables: list[str]
+    confidence_logic: str
+    default_status: str
+    extraction_method: str
+    visible_by_default: bool
+    candidate_only: bool
+    methodological_note: str
+    limitation_caution: str
+    meaning: str
+    does_not_mean: str
+    accepted_when: str
+    needs_review_when: str
+    implemented: bool
+
+
+class SemanticRelationRulesResponse(BaseModel):
+    policy_version: str
+    rules: list[SemanticRelationRuleResponse]
+    count: int
+    policy: dict[str, str]
+
+
+class SemanticRelationEntityResponse(BaseModel):
+    id: str
+    label: str
+    type: str
+
+
+class SemanticRelationExplanationResponse(BaseModel):
+    relation_id: str
+    predicate: str
+    rule_id: str
+    matching_rule_ids: list[str]
+    plain_language_explanation: str
+    subject: SemanticRelationEntityResponse
+    object: SemanticRelationEntityResponse
+    evidence_count: int
+    document_count: int
+    confidence: float
+    status: str
+    extraction_method: str
+    evidence_items: list[dict[str, Any]]
+    methodological_caution: str
+    what_it_does_not_mean: str
+    recommended_review_action: str
+    rule: SemanticRelationRuleResponse
+    properties: dict[str, Any]
+    review_decision: Optional[dict[str, Any]] = None
+
+
+class PlaceResolutionReviewRequest(BaseModel):
+    resolution_status: str = Field(..., pattern="^(resolved|ambiguous|unresolved|rejected)$")
+    latitude: Optional[float] = Field(default=None, ge=-90, le=90)
+    longitude: Optional[float] = Field(default=None, ge=-180, le=180)
+    resolved_label: Optional[str] = Field(default=None, max_length=300)
+    gazetteer_id: Optional[str] = Field(default=None, max_length=300)
+    notes: Optional[str] = Field(default=None, max_length=2000)
+
+
+class TimeResolutionReviewRequest(BaseModel):
+    resolution_status: str = Field(..., pattern="^(resolved|ambiguous|invalid|needs_review|rejected)$")
+    start_year: Optional[int] = Field(default=None, ge=-100000, le=100000)
+    end_year: Optional[int] = Field(default=None, ge=-100000, le=100000)
+    resolved_label: Optional[str] = Field(default=None, max_length=300)
+    notes: Optional[str] = Field(default=None, max_length=2000)
 
 
 @dataclass
