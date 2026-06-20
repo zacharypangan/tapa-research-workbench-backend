@@ -13,8 +13,11 @@ services:
       - OLLAMA_EMBEDDING_MODEL=${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
       - OLLAMA_RETRIEVAL_MODEL=${OLLAMA_RETRIEVAL_MODEL:-llama3.1}
       - OLLAMA_VISION_MODEL=${OLLAMA_VISION_MODEL:-llava}
+      - GOVERNANCE_ENABLED=${GOVERNANCE_ENABLED:-true}
+      - GOVERNANCE_ROOT=/governance
     volumes:
       - ./storage:/app/storage
+      - ../Data Governance:/governance:ro
     depends_on:
       - redis
 
