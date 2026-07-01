@@ -16,7 +16,11 @@ Required settings:
 
 ```env
 REDIS_URL=<railway redis private url>
+DATABASE_URL=<railway postgres private url>
 ALLOWED_ORIGINS=https://<vercel-domain>,https://<custom-domain-if-any>
+CLERK_ISSUER=https://<clerk-frontend-api-domain>
+CLERK_AUTHORIZED_PARTIES=https://<vercel-domain>,https://<custom-domain-if-any>
+AUTH_DISABLED=false
 REPOSITORY_STORAGE_ROOT=/app/storage/repository
 REPOSITORY_OLLAMA_BASE_URL=
 OLLAMA_BASE_URL=
@@ -98,9 +102,11 @@ The AI status endpoint should report Ollama unavailable instead of breaking the 
 
 ## Access Control
 
-For v1, use platform protection:
+Use Clerk application authentication in addition to platform protection:
 
 - Vercel deployment protection or team-only access for the frontend.
+- Clerk Organizations with member, reviewer, and admin project roles.
+- FastAPI bearer-token verification for Progress and protected Repository operations.
 - CORS restricted with `ALLOWED_ORIGINS`.
 - Railway project access limited to trusted teammates.
 

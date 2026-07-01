@@ -26,4 +26,10 @@ dependencies = [
     "pytesseract>=0.3.13",
     "striprtf",
     "PyMuPDF",
+    "sqlalchemy>=2.0.51",
+    "alembic>=1.18.5",
+    "psycopg[binary]>=3.3.4",
+    "pyjwt>=2.13.0",
+    "cryptography>=49.0.0",
+    "arq>=0.25.0",
 ]

@@ -2,7 +2,7 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.db import init_db
-from app.api import tiles, chat, data, governance, repository
+from app.api import tiles, chat, data, governance, progress, repository
 
 app = FastAPI(title="Tapa Research Workbench Backend")
 
@@ -35,6 +35,7 @@ app.include_router(chat.router, prefix="/api/v1")
 app.include_router(data.router, prefix="/api/v1")
 app.include_router(repository.router, prefix="/api/v1")
 app.include_router(governance.router, prefix="/api/v1")
+app.include_router(progress.router, prefix="/api/v1")
 
 
 @app.on_event("startup")
