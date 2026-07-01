@@ -3,6 +3,7 @@ from logging.config import fileConfig
 from alembic import context
 
 from app.progress.database import Base, DATABASE_URL
+from app.progress import models  # noqa: F401
 
 
 config = context.config
