@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -133,6 +134,22 @@ class ProgressApiTests(unittest.TestCase):
         self.role = "member"
         response = self.client.get("/api/v1/progress/review-queue")
         self.assertEqual(response.status_code, 403)
+
+    def test_extraction_job_is_persisted_before_queueing(self):
+        pool = AsyncMock()
+        pool.enqueue_job = AsyncMock()
+        pool.close = AsyncMock()
+        with patch("app.api.progress.create_pool", new=AsyncMock(return_value=pool)):
+            response = self.client.post(
+                "/api/v1/progress/jobs/repository-extract/material-1?force=true"
+            )
+        self.assertEqual(response.status_code, 202, response.text)
+        payload = response.json()
+        self.assertEqual(payload["status"], "queued")
+        self.assertEqual(payload["payload"], {"force": True})
+        pool.enqueue_job.assert_awaited_once_with(
+            "extract_repository_material", payload["id"], _job_id=payload["id"]
+        )
 
 
 if __name__ == "__main__":

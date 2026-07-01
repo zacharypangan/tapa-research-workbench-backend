@@ -42,6 +42,14 @@ This preserves:
 /app/storage/repository/images
 ```
 
+Create a second Railway service from the same backend image for durable extraction jobs:
+
+```text
+Command: arq app.progress.worker.WorkerSettings
+Variables: DATABASE_URL, REDIS_PRIVATE_URL, REPOSITORY_STORAGE_ROOT
+Volume: mount the same repository storage volume at /app/storage
+```
+
 ## Vercel Frontend
 
 Create a Vercel project rooted at `stling_frontend/`.

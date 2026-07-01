@@ -9,6 +9,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
+from arq import create_pool
+from arq.connections import RedisSettings
+import os
 
 from app.auth import AuthContext, require_permission
 from app.progress.database import get_session
@@ -20,6 +23,7 @@ from app.progress.models import (
     MeetingSession,
     Member,
     Presentation,
+    ProgressJob,
     RecordConcept,
     RecordEvidence,
     RepositoryMaterialLink,
@@ -517,3 +521,58 @@ def create_concept(
     _commit(session)
     session.refresh(concept)
     return concept
+
+
+@router.get("/jobs/{job_id}")
+def get_job(
+    job_id: str,
+    session: Session = Depends(get_session),
+    _context: AuthContext = Depends(require_permission("progress:read")),
+):
+    job = session.get(ProgressJob, job_id)
+    if not job:
+        raise _not_found("Progress job")
+    return job
+
+
+@router.post("/jobs/repository-extract/{material_id}", status_code=status.HTTP_202_ACCEPTED)
+async def enqueue_repository_extraction(
+    material_id: str,
+    force: bool = False,
+    session: Session = Depends(get_session),
+    context: AuthContext = Depends(require_permission("progress:write")),
+):
+    job = ProgressJob(
+        job_type="repository_extract",
+        target_id=material_id,
+        status="queued",
+        payload={"force": force},
+        queued_by=context.user_id,
+    )
+    session.add(job)
+    session.flush()
+    _audit(
+        session,
+        entity_type="progress_job",
+        entity_id=job.id,
+        action="queued",
+        actor_id=context.user_id,
+        changes={"material_id": material_id, "force": force},
+    )
+    _commit(session)
+
+    redis_url = os.getenv("REDIS_PRIVATE_URL") or os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    try:
+        pool = await create_pool(RedisSettings.from_dsn(redis_url))
+        await pool.enqueue_job("extract_repository_material", job.id, _job_id=job.id)
+        await pool.close()
+    except Exception as exc:
+        job.status = "queue_failed"
+        job.error_message = str(exc)
+        _commit(session)
+        raise HTTPException(
+            status_code=503,
+            detail={"message": "Extraction queue is unavailable.", "job_id": job.id},
+        ) from exc
+    session.refresh(job)
+    return job

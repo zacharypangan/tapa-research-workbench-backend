@@ -267,9 +267,15 @@ def init_repository_db():
             )
             """
         )
+        ensure_column(con, "files", "sha256", "sha256 TEXT")
+        ensure_column(con, "files", "ingest_source", "ingest_source TEXT")
+        ensure_column(con, "files", "original_mtime", "original_mtime TEXT")
+        ensure_column(con, "files", "parser_status", "parser_status TEXT")
+        ensure_column(con, "files", "parser_message", "parser_message TEXT")
         con.execute("CREATE INDEX IF NOT EXISTS idx_materials_status ON materials(status)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_materials_collection ON materials(collection)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_files_material ON files(material_id)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_files_sha256 ON files(sha256)")
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS extracted_segments (
@@ -4745,6 +4751,8 @@ async def add_file(
     if len(content) > 100 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="File exceeds 100MB limit")
 
+    sha256 = hashlib.sha256(content).hexdigest()
+
     file_id = str(uuid.uuid4())
     material_dir = os.path.join(FILES_ROOT, material_id)
     os.makedirs(material_dir, exist_ok=True)
@@ -4752,6 +4760,14 @@ async def add_file(
 
     with get_connection() as con:
         ensure_material(con, material_id)
+        existing = con.execute(
+            "SELECT * FROM files WHERE material_id = ? AND sha256 = ?",
+            (material_id, sha256),
+        ).fetchone()
+        if existing:
+            payload = file_from_row(existing)
+            payload["deduplicated"] = True
+            return payload
         with open(stored_path, "wb") as f:
             f.write(content)
         ts = now_iso()
@@ -4759,9 +4775,10 @@ async def add_file(
             """
             INSERT INTO files (
                 id, material_id, original_filename, stored_path,
-                mime_type, file_size, uploaded_at
+                mime_type, file_size, uploaded_at, sha256,
+                ingest_source, parser_status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 file_id,
@@ -4771,6 +4788,9 @@ async def add_file(
                 mime_type,
                 len(content),
                 ts,
+                sha256,
+                "interactive_upload",
+                "pending",
             ),
         )
         con.execute(
