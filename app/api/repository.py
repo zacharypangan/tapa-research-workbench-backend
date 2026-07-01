@@ -14,7 +14,7 @@ from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from app.repository.schemas import (
     AskCorpusRequest,
@@ -80,9 +80,14 @@ from app.repository.settings import (
     STATUSES,
     STORAGE_ROOT,
 )
+from app.auth import require_permission
 
 
-router = APIRouter(prefix="/repository", tags=["repository"])
+router = APIRouter(
+    prefix="/repository",
+    tags=["repository"],
+    dependencies=[Depends(require_permission("progress:read"))],
+)
 
 OLLAMA_CLOUD_API_BASE_URL = "https://ollama.com/api"
 OLLAMA_REPOSITORY_API_KEY = os.getenv(

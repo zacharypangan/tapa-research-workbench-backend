@@ -10,11 +10,19 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api import governance
+from app.auth import AuthContext, get_auth_context
 
 
 def make_client() -> TestClient:
     app = FastAPI()
     app.include_router(governance.router, prefix="/api/v1")
+    app.dependency_overrides[get_auth_context] = lambda: AuthContext(
+        user_id="test-admin",
+        organization_id="test-org",
+        role="admin",
+        permissions=frozenset({"progress:read", "progress:write", "progress:review", "progress:admin"}),
+        claims={"sub": "test-admin"},
+    )
     return TestClient(app)
 
 

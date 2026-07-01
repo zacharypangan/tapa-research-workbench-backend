@@ -10,7 +10,13 @@ from sqlalchemy.pool import StaticPool
 from app.api import progress
 from app.auth import AuthContext, get_auth_context
 from app.progress.database import Base, get_session
-from app.progress.models import AuditEvent
+from app.progress.models import (
+    AiExtractionRun,
+    AuditEvent,
+    LocalizedRevision,
+    ResearchRecord,
+    TranscriptSegment,
+)
 
 
 class ProgressApiTests(unittest.TestCase):
@@ -150,6 +156,143 @@ class ProgressApiTests(unittest.TestCase):
         pool.enqueue_job.assert_awaited_once_with(
             "extract_repository_material", payload["id"], _job_id=payload["id"]
         )
+
+    def test_bilingual_concept_alias_search_returns_original_evidence(self):
+        meeting = self.create_meeting()
+        concept = self.client.post(
+            "/api/v1/progress/concepts",
+            json={
+                "label_en": "collection year",
+                "label_ja": "採録年",
+                "aliases_en": ["temporal metadata"],
+                "aliases_ja": ["時間情報"],
+                "concept_type": "temporal",
+            },
+        )
+        self.assertEqual(concept.status_code, 201, concept.text)
+        record = self.client.post(
+            "/api/v1/progress/records",
+            json={
+                "record_type": "temporal_issue",
+                "title_original": "採録年の区別",
+                "original_evidence": "採録年と発行年を区別する必要がある。",
+                "meeting_id": meeting["id"],
+                "status": "candidate",
+                "concept_ids": [concept.json()["id"]],
+            },
+        )
+        self.assertEqual(record.status_code, 201, record.text)
+
+        response = self.client.get("/api/v1/progress/search", params={"q": "collection year"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()[0]["original_text"], "採録年と発行年を区別する必要がある。")
+        self.assertEqual(response.json()[0]["retrieval_basis"], "concept_alias")
+
+    def test_transcript_translation_creates_revision_history(self):
+        meeting = self.create_meeting()
+        with self.sessions() as session:
+            segment = TranscriptSegment(
+                meeting_id=meeting["id"],
+                original_text="時間情報が必要です。",
+                language="ja",
+                source_locator="cue:1",
+            )
+            session.add(segment)
+            session.commit()
+            segment_id = segment.id
+
+        response = self.client.patch(
+            f"/api/v1/progress/transcript-segments/{segment_id}",
+            json={"translation_en": "Temporal information is required.", "reviewed": True},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        with self.sessions() as session:
+            revisions = list(session.scalars(select(LocalizedRevision)))
+        self.assertEqual(len(revisions), 1)
+        self.assertEqual(revisions[0].review_status, "reviewed")
+
+    def test_ai_extraction_can_only_create_evidence_linked_candidates(self):
+        meeting = self.create_meeting()
+        with self.sessions() as session:
+            segment = TranscriptSegment(
+                meeting_id=meeting["id"],
+                original_text="GIS should be used as an analytical interface.",
+                language="en",
+                source_locator="cue:2",
+            )
+            session.add(segment)
+            session.commit()
+            segment_id = segment.id
+        generated = [
+            {
+                "record_type": "method_claim",
+                "title_original": "GIS as analytical interface",
+                "title_en": "GIS as analytical interface",
+                "title_ja": None,
+                "summary_en": "GIS supports analysis rather than display alone.",
+                "summary_ja": None,
+                "confidence": 0.87,
+                "evidence_source_ids": [segment_id],
+                "details": {"requested_status": "accepted"},
+            }
+        ]
+        with patch(
+            "app.api.progress.request_candidate_extraction",
+            new=AsyncMock(return_value=("[]", generated)),
+        ):
+            response = self.client.post(
+                "/api/v1/progress/ai/extract",
+                json={"source_kind": "transcript_segment", "source_ids": [segment_id]},
+            )
+        self.assertEqual(response.status_code, 201, response.text)
+        with self.sessions() as session:
+            run = session.scalars(select(AiExtractionRun)).one()
+            record = session.scalars(select(ResearchRecord)).one()
+        self.assertEqual(run.status, "completed")
+        self.assertEqual(record.status, "candidate")
+        self.assertEqual(len(response.json()["candidate_record_ids"]), 1)
+
+    def test_meeting_and_narrative_reports_preserve_evidence(self):
+        meeting = self.create_meeting()
+        record_response = self.client.post(
+            "/api/v1/progress/records",
+            json={
+                "record_type": "decision",
+                "title_en": "Keep originals primary",
+                "meeting_id": meeting["id"],
+                "status": "candidate",
+                "evidence": [
+                    {
+                        "source_kind": "note",
+                        "citation_text_original": "原文を一次資料として保存する。",
+                        "source_locator": "meeting-note:3",
+                    }
+                ],
+            },
+        )
+        self.assertEqual(record_response.status_code, 201, record_response.text)
+        record = record_response.json()
+        arc_response = self.client.post(
+            "/api/v1/progress/narrative-arcs",
+            json={
+                "title_en": "From data collection to datafication",
+                "title_ja": "データ収集からデータ化へ",
+                "description_en": "How materials become structured evidence.",
+                "description_ja": "資料が構造化された証拠になる過程。",
+            },
+        )
+        self.assertEqual(arc_response.status_code, 201, arc_response.text)
+        arc = arc_response.json()
+        link_response = self.client.post(
+            f"/api/v1/progress/narrative-arcs/{arc['id']}/links",
+            json={"source_kind": "research_record", "source_id": record["id"], "role_in_arc": "decision"},
+        )
+        self.assertEqual(link_response.status_code, 201, link_response.text)
+
+        meeting_report = self.client.get(f"/api/v1/progress/reports/meeting/{meeting['id']}")
+        arc_report = self.client.get(f"/api/v1/progress/reports/narrative-arcs/{arc['id']}")
+        self.assertIn("meeting-note:3", meeting_report.json()["content"])
+        self.assertIn("Keep originals primary", arc_report.json()["content"])
 
 
 if __name__ == "__main__":

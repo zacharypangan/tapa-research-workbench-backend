@@ -29,4 +29,4 @@ COPY . .
 # Expose the API port
 EXPOSE 8000
 
-CMD ["sh", "-c", "exec uv run uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "uv run alembic upgrade head && exec uv run uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]

@@ -75,7 +75,7 @@ Enable Vercel deployment protection or team-only access for the shared-team depl
 After Railway deploys, run:
 
 ```bash
-python scripts/smoke_deploy.py https://<railway-backend-domain>
+SMOKE_AUTH_TOKEN=<clerk-session-token> python scripts/smoke_deploy.py https://<railway-backend-domain>
 ```
 
 Expected checks:
@@ -84,6 +84,7 @@ Expected checks:
 GET /health
 GET /api/v1/repository/statuses
 GET /api/v1/repository/materials
+GET /api/v1/progress/status
 ```
 
 After Vercel deploys:
@@ -119,3 +120,15 @@ Use Clerk application authentication in addition to platform protection:
 - Railway project access limited to trusted teammates.
 
 Do not treat an obscure Railway URL as security.
+
+## Database Operations
+
+The backend container runs `alembic upgrade head` before starting Uvicorn. Keep Railway Postgres automated backups enabled and perform a restore drill before the first production import. Repository SQLite and files remain on the mounted Railway volume and require a separate volume snapshot or encrypted copy.
+
+Before a schema deployment:
+
+```bash
+pg_dump "$DATABASE_URL" --format=custom --file=progress_predeploy.dump
+```
+
+Verify restore into a temporary database with `pg_restore`, then run the authenticated smoke check against the restored application environment.

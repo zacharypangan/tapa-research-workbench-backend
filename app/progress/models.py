@@ -320,3 +320,90 @@ class ProgressJob(Base, TimestampMixin):
     queued_by: Mapped[str] = mapped_column(String(255))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class SourceAlignment(Base, TimestampMixin):
+    __tablename__ = "progress_source_alignments"
+    __table_args__ = (
+        UniqueConstraint(
+            "transcript_segment_id",
+            "repository_material_id",
+            "repository_segment_id",
+            name="uq_progress_source_alignment",
+        ),
+        Index("idx_progress_alignment_meeting", "meeting_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_string)
+    meeting_id: Mapped[str] = mapped_column(
+        ForeignKey("progress_meetings.id", ondelete="CASCADE"), index=True
+    )
+    presentation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("progress_presentations.id", ondelete="SET NULL")
+    )
+    transcript_segment_id: Mapped[str] = mapped_column(
+        ForeignKey("progress_transcript_segments.id", ondelete="CASCADE"), index=True
+    )
+    repository_material_id: Mapped[str] = mapped_column(String(36), index=True)
+    repository_segment_id: Mapped[int | None] = mapped_column(Integer)
+    method: Mapped[str] = mapped_column(String(32), default="manual")
+    confidence: Mapped[float | None] = mapped_column(Float)
+    status: Mapped[str] = mapped_column(String(32), default="candidate")
+    created_by: Mapped[str] = mapped_column(String(255))
+    reviewed_by: Mapped[str | None] = mapped_column(String(255))
+    notes: Mapped[str | None] = mapped_column(Text)
+
+
+class AiExtractionRun(Base, TimestampMixin):
+    __tablename__ = "progress_ai_extraction_runs"
+    __table_args__ = (Index("idx_progress_ai_run_status", "status", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_string)
+    provider: Mapped[str] = mapped_column(String(64))
+    model: Mapped[str] = mapped_column(String(255))
+    prompt_version: Mapped[str] = mapped_column(String(128))
+    prompt_hash: Mapped[str] = mapped_column(String(128))
+    source_kind: Mapped[str] = mapped_column(String(64))
+    source_ids: Mapped[list] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(32), default="running", index=True)
+    raw_response: Mapped[str | None] = mapped_column(Text)
+    candidate_record_ids: Mapped[list] = mapped_column(JSON, default=list)
+    requested_by: Mapped[str] = mapped_column(String(255))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class NarrativeArc(Base, TimestampMixin):
+    __tablename__ = "progress_narrative_arcs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_string)
+    title_en: Mapped[str] = mapped_column(String(1000))
+    title_ja: Mapped[str] = mapped_column(String(1000))
+    description_en: Mapped[str] = mapped_column(Text)
+    description_ja: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    notes: Mapped[str | None] = mapped_column(Text)
+
+    links: Mapped[list[ArcLink]] = relationship(
+        back_populates="arc", cascade="all, delete-orphan", order_by="ArcLink.order_index"
+    )
+
+
+class ArcLink(Base, TimestampMixin):
+    __tablename__ = "progress_arc_links"
+    __table_args__ = (UniqueConstraint("arc_id", "source_kind", "source_id"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_string)
+    arc_id: Mapped[str] = mapped_column(
+        ForeignKey("progress_narrative_arcs.id", ondelete="CASCADE"), index=True
+    )
+    source_kind: Mapped[str] = mapped_column(String(64))
+    source_id: Mapped[str] = mapped_column(String(36))
+    role_in_arc: Mapped[str] = mapped_column(String(32), default="evidence")
+    summary_en: Mapped[str | None] = mapped_column(Text)
+    summary_ja: Mapped[str | None] = mapped_column(Text)
+    confidence: Mapped[float | None] = mapped_column(Float)
+    order_index: Mapped[int] = mapped_column(Integer, default=0)
+    notes: Mapped[str | None] = mapped_column(Text)
+
+    arc: Mapped[NarrativeArc] = relationship(back_populates="links")

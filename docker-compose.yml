@@ -8,6 +8,8 @@ services:
     environment:
       # Override REDIS_URL to point to the local redis container in compose
       - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/research_workbench
+      - AUTH_DISABLED=${AUTH_DISABLED:-true}
       - PORT=${PORT:-8000}
       - REPOSITORY_OLLAMA_BASE_URL=${REPOSITORY_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       - OLLAMA_EMBEDDING_MODEL=${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
@@ -17,9 +19,26 @@ services:
       - GOVERNANCE_ROOT=/governance
     volumes:
       - ./storage:/app/storage
-      - ../Data Governance:/governance:ro
+      - ../../../Data Governance:/governance:ro
     depends_on:
       - redis
+      - postgres
+
+  progress-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: sh -c "uv run alembic upgrade head && uv run arq app.progress.worker.WorkerSettings"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/research_workbench
+      - REPOSITORY_STORAGE_ROOT=/app/storage/repository
+      - AUTH_DISABLED=${AUTH_DISABLED:-true}
+    volumes:
+      - ./storage:/app/storage
+    depends_on:
+      - redis
+      - postgres
 
   redis:
     image: redis:alpine
@@ -28,5 +47,17 @@ services:
     volumes:
       - redis_data:/data
 
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      - POSTGRES_DB=research_workbench
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
 volumes:
   redis_data:
+  postgres_data:

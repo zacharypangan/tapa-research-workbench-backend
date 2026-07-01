@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -14,6 +15,7 @@ CHECKS = [
     ("health", "/health"),
     ("repository statuses", "/api/v1/repository/statuses"),
     ("repository materials", "/api/v1/repository/materials"),
+    ("progress portal", "/api/v1/progress/status"),
 ]
 
 
@@ -24,8 +26,11 @@ def normalize_base_url(value: str) -> str:
     return base_url
 
 
-def fetch_json(url: str, timeout: float) -> tuple[int, object]:
-    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+def fetch_json(url: str, timeout: float, token: str = "") -> tuple[int, object]:
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         raw = response.read().decode("utf-8")
         try:
@@ -46,6 +51,11 @@ def main() -> int:
         help="Backend root URL, for example https://example.up.railway.app",
     )
     parser.add_argument("--timeout", type=float, default=10.0)
+    parser.add_argument(
+        "--token",
+        default=os.getenv("SMOKE_AUTH_TOKEN", ""),
+        help="Clerk session token for protected checks; defaults to SMOKE_AUTH_TOKEN.",
+    )
     args = parser.parse_args()
 
     base_url = normalize_base_url(args.base_url)
@@ -54,7 +64,8 @@ def main() -> int:
     for label, path in CHECKS:
         url = f"{base_url}{path}"
         try:
-            status, payload = fetch_json(url, args.timeout)
+            token = "" if path == "/health" else args.token
+            status, payload = fetch_json(url, args.timeout, token)
             ok = 200 <= status < 300
         except (urllib.error.URLError, TimeoutError) as exc:
             ok = False

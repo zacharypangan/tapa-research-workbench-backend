@@ -5,7 +5,7 @@ from unittest.mock import patch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app.api import progress
+from app.api import progress, repository
 from app.auth import AuthContext, get_auth_context
 
 
@@ -39,6 +39,13 @@ class ProgressAuthTests(unittest.TestCase):
         )
         response = TestClient(app).get("/api/v1/progress/status")
         self.assertEqual(response.status_code, 403)
+
+    def test_repository_metadata_is_protected(self):
+        app = FastAPI()
+        app.include_router(repository.router, prefix="/api/v1")
+        with patch.dict(os.environ, {"AUTH_DISABLED": "false"}):
+            response = TestClient(app).get("/api/v1/repository/statuses")
+        self.assertEqual(response.status_code, 401)
 
 
 if __name__ == "__main__":

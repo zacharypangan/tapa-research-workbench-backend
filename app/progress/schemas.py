@@ -229,3 +229,98 @@ class ConceptOut(ConceptCreate, OrmModel):
     id: str
     created_at: datetime
     updated_at: datetime
+
+
+class TranscriptSegmentUpdate(BaseModel):
+    speaker_text: str | None = Field(default=None, max_length=500)
+    speaker_member_id: str | None = None
+    segment_type: str | None = Field(default=None, max_length=64)
+    translation_en: str | None = None
+    translation_ja: str | None = None
+    summary_en: str | None = None
+    summary_ja: str | None = None
+    reviewed: bool | None = None
+    notes: str | None = None
+
+
+class AlignmentCreate(BaseModel):
+    meeting_id: str
+    transcript_segment_id: str
+    repository_material_id: str
+    repository_segment_id: int | None = None
+    presentation_id: str | None = None
+    method: Literal["manual", "title", "timestamp", "keyword", "program_order"] = "manual"
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    status: Literal["candidate", "accepted", "rejected"] = "candidate"
+    notes: str | None = None
+
+
+class AlignmentOut(AlignmentCreate, OrmModel):
+    id: str
+    created_by: str
+    reviewed_by: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class SearchResult(BaseModel):
+    source_kind: Literal["research_record", "transcript_segment"]
+    source_id: str
+    meeting_id: str | None
+    title: str | None
+    original_text: str | None
+    translation_en: str | None
+    translation_ja: str | None
+    summary_en: str | None
+    summary_ja: str | None
+    source_locator: str | None
+    matched_term: str
+    retrieval_basis: Literal["original", "translation", "concept_alias"]
+    score: float
+
+
+class AiExtractionRequest(BaseModel):
+    source_kind: Literal["transcript_segment"] = "transcript_segment"
+    source_ids: list[str] = Field(min_length=1, max_length=50)
+
+
+class NarrativeArcCreate(BaseModel):
+    title_en: str = Field(min_length=1, max_length=1000)
+    title_ja: str = Field(min_length=1, max_length=1000)
+    description_en: str
+    description_ja: str
+    status: Literal["active", "archived"] = "active"
+    notes: str | None = None
+
+
+class NarrativeArcOut(NarrativeArcCreate, OrmModel):
+    id: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class ArcLinkCreate(BaseModel):
+    source_kind: Literal[
+        "transcript_segment",
+        "research_record",
+        "decision",
+        "open_question",
+        "technique",
+        "spatial_framework_item",
+        "temporal_framework_item",
+    ]
+    source_id: str
+    role_in_arc: Literal[
+        "origin", "problem", "example", "critique", "decision", "refinement", "follow_up", "evidence"
+    ] = "evidence"
+    summary_en: str | None = None
+    summary_ja: str | None = None
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    order_index: int = Field(default=0, ge=0)
+    notes: str | None = None
+
+
+class ReportPayload(BaseModel):
+    filename: str
+    media_type: str
+    content: str

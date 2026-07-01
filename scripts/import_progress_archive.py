@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import mimetypes
 import os
+import re
 import shutil
 import sys
 import uuid
@@ -48,18 +49,19 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def date_folder(root: Path, meeting_date: str) -> Path:
+def date_folder(root: Path, meeting_date: str) -> Path | None:
     materials_root = root / "Presentation Materials"
     for child in materials_root.iterdir():
         if child.is_dir() and child.name.strip() == meeting_date:
             return child
-    raise FileNotFoundError(f"No presentation folder matches {meeting_date}")
+    return None
 
 
 def meeting_files(root: Path, meeting_date: str) -> tuple[list[Path], list[Path]]:
+    folder = date_folder(root, meeting_date)
     materials = sorted(
-        path for path in date_folder(root, meeting_date).iterdir() if path.is_file() and not path.name.startswith(".")
-    )
+        path for path in folder.iterdir() if path.is_file() and not path.name.startswith(".")
+    ) if folder else []
     short_date = meeting_date[2:]
     minutes_root = root / "Minutes"
     transcripts = sorted(
@@ -70,6 +72,23 @@ def meeting_files(root: Path, meeting_date: str) -> tuple[list[Path], list[Path]
         and (path.name.startswith(meeting_date) or path.name.startswith(short_date))
     )
     return materials, transcripts
+
+
+def discover_meeting_dates(root: Path) -> list[str]:
+    dates = {
+        child.name.strip()
+        for child in (root / "Presentation Materials").iterdir()
+        if child.is_dir() and re.fullmatch(r"\d{8}", child.name.strip())
+    }
+    for path in (root / "Minutes").iterdir():
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        match = re.match(r"^(\d{8}|\d{6})", path.name)
+        if not match:
+            continue
+        value = match.group(1)
+        dates.add(value if len(value) == 8 else f"20{value}")
+    return sorted(dates)
 
 
 def display_title(path: Path, meeting_date: str) -> str:
@@ -355,14 +374,18 @@ def main() -> int:
     parser.add_argument("--meeting-date", default="20250427", help="Meeting date in YYYYMMDD format.")
     parser.add_argument("--archive-root", type=Path, default=default_archive_root())
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--all", action="store_true", help="Import every dated meeting folder and transcript.")
     args = parser.parse_args()
 
     archive_root = args.archive_root.expanduser().resolve()
     if not archive_root.is_dir():
         parser.error(f"Archive root does not exist: {archive_root}")
-    summary = run_import(archive_root, args.meeting_date, args.dry_run)
-    for key, value in summary.items():
-        print(f"{key}: {value}")
+    meeting_dates = discover_meeting_dates(archive_root) if args.all else [args.meeting_date]
+    for meeting_date in meeting_dates:
+        print(f"meeting_date: {meeting_date}")
+        summary = run_import(archive_root, meeting_date, args.dry_run)
+        for key, value in summary.items():
+            print(f"{key}: {value}")
     return 0
 
 

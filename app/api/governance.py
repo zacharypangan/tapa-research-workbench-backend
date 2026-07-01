@@ -5,10 +5,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+from app.auth import require_permission
 
 
-router = APIRouter(prefix="/governance", tags=["governance"])
+router = APIRouter(
+    prefix="/governance",
+    tags=["governance"],
+    dependencies=[Depends(require_permission("progress:read"))],
+)
 
 REGISTRY_FIELDS = (
     "dataset_id",
