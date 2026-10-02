@@ -85,6 +85,24 @@ class SessionCreate(BaseModel):
     notes: str | None = None
 
 
+class SessionUpdate(BaseModel):
+    title_original: str | None = Field(default=None, min_length=1, max_length=1000)
+    title_en: str | None = None
+    title_ja: str | None = None
+    session_type: str | None = Field(default=None, max_length=64)
+    start_time: str | None = None
+    end_time: str | None = None
+    order_index: int | None = Field(default=None, ge=0)
+    notes: str | None = None
+
+
+class SessionOut(SessionCreate, OrmModel):
+    id: str
+    meeting_id: str
+    created_at: datetime
+    updated_at: datetime
+
+
 class PresentationCreate(BaseModel):
     session_id: str | None = None
     presenter_member_id: str | None = None
@@ -100,11 +118,46 @@ class PresentationCreate(BaseModel):
     notes: str | None = None
 
 
+class PresentationUpdate(BaseModel):
+    session_id: str | None = None
+    presenter_member_id: str | None = None
+    title_original: str | None = Field(default=None, min_length=1, max_length=1000)
+    title_en: str | None = None
+    title_ja: str | None = None
+    language_primary: Language | None = None
+    start_time: str | None = None
+    end_time: str | None = None
+    order_index: int | None = Field(default=None, ge=0)
+    summary_en: str | None = None
+    summary_ja: str | None = None
+    notes: str | None = None
+
+
+class PresentationOut(PresentationCreate, OrmModel):
+    id: str
+    meeting_id: str
+    created_at: datetime
+    updated_at: datetime
+
+
 class MaterialLinkCreate(BaseModel):
     repository_material_id: str = Field(min_length=1, max_length=36)
     presentation_id: str | None = None
     link_status: str = "linked"
     notes: str | None = None
+
+
+class MaterialLinkUpdate(BaseModel):
+    presentation_id: str | None = None
+    link_status: str | None = Field(default=None, max_length=32)
+    notes: str | None = None
+
+
+class MaterialLinkOut(MaterialLinkCreate, OrmModel):
+    id: str
+    meeting_id: str
+    created_at: datetime
+    updated_at: datetime
 
 
 class EvidenceCreate(BaseModel):

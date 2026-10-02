@@ -21,7 +21,7 @@ RUN pip install uv
 COPY pyproject.toml uv.lock ./
 
 # Sync dependencies using uv (creates a .venv automatically)
-RUN uv sync
+RUN uv sync --frozen
 
 # Copy the rest of the application code
 COPY . .
@@ -29,4 +29,4 @@ COPY . .
 # Expose the API port
 EXPOSE 8000
 
-CMD ["sh", "-c", "uv run alembic upgrade head && exec uv run uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "uv run --frozen alembic upgrade head && exec uv run --frozen python -m app.service"]

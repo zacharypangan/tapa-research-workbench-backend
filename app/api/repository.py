@@ -5,8 +5,12 @@ import json
 import math
 import re
 import sqlite3
+import tempfile
+import shutil
+import logging
 import uuid
 from collections import deque
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from html import unescape
 from html.parser import HTMLParser
@@ -14,7 +18,10 @@ from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from starlette.concurrency import run_in_threadpool
+from sqlalchemy import inspect, or_, select
+from sqlalchemy.orm import Session
 from fastapi.responses import FileResponse
 from app.repository.schemas import (
     AskCorpusRequest,
@@ -68,7 +75,6 @@ from app.repository.settings import (
     DB_PATH,
     EMBEDDING_TEXT_LIMIT,
     FILES_ROOT,
-    IMAGE_INDEX_JOBS,
     IMAGES_ROOT,
     MULTIMODAL_METHOD_VERSION,
     OBSERVATION_TYPES,
@@ -80,8 +86,14 @@ from app.repository.settings import (
     STATUSES,
     STORAGE_ROOT,
 )
-from app.auth import require_permission
+from app.auth import AuthContext, require_permission
+from app.progress.database import SessionLocal, get_session
+from app.progress.models import EvidenceCitation, ProgressJob, SourceAlignment
+from app.repository.jobs import enqueue_repository_job
+from app.repository.links import fetch_html
 
+
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
 router = APIRouter(
     prefix="/repository",
@@ -232,6 +244,7 @@ def init_repository_db():
     os.makedirs(FILES_ROOT, exist_ok=True)
     os.makedirs(IMAGES_ROOT, exist_ok=True)
     with get_connection() as con:
+        con.execute("BEGIN IMMEDIATE")
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS materials (
@@ -548,14 +561,19 @@ def init_repository_db():
         init_semantic_graph_schema(con)
 
 
+@contextmanager
 def get_connection():
     os.makedirs(STORAGE_ROOT, exist_ok=True)
     con = sqlite3.connect(DB_PATH, timeout=30)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys = ON")
-    con.execute("PRAGMA busy_timeout = 30000")
-    con.execute("PRAGMA journal_mode = WAL")
-    return con
+    try:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys = ON")
+        con.execute("PRAGMA busy_timeout = 30000")
+        con.execute("PRAGMA journal_mode = WAL")
+        with con:
+            yield con
+    finally:
+        con.close()
 
 def ensure_column(con: sqlite3.Connection, table_name: str, column_name: str, column_sql: str):
     """
@@ -3473,20 +3491,18 @@ async def index_missing_image_embeddings(
     captioned_count = 0
     caption_attempted_count = 0
     caption_failed_count = 0
-    removed_blank_count = 0
+    skipped_blank_count = 0
     ts = now_iso()
 
     for row in rows:
-        if not is_informative_image(row["image_path"]):
-            remove_file_quietly(row["image_path"])
-            con.execute("DELETE FROM image_evidence WHERE id = ?", (row["id"],))
-            con.commit()
-            removed_blank_count += 1
+        if not await run_in_threadpool(is_informative_image, row["image_path"]):
+            # Indexing must not delete source evidence that may already be cited.
+            skipped_blank_count += 1
             continue
         if processed_image_count >= limit:
             break
         processed_image_count += 1
-        ocr_text = row["ocr_text"] or ocr_image_file(row["image_path"])
+        ocr_text = row["ocr_text"] or await run_in_threadpool(ocr_image_file, row["image_path"])
         context_text = get_image_context_text(con, row)
         should_caption = force or not row["visual_caption"]
         visual_caption = row["visual_caption"] or ""
@@ -3543,7 +3559,8 @@ async def index_missing_image_embeddings(
         "captioned_count": captioned_count,
         "caption_attempted_count": caption_attempted_count,
         "caption_failed_count": caption_failed_count,
-        "removed_blank_count": removed_blank_count,
+        "removed_blank_count": 0,
+        "skipped_blank_count": skipped_blank_count,
         "model": active_embedding_model_name(),
         "vision_model": OLLAMA_VISION_MODEL,
         "method_version": MULTIMODAL_METHOD_VERSION,
@@ -4431,7 +4448,8 @@ async def crawl_and_extract_links(
 
     async with httpx.AsyncClient(
         timeout=client_timeout,
-        follow_redirects=True,
+        follow_redirects=False,
+        trust_env=False,
         headers=headers,
     ) as client:
         while pending and len(visited) < max_pages:
@@ -4441,7 +4459,7 @@ async def crawl_and_extract_links(
                 continue
             visited.add(normalized)
             try:
-                response = await client.get(normalized)
+                response = await fetch_html(client, normalized)
             except Exception:
                 links_log.append(
                     {
@@ -4512,7 +4530,7 @@ async def get_statuses():
     return {"statuses": sorted(STATUSES)}
 
 
-@router.post("/materials")
+@router.post("/materials", dependencies=[Depends(require_permission("progress:write"))])
 async def create_material(payload: MaterialCreate):
     validate_source_type(payload.source_type)
     validate_status(payload.status)
@@ -4649,9 +4667,12 @@ async def list_materials(
         for row in rows:
             materials.append(enrich_material(con, row))
 
+    with get_connection() as con:
+        status_counts = {row["status"]: row["count"] for row in con.execute("SELECT status, COUNT(*) AS count FROM materials GROUP BY status")}
     return {
         "materials": materials,
         "total": total_row["total"],
+        "status_counts": status_counts,
     }
 
 
@@ -4687,7 +4708,7 @@ async def get_material(material_id: str):
 
     return material
 
-@router.patch("/materials/{material_id}")
+@router.patch("/materials/{material_id}", dependencies=[Depends(require_permission("progress:write"))])
 async def update_material(material_id: str, payload: MaterialUpdate):
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
@@ -4722,10 +4743,11 @@ async def update_material(material_id: str, payload: MaterialUpdate):
         return enrich_material(con, row)
 
 
-@router.delete("/materials/{material_id}")
+@router.delete("/materials/{material_id}", dependencies=[Depends(require_permission("progress:admin"))])
 async def delete_material(material_id: str):
     with get_connection() as con:
         ensure_material(con, material_id)
+        ensure_material_uncited(con, material_id)
         file_rows = con.execute(
             "SELECT stored_path FROM files WHERE material_id = ?",
             (material_id,),
@@ -4742,68 +4764,67 @@ async def delete_material(material_id: str):
     return {"deleted": True}
 
 
-@router.post("/materials/{material_id}/files")
+@router.post("/materials/{material_id}/files", dependencies=[Depends(require_permission("progress:write"))])
 async def add_file(
     material_id: str,
     request: Request,
     filename: str = Query(..., min_length=1, max_length=500),
     mime_type: Optional[str] = Query(default=None, max_length=255),
 ):
+    with get_connection() as con:
+        ensure_material(con, material_id)
+    size_limit = MAX_UPLOAD_BYTES
+    if request.headers.get("content-length"):
+        try:
+            if int(request.headers["content-length"]) > size_limit:
+                raise HTTPException(status_code=413, detail="File exceeds 100MB limit")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid upload size") from exc
     clean_name = sanitize_filename(filename)
-    content = await request.body()
-    if not content:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty")
-    if len(content) > 100 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="File exceeds 100MB limit")
-
-    sha256 = hashlib.sha256(content).hexdigest()
-
     file_id = str(uuid.uuid4())
     material_dir = os.path.join(FILES_ROOT, material_id)
     os.makedirs(material_dir, exist_ok=True)
     stored_path = os.path.join(material_dir, f"{file_id}_{clean_name}")
-
-    with get_connection() as con:
-        ensure_material(con, material_id)
-        existing = con.execute(
-            "SELECT * FROM files WHERE material_id = ? AND sha256 = ?",
-            (material_id, sha256),
-        ).fetchone()
-        if existing:
-            payload = file_from_row(existing)
-            payload["deduplicated"] = True
-            return payload
-        with open(stored_path, "wb") as f:
-            f.write(content)
-        ts = now_iso()
-        con.execute(
-            """
-            INSERT INTO files (
-                id, material_id, original_filename, stored_path,
-                mime_type, file_size, uploaded_at, sha256,
-                ingest_source, parser_status
+    digest = hashlib.sha256()
+    size = 0
+    temporary_path = None
+    moved = False
+    committed = False
+    try:
+        with tempfile.NamedTemporaryFile(dir=material_dir, prefix=".upload-", delete=False) as handle:
+            temporary_path = handle.name
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > size_limit:
+                    raise HTTPException(status_code=413, detail="File exceeds 100MB limit")
+                digest.update(chunk)
+                await run_in_threadpool(handle.write, chunk)
+        if not size:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty")
+        with get_connection() as con:
+            con.execute("BEGIN IMMEDIATE")
+            ensure_material(con, material_id)
+            existing = con.execute("SELECT * FROM files WHERE material_id = ? AND sha256 = ?", (material_id, digest.hexdigest())).fetchone()
+            if existing:
+                return {**file_from_row(existing), "deduplicated": True}
+            os.replace(temporary_path, stored_path)
+            moved = True
+            ts = now_iso()
+            con.execute(
+                """INSERT INTO files (id, material_id, original_filename, stored_path,
+                mime_type, file_size, uploaded_at, sha256, ingest_source, parser_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (file_id, material_id, clean_name, stored_path, mime_type, size, ts, digest.hexdigest(), "interactive_upload", "pending"),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                file_id,
-                material_id,
-                clean_name,
-                stored_path,
-                mime_type,
-                len(content),
-                ts,
-                sha256,
-                "interactive_upload",
-                "pending",
-            ),
-        )
-        con.execute(
-            "UPDATE materials SET updated_at = ? WHERE id = ?",
-            (ts, material_id),
-        )
-        row = con.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
-    return file_from_row(row)
+            con.execute("UPDATE materials SET updated_at = ? WHERE id = ?", (ts, material_id))
+            row = con.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
+        committed = True
+        return file_from_row(row)
+    finally:
+        if temporary_path:
+            remove_file_quietly(temporary_path)
+        if moved and not committed:
+            remove_file_quietly(stored_path)
 
 
 @router.get("/materials/{material_id}/files/{file_id}")
@@ -4865,14 +4886,63 @@ async def list_collections():
     return {"collections": [dict(row) for row in rows]}
 
 
-@router.post("/materials/{material_id}/extract")
-async def extract_material_text(
+def ensure_material_uncited(con: sqlite3.Connection, material_id: str):
+    """Cited source evidence is immutable; use a new material for a new version."""
+    message = "This material has linked evidence. Upload a new material/version to preserve existing citations."
+    if con.execute("SELECT 1 FROM observations WHERE material_id = ? AND (source_segment_id IS NOT NULL OR source_image_id IS NOT NULL) LIMIT 1", (material_id,)).fetchone():
+        raise HTTPException(status_code=409, detail=message)
+    with SessionLocal() as session:
+        if not inspect(session.bind).has_table(EvidenceCitation.__tablename__):
+            if os.getenv("DATABASE_URL"):
+                raise HTTPException(status_code=503, detail="Progress database is not ready.")
+            return
+        segment_ids = [row[0] for row in con.execute("SELECT id FROM extracted_segments WHERE material_id = ?", (material_id,))]
+        image_ids = [row[0] for row in con.execute("SELECT id FROM image_evidence WHERE material_id = ?", (material_id,))]
+        citation = session.scalar(select(EvidenceCitation.id).where(or_(EvidenceCitation.repository_material_id == material_id, EvidenceCitation.repository_segment_id.in_(segment_ids), EvidenceCitation.repository_image_id.in_(image_ids))).limit(1))
+        alignment = session.scalar(select(SourceAlignment.id).where(SourceAlignment.repository_material_id == material_id).limit(1))
+        if citation or alignment:
+            raise HTTPException(status_code=409, detail=message)
+
+
+@router.post("/materials/{material_id}/extract", status_code=202)
+async def queue_material_extraction(
     material_id: str,
-    background_tasks: BackgroundTasks,
     payload: ExtractRequest,
     force: bool = False,
+    session: Session = Depends(get_session),
+    context: AuthContext = Depends(require_permission("progress:write")),
 ):
-    run_id = str(uuid.uuid4())
+    with get_connection() as con:
+        ensure_material(con, material_id)
+    job = await enqueue_repository_job(session, "repository_extract", material_id, {"force": force, "extract": payload.model_dump()}, context.user_id)
+    return {"job_id": job.id, "status": job.status, "material_id": material_id}
+
+
+async def extract_material_text(material_id: str, payload: ExtractRequest, force: bool = False, run_id: Optional[str] = None):
+    with get_connection() as con:
+        ensure_material(con, material_id)
+    run_id = run_id or str(uuid.uuid4())
+    try:
+        return await _extract_material_text(material_id, payload, force, run_id)
+    except BaseException:
+        with get_connection() as con:
+            committed = con.execute("SELECT 1 FROM extraction_runs WHERE id = ?", (run_id,)).fetchone()
+        if not committed:
+            directory = os.path.join(IMAGES_ROOT, material_id)
+            if os.path.isdir(directory):
+                for name in os.listdir(directory):
+                    if name.endswith(f"-{run_id}"):
+                        await run_in_threadpool(shutil.rmtree, os.path.join(directory, name), True)
+        raise
+
+
+async def _extract_material_text(
+    material_id: str,
+    payload: ExtractRequest,
+    force: bool = False,
+    run_id: Optional[str] = None,
+):
+    run_id = run_id or str(uuid.uuid4())
     ts = now_iso()
     with get_connection() as con:
         material = ensure_material(con, material_id)
@@ -4886,82 +4956,41 @@ async def extract_material_text(
             (material_id,),
         ).fetchall()
 
+        previous_run = con.execute("SELECT * FROM extraction_runs WHERE id = ?", (run_id,)).fetchone()
+        if previous_run:
+            return {
+                "run_id": run_id, "material_id": material_id,
+                "extracted_segment_count": previous_run["extracted_segment_count"],
+                "image_evidence_count": con.execute("SELECT COUNT(*) FROM image_evidence WHERE material_id = ?", (material_id,)).fetchone()[0],
+                "image_label_job_id": None,
+                "discovered_link_count": previous_run["discovered_link_count"],
+                "status": previous_run["status"],
+                "warnings": [previous_run["error_message"]] if previous_run["error_message"] else [],
+            }
+        if not force and con.execute("SELECT COUNT(*) FROM extracted_segments WHERE material_id = ?", (material_id,)).fetchone()[0]:
+            raise HTTPException(status_code=409, detail="This material already has extracted text. Use force=true to re-extract.")
         if force:
-            old_images = con.execute(
-                """
-                SELECT image_path
-                FROM image_evidence
-                WHERE material_id = ?
-                """,
-                (material_id,),
-            ).fetchall()
-            for image in old_images:
-                remove_file_quietly(image["image_path"])
-            con.execute(
-                "DELETE FROM segment_embeddings WHERE material_id = ?",
-                (material_id,),
-            )
-            con.execute(
-                "DELETE FROM image_embeddings WHERE material_id = ?",
-                (material_id,),
-            )
-            con.execute(
-                "DELETE FROM extracted_segments WHERE material_id = ?",
-                (material_id,),
-            )
-            con.execute(
-                "DELETE FROM image_evidence WHERE material_id = ?",
-                (material_id,),
-            )
-            con.execute(
-                "DELETE FROM discovered_links WHERE material_id = ?",
-                (material_id,),
-            )
-            con.execute(
-                "DELETE FROM extraction_runs WHERE material_id = ?",
-                (material_id,),
-            )
-        else:
-            existing_count = con.execute(
-                """
-                SELECT COUNT(*)
-                FROM extracted_segments
-                WHERE material_id = ?
-                """,
-                (material_id,),
-            ).fetchone()[0]
+            ensure_material_uncited(con, material_id)
 
-            if existing_count > 0:
-                raise HTTPException(
-                    status_code=409,
-                    detail="This material already has extracted text. Use force=true to re-extract.",
-                )
-            
     all_segments: list[tuple[str | None, SegmentInput]] = []
     all_images: list[ImageEvidenceInput] = []
     extraction_warnings: list[str] = []
     for file_row in files:
-        file_extraction = extract_text_from_file(
-            file_row["stored_path"], file_row["original_filename"]
-        )
-        extraction_warnings.extend(
-            [
-                f"{file_row['original_filename']}: {warning}"
-                for warning in file_extraction.warnings
-            ]
-        )
-        for seg in file_extraction.segments:
-            seg.source_locator = file_row["original_filename"]
-            all_segments.append((file_row["id"], seg))
+        def parse_file():
+            extracted = extract_text_from_file(file_row["stored_path"], file_row["original_filename"])
+            images, warnings = extract_images_from_file(
+                file_row["stored_path"], file_row["original_filename"], material_id, f"{file_row['id']}-{run_id}",
+            )
+            for image in images:
+                image.file_id = file_row["id"]
+                image.ocr_text = ocr_image_file(image.image_path)
+            return extracted, images, warnings
 
-        image_extraction, image_warnings = extract_images_from_file(
-            file_row["stored_path"],
-            file_row["original_filename"],
-            material_id,
-            file_row["id"],
-        )
-        for image in image_extraction:
-            image.ocr_text = ocr_image_file(image.image_path)
+        file_extraction, image_extraction, image_warnings = await run_in_threadpool(parse_file)
+        extraction_warnings.extend(f"{file_row['original_filename']}: {warning}" for warning in file_extraction.warnings)
+        for segment in file_extraction.segments:
+            segment.source_locator = file_row["original_filename"]
+            all_segments.append((file_row["id"], segment))
         all_images.extend(image_extraction)
         extraction_warnings.extend(image_warnings)
         if len(all_segments) >= payload.max_segments:
@@ -5006,7 +5035,19 @@ async def extract_material_text(
     run_status = "ok" if all_segments else "empty"
     run_message = "; ".join(extraction_warnings[:10]) if extraction_warnings else None
 
+    if force and not all_segments and not all_images:
+        raise HTTPException(status_code=422, detail="Replacement extraction was empty. Existing evidence was preserved.")
+    old_image_paths = []
     with get_connection() as con:
+        con.execute("BEGIN IMMEDIATE")
+        ensure_material(con, material_id)
+        if force:
+            ensure_material_uncited(con, material_id)
+            old_image_paths = [row["image_path"] for row in con.execute("SELECT image_path FROM image_evidence WHERE material_id = ?", (material_id,))]
+            for table in ("segment_embeddings", "image_embeddings", "extracted_segments", "image_evidence", "discovered_links", "extraction_runs"):
+                con.execute(f"DELETE FROM {table} WHERE material_id = ?", (material_id,))
+        elif con.execute("SELECT 1 FROM extracted_segments WHERE material_id = ? LIMIT 1", (material_id,)).fetchone():
+            raise HTTPException(status_code=409, detail="Another extraction completed for this material.")
         for file_id, segment in all_segments:
             con.execute(
                 """
@@ -5104,41 +5145,27 @@ async def extract_material_text(
         )
         con.execute("UPDATE materials SET updated_at = ? WHERE id = ?", (ts, material_id))
 
-    image_label_job_id = None
-    if all_images:
-        image_label_job_id = str(uuid.uuid4())
-        IMAGE_INDEX_JOBS[image_label_job_id] = {
-            "job_id": image_label_job_id,
-            "status": "queued",
-            "created_at": now_iso(),
-            "material_id": material_id,
-            "limit": max(len(all_images), 1),
-            "force": True,
-        }
-        label_payload = BuildSemanticIndexRequest(
-            material_id=material_id,
-            limit=max(len(all_images), 1),
-            force=True,
-        )
-        if background_tasks:
-            background_tasks.add_task(run_image_index_job, image_label_job_id, label_payload)
-        else:
-            await run_image_index_job(image_label_job_id, label_payload)
+    for image_path in old_image_paths:
+        try:
+            remove_file_quietly(image_path)
+        except OSError:
+            logging.getLogger(__name__).warning("Could not remove an obsolete extracted image")
 
     return {
         "run_id": run_id,
         "material_id": material_id,
         "extracted_segment_count": len(all_segments),
         "image_evidence_count": len(all_images),
-        "image_label_job_id": image_label_job_id,
+        "image_label_job_id": None,
         "discovered_link_count": len(link_logs),
         "status": run_status,
         "warnings": extraction_warnings,
     }
 
-@router.post("/extract-ready")
+@router.post("/extract-ready", dependencies=[Depends(require_permission("progress:write"))])
 async def extract_ready_materials(
-    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+    context: AuthContext = Depends(require_permission("progress:write")),
     limit: int = Query(25, ge=1, le=100),
     force: bool = False,
     include_links: bool = True,
@@ -5179,12 +5206,8 @@ async def extract_ready_materials(
         title = row["title"]
 
         try:
-            result = await extract_material_text(
-                material_id=material_id,
-                background_tasks=background_tasks,
-                payload=payload,
-                force=force,
-            )
+            job = await enqueue_repository_job(session, "repository_extract", material_id, {"force": force, "extract": payload.model_dump()}, context.user_id)
+            result = {"job_id": job.id, "status": job.status}
 
             results.append(
                 {
@@ -5351,7 +5374,7 @@ async def get_ai_status():
         "embedding_status_detail": embedding_status_detail,
     }
 
-@router.post("/ai/index")
+@router.post("/ai/index", dependencies=[Depends(require_permission("progress:write"))])
 async def build_semantic_index(payload: BuildSemanticIndexRequest):
     if not await ollama_available():
         return {
@@ -5371,7 +5394,6 @@ async def build_semantic_index(payload: BuildSemanticIndexRequest):
     return result
 
 
-@router.post("/ai/image-index")
 async def build_image_index(payload: BuildSemanticIndexRequest):
     if not await ollama_available():
         return {
@@ -5392,80 +5414,35 @@ async def build_image_index(payload: BuildSemanticIndexRequest):
     return result
 
 
-async def run_image_index_job(job_id: str, payload: BuildSemanticIndexRequest):
-    IMAGE_INDEX_JOBS[job_id] = {
-        **IMAGE_INDEX_JOBS.get(job_id, {}),
-        "status": "running",
-        "started_at": now_iso(),
-    }
-    try:
-        if not await ollama_available():
-            IMAGE_INDEX_JOBS[job_id].update(
-                {
-                    "status": "error",
-                    "finished_at": now_iso(),
-                    "result": {
-                        "provider_configured": False,
-                        "indexed_count": 0,
-                        "captioned_count": 0,
-                        "removed_blank_count": 0,
-                        "message": ollama_status_message(),
-                    },
-                }
-            )
-            return
-
+@router.post("/ai/image-index", status_code=202)
+@router.post("/ai/image-index/start", status_code=202)
+async def start_image_index_job(
+    payload: BuildSemanticIndexRequest,
+    session: Session = Depends(get_session),
+    context: AuthContext = Depends(require_permission("progress:write")),
+):
+    if payload.material_id:
         with get_connection() as con:
-            if payload.material_id:
-                ensure_material(con, payload.material_id)
-            result = await index_missing_image_embeddings(
-                con,
-                material_id=payload.material_id,
-                limit=payload.limit,
-                force=payload.force,
-            )
-        IMAGE_INDEX_JOBS[job_id].update(
-            {
-                "status": "done",
-                "finished_at": now_iso(),
-                "result": result,
-            }
-        )
-    except Exception as exc:
-        IMAGE_INDEX_JOBS[job_id].update(
-            {
-                "status": "error",
-                "finished_at": now_iso(),
-                "error": str(exc),
-            }
-        )
-
-
-@router.post("/ai/image-index/start")
-async def start_image_index_job(payload: BuildSemanticIndexRequest, background_tasks: BackgroundTasks):
-    job_id = str(uuid.uuid4())
-    IMAGE_INDEX_JOBS[job_id] = {
-        "job_id": job_id,
-        "status": "queued",
-        "created_at": now_iso(),
-        "material_id": payload.material_id,
-        "limit": payload.limit,
-        "force": payload.force,
-    }
-    background_tasks.add_task(run_image_index_job, job_id, payload)
-    return IMAGE_INDEX_JOBS[job_id]
+            ensure_material(con, payload.material_id)
+    job = await enqueue_repository_job(session, "repository_image_index", payload.material_id or "corpus", payload.model_dump(), context.user_id)
+    return {"job_id": job.id, "status": job.status, "material_id": payload.material_id}
 
 
 @router.get("/ai/image-index/jobs/{job_id}")
-async def get_image_index_job(job_id: str):
-    job = IMAGE_INDEX_JOBS.get(job_id)
-    if not job:
+def get_image_index_job(job_id: str, session: Session = Depends(get_session)):
+    job = session.get(ProgressJob, job_id)
+    if not job or job.job_type != "repository_image_index":
         raise HTTPException(status_code=404, detail="Image index job not found")
-    return job
+    return {"job_id": job.id, "status": job.status, "result": job.result, "error": job.error_message}
 
 
 @router.post("/ai/semantic-search")
-async def semantic_search(payload: SemanticSearchRequest):
+async def semantic_search(
+    payload: SemanticSearchRequest,
+    context: AuthContext = Depends(require_permission("progress:read")),
+):
+    if payload.auto_index and "progress:write" not in context.permissions:
+        raise HTTPException(status_code=403, detail="Index preparation requires write permission.")
     if not await ollama_available():
         return {
             "query": payload.query,
@@ -5482,7 +5459,12 @@ async def semantic_search(payload: SemanticSearchRequest):
 
 
 @router.post("/ai/multimodal-search")
-async def multimodal_search(payload: MultimodalSearchRequest):
+async def multimodal_search(
+    payload: MultimodalSearchRequest,
+    context: AuthContext = Depends(require_permission("progress:read")),
+):
+    if payload.auto_index_images and "progress:write" not in context.permissions:
+        raise HTTPException(status_code=403, detail="Index preparation requires write permission.")
     if not await ollama_available():
         return {
             "query": payload.query,
@@ -5588,7 +5570,12 @@ async def ask_corpus(payload: AskCorpusRequest):
 
 
 @router.post("/ai/evidence-report")
-async def generate_ai_evidence_report(payload: SemanticSearchRequest):
+async def generate_ai_evidence_report(
+    payload: SemanticSearchRequest,
+    context: AuthContext = Depends(require_permission("progress:read")),
+):
+    if payload.auto_index and "progress:write" not in context.permissions:
+        raise HTTPException(status_code=403, detail="Index preparation requires write permission.")
     if not await ollama_available():
         return {
             "query": payload.query,
@@ -5746,7 +5733,7 @@ async def generate_ai_evidence_report(payload: SemanticSearchRequest):
     }
 
 
-@router.post("/graph/build")
+@router.post("/graph/build", dependencies=[Depends(require_permission("progress:write"))])
 async def build_knowledge_graph(payload: GraphBuildRequest):
     init_repository_db()
     with get_connection() as con:
@@ -5783,7 +5770,7 @@ async def build_knowledge_graph(payload: GraphBuildRequest):
     }
 
 
-@router.post("/graph/semantic/build")
+@router.post("/graph/semantic/build", dependencies=[Depends(require_permission("progress:write"))])
 async def build_semantic_knowledge_graph(payload: GraphBuildRequest):
     init_repository_db()
     with get_connection() as con:
@@ -5978,7 +5965,7 @@ async def get_semantic_time_review(
         return resolution_review_payload(con, "time", status=status, limit=limit)
 
 
-@router.patch("/graph/semantic/relations/{relation_id}/review")
+@router.patch("/graph/semantic/relations/{relation_id}/review", dependencies=[Depends(require_permission("progress:review"))])
 async def review_semantic_graph_relation(relation_id: str, payload: GraphEdgeReviewRequest):
     init_repository_db()
     with get_connection() as con:
@@ -5987,7 +5974,7 @@ async def review_semantic_graph_relation(relation_id: str, payload: GraphEdgeRev
         return result
 
 
-@router.patch("/graph/semantic/candidates/{candidate_id}/review")
+@router.patch("/graph/semantic/candidates/{candidate_id}/review", dependencies=[Depends(require_permission("progress:review"))])
 async def review_semantic_graph_candidate(candidate_id: str, payload: GraphEdgeReviewRequest):
     init_repository_db()
     with get_connection() as con:
@@ -5996,7 +5983,7 @@ async def review_semantic_graph_candidate(candidate_id: str, payload: GraphEdgeR
         return result
 
 
-@router.patch("/graph/place-review/{resolution_id}")
+@router.patch("/graph/place-review/{resolution_id}", dependencies=[Depends(require_permission("progress:review"))])
 async def review_semantic_place(
     resolution_id: str,
     payload: PlaceResolutionReviewRequest,
@@ -6025,7 +6012,7 @@ async def review_semantic_place(
         return result
 
 
-@router.patch("/graph/time-review/{resolution_id}")
+@router.patch("/graph/time-review/{resolution_id}", dependencies=[Depends(require_permission("progress:review"))])
 async def review_semantic_time(
     resolution_id: str,
     payload: TimeResolutionReviewRequest,
@@ -6285,7 +6272,7 @@ async def get_knowledge_graph_map(
         return query_graph_map(con, query=query, material_id=material_id, limit=limit)
 
 
-@router.patch("/graph/edges/{edge_id}/review")
+@router.patch("/graph/edges/{edge_id}/review", dependencies=[Depends(require_permission("progress:review"))])
 async def review_knowledge_graph_edge(edge_id: str, payload: GraphEdgeReviewRequest):
     init_repository_db()
     with get_connection() as con:
@@ -6351,7 +6338,7 @@ async def list_material_observations(
     }
 
 
-@router.post("/materials/{material_id}/observations")
+@router.post("/materials/{material_id}/observations", dependencies=[Depends(require_permission("progress:write"))])
 async def create_material_observation(material_id: str, payload: ObservationCreate):
     validate_observation_type(payload.observation_type)
 
@@ -6435,7 +6422,7 @@ async def create_material_observation(material_id: str, payload: ObservationCrea
     return dict(row)
 
 
-@router.patch("/materials/{material_id}/observations/{observation_id}")
+@router.patch("/materials/{material_id}/observations/{observation_id}", dependencies=[Depends(require_permission("progress:write"))])
 async def update_material_observation(
     material_id: str,
     observation_id: str,
@@ -6510,7 +6497,7 @@ async def update_material_observation(
     return dict(row)
 
 
-@router.delete("/materials/{material_id}/observations/{observation_id}")
+@router.delete("/materials/{material_id}/observations/{observation_id}", dependencies=[Depends(require_permission("progress:write"))])
 async def delete_material_observation(material_id: str, observation_id: str):
     with get_connection() as con:
         ensure_material(con, material_id)
@@ -6541,7 +6528,7 @@ async def delete_material_observation(material_id: str, observation_id: str):
 
     return {"deleted": True}
 
-@router.post("/materials/{material_id}/auto-keywords")
+@router.post("/materials/{material_id}/auto-keywords", dependencies=[Depends(require_permission("progress:write"))])
 async def generate_material_auto_keywords(
     material_id: str,
     limit: int = Query(12, ge=3, le=30),

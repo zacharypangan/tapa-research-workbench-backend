@@ -18,7 +18,7 @@ Developed with Python and managed using [uv](https://github.com/astral-sh/uv).
 
 ## Setup & Running
 
-We highly recommend running the project using Docker Compose, as it seamlessly orchestrates the FastAPI Backend alongside the required Redis instance out of the box.
+We highly recommend running the project using Docker Compose. It starts PostgreSQL, Redis, and one backend service containing both the API and extraction worker.
 
 ### Method 1: With Docker Compose (Recommended)
 
@@ -52,12 +52,15 @@ If you prefer to run the FastAPI app directly on your host machine, you will nee
 
 To start the FastAPI server with auto-reload:
 ```bash
-uv run python main.py
+uv run alembic upgrade head
+uv run python -m app.service
 ```
 
 Or using uvicorn directly:
 ```bash
 uv run uvicorn main:app --reload
+# In a second terminal, using the same database and storage configuration:
+uv run arq app.progress.worker.WorkerSettings
 ```
 
 ## Adding Dependencies
@@ -156,3 +159,5 @@ The Python version is specified in `.python-version`. To use a different version
 ```bash
 uv python pin 3.12
 ```
+
+Production authentication requires `CLERK_ISSUER`, `CLERK_ORGANIZATION_ID`, `CLERK_AUTHORIZED_PARTIES`, and `AUTH_DISABLED=false`. See `DEPLOYMENT.md` for the single-service layout, exact CORS origins, bounded link extraction, and recovery checks.

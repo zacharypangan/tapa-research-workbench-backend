@@ -20,6 +20,7 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from app.api.repository import get_connection, init_repository_db, now_iso  # noqa: E402
+from app.progress.archive_structure import LinkedMaterialSnapshot, backfill_meeting_structure  # noqa: E402
 from app.progress.database import Base, ENGINE, SessionLocal  # noqa: E402
 from app.progress.models import (  # noqa: E402
     AuditEvent,
@@ -334,7 +335,64 @@ def progress_transcript_segments(
     return created
 
 
-def run_import(archive_root: Path, meeting_date: str, dry_run: bool) -> dict[str, int]:
+def repository_snapshots(meeting_id: str) -> list[LinkedMaterialSnapshot]:
+    with SessionLocal() as session:
+        links = list(
+            session.query(RepositoryMaterialLink).filter(
+                RepositoryMaterialLink.meeting_id == meeting_id
+            )
+        )
+    material_ids = [link.repository_material_id for link in links]
+    if not material_ids:
+        return []
+    placeholders = ", ".join("?" for _ in material_ids)
+    with get_connection() as connection:
+        rows = connection.execute(
+            f"""
+            SELECT m.id, m.title, m.source_type, m.raw_reference,
+                   f.original_filename, f.parser_status
+            FROM materials m
+            LEFT JOIN files f ON f.material_id = m.id
+            WHERE m.id IN ({placeholders})
+            """,
+            material_ids,
+        ).fetchall()
+    metadata_by_id = {row["id"]: dict(row) for row in rows}
+    return [
+        LinkedMaterialSnapshot(
+            link_id=link.id,
+            repository_material_id=link.repository_material_id,
+            repository_title=metadata_by_id.get(link.repository_material_id, {}).get("title"),
+            original_filename=metadata_by_id.get(link.repository_material_id, {}).get("original_filename"),
+            source_type=metadata_by_id.get(link.repository_material_id, {}).get("source_type"),
+            raw_reference=metadata_by_id.get(link.repository_material_id, {}).get("raw_reference"),
+            parser_status=metadata_by_id.get(link.repository_material_id, {}).get("parser_status"),
+        )
+        for link in links
+    ]
+
+
+def structure_meeting(meeting_date: str) -> dict[str, int]:
+    meeting = ensure_meeting(meeting_date)
+    with SessionLocal() as session:
+        managed_meeting = session.query(Meeting).filter(Meeting.id == meeting.id).one()
+        summary = backfill_meeting_structure(
+            session,
+            managed_meeting,
+            repository_snapshots(meeting.id),
+            actor_id="archive-importer",
+        )
+        session.commit()
+        return summary
+
+
+def run_import(
+    archive_root: Path,
+    meeting_date: str,
+    dry_run: bool,
+    *,
+    structure_only: bool = False,
+) -> dict[str, int]:
     materials, transcripts = meeting_files(archive_root, meeting_date)
     all_files = [(path, False) for path in materials] + [(path, True) for path in transcripts]
     summary = {
@@ -344,12 +402,20 @@ def run_import(archive_root: Path, meeting_date: str, dry_run: bool) -> dict[str
         "material_links_created": 0,
         "transcript_segments_created": 0,
         "preserved_only": sum(1 for path, _ in all_files if path.suffix.lower() not in SUPPORTED_EXTENSIONS),
+        "sessions_created": 0,
+        "presentations_created": 0,
+        "material_assignments_created": 0,
     }
     if dry_run:
         return summary
 
     init_repository_db()
     Base.metadata.create_all(ENGINE)
+    if structure_only:
+        structure_summary = structure_meeting(meeting_date)
+        summary.update(structure_summary)
+        return summary
+
     meeting = ensure_meeting(meeting_date)
     for path, is_transcript in all_files:
         material_id, file_id, created = import_repository_file(
@@ -366,6 +432,7 @@ def run_import(archive_root: Path, meeting_date: str, dry_run: bool) -> dict[str
             summary["transcript_segments_created"] += progress_transcript_segments(
                 meeting.id, material_id, cues, repository_segments
             )
+    summary.update(structure_meeting(meeting_date))
     return summary
 
 
@@ -375,6 +442,11 @@ def main() -> int:
     parser.add_argument("--archive-root", type=Path, default=default_archive_root())
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--all", action="store_true", help="Import every dated meeting folder and transcript.")
+    parser.add_argument(
+        "--structure-only",
+        action="store_true",
+        help="Backfill meeting sessions, presentations, and material assignments without copying files.",
+    )
     args = parser.parse_args()
 
     archive_root = args.archive_root.expanduser().resolve()

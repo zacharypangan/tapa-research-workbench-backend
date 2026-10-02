@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
@@ -9,12 +10,18 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
-from arq import create_pool
-from arq.connections import RedisSettings
-import os
+from app.repository.jobs import enqueue_repository_job
 
 from app.auth import AuthContext, require_permission
 from app.api.repository import get_connection as get_repository_connection
+from app.progress.archive_structure import (
+    LinkedMaterialSnapshot,
+    canonical_material_title,
+    generated_presentation,
+    generated_session,
+    is_transcript_snapshot,
+    normalized_title_key,
+)
 from app.progress.database import get_session
 from app.progress.models import (
     AuditEvent,
@@ -54,6 +61,8 @@ from app.progress.schemas import (
     ConceptOut,
     EvidenceOut,
     MaterialLinkCreate,
+    MaterialLinkOut,
+    MaterialLinkUpdate,
     MeetingCreate,
     MeetingOut,
     MeetingUpdate,
@@ -61,6 +70,8 @@ from app.progress.schemas import (
     MemberOut,
     MemberUpdate,
     PresentationCreate,
+    PresentationOut,
+    PresentationUpdate,
     ResearchRecordCreate,
     ResearchRecordOut,
     ResearchRecordUpdate,
@@ -69,6 +80,8 @@ from app.progress.schemas import (
     AlignmentOut,
     SearchResult,
     SessionCreate,
+    SessionOut,
+    SessionUpdate,
     TranscriptSegmentUpdate,
     AiExtractionRequest,
     ArcLinkCreate,
@@ -126,6 +139,124 @@ def _apply_updates(instance: Any, updates: dict[str, Any]) -> dict[str, Any]:
 def _record_out(record: ResearchRecord) -> ResearchRecordOut:
     evidence = [EvidenceOut.model_validate(link.evidence) for link in record.evidence_links]
     return ResearchRecordOut.model_validate(record).model_copy(update={"evidence": evidence})
+
+
+def _meeting_date_token(meeting: Meeting) -> str:
+    return meeting.meeting_date.strftime("%Y%m%d")
+
+
+def _record_title(record: ResearchRecord) -> str:
+    return record.title_original or record.title_en or record.title_ja or "Untitled record"
+
+
+def _arc_link_payload(
+    session: Session,
+    link: ArcLink,
+    *,
+    current_meeting_id: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": link.id,
+        "source_kind": link.source_kind,
+        "source_id": link.source_id,
+        "role_in_arc": link.role_in_arc,
+        "summary_en": link.summary_en,
+        "summary_ja": link.summary_ja,
+        "confidence": link.confidence,
+        "order_index": link.order_index,
+        "notes": link.notes,
+        "meeting_id": None,
+        "meeting_date": None,
+        "source_label": link.source_id,
+        "source_status": None,
+        "source_record_type": None,
+        "is_current_meeting": False,
+    }
+    if link.source_kind == "research_record":
+        record = session.get(ResearchRecord, link.source_id)
+        if record:
+            payload.update(
+                {
+                    "meeting_id": record.meeting_id,
+                    "source_label": _record_title(record),
+                    "source_status": record.status,
+                    "source_record_type": record.record_type,
+                }
+            )
+            if record.meeting_id:
+                meeting = session.get(Meeting, record.meeting_id)
+                payload["meeting_date"] = meeting.meeting_date.isoformat() if meeting else None
+    elif link.source_kind == "transcript_segment":
+        segment = session.get(TranscriptSegment, link.source_id)
+        if segment:
+            preview = segment.original_text[:160]
+            payload.update(
+                {
+                    "meeting_id": segment.meeting_id,
+                    "source_label": f"{segment.speaker_text or 'Unknown speaker'}: {preview}",
+                }
+            )
+            meeting = session.get(Meeting, segment.meeting_id)
+            payload["meeting_date"] = meeting.meeting_date.isoformat() if meeting else None
+    payload["is_current_meeting"] = bool(
+        current_meeting_id and payload["meeting_id"] == current_meeting_id
+    )
+    return payload
+
+
+def _arc_detail_payload(
+    session: Session,
+    arc: NarrativeArc,
+    *,
+    current_meeting_id: str | None = None,
+) -> dict[str, Any]:
+    links = list(
+        session.scalars(select(ArcLink).where(ArcLink.arc_id == arc.id).order_by(ArcLink.order_index))
+    )
+    link_payload = [
+        _arc_link_payload(session, link, current_meeting_id=current_meeting_id)
+        for link in links
+    ]
+    current_meeting_steps = sum(1 for item in link_payload if item["is_current_meeting"])
+    return {
+        "arc": NarrativeArcOut.model_validate(arc),
+        "links": link_payload,
+        "link_count": len(link_payload),
+        "current_meeting_steps": current_meeting_steps,
+    }
+
+
+def _narrative_treatment() -> list[dict[str, str]]:
+    return [
+        {
+            "title": "Evidence-linked storytelling",
+            "description": (
+                "Narrative arcs do not float above the ledger. Each arc step is anchored in a "
+                "research record or transcript segment so the story remains inspectable."
+            ),
+        },
+        {
+            "title": "Chronology before rhetoric",
+            "description": (
+                "Arc development is shown across meetings in date order, making it clear how ideas "
+                "move from planning, to pilot validation, to bilingual retrieval, to release hardening."
+            ),
+        },
+        {
+            "title": "Reviewer-governed interpretation",
+            "description": (
+                "The portal treats narrative as a governed interpretation layer. Accepted records, "
+                "confidence notes, and provenance metadata remain visible even when the story is condensed."
+            ),
+        },
+        {
+            "title": "Original-first multilingual context",
+            "description": (
+                "Narrative summaries can be bilingual, but the underlying evidence chain keeps original "
+                "language text and exact source locators available for scholarly review."
+            ),
+        },
+    ]
 
 
 @router.get("/status")
@@ -224,6 +355,90 @@ def create_meeting(
     return meeting
 
 
+@router.get("/dashboard")
+def progress_dashboard(
+    session: Session = Depends(get_session),
+    _context: AuthContext = Depends(require_permission("progress:read")),
+):
+    meetings = list(session.scalars(select(Meeting).order_by(Meeting.meeting_date)))
+    sessions = list(session.scalars(select(MeetingSession)))
+    presentations = list(session.scalars(select(Presentation)))
+    materials = list(session.scalars(select(RepositoryMaterialLink)))
+    records = list(
+        session.scalars(
+            select(ResearchRecord)
+            .options(selectinload(ResearchRecord.evidence_links).selectinload(RecordEvidence.evidence))
+            .order_by(ResearchRecord.created_at)
+        )
+    )
+    arcs = [
+        _arc_detail_payload(session, arc)
+        for arc in session.scalars(select(NarrativeArc).order_by(NarrativeArc.created_at))
+    ]
+    transcript_counts = {
+        meeting_id: count
+        for meeting_id, count in session.execute(
+            select(TranscriptSegment.meeting_id, func.count())
+            .group_by(TranscriptSegment.meeting_id)
+        )
+    }
+    session_counts = Counter(item.meeting_id for item in sessions)
+    presentation_counts = Counter(item.meeting_id for item in presentations)
+    material_counts = Counter(item.meeting_id for item in materials)
+    record_counts = Counter(item.meeting_id for item in records if item.meeting_id)
+    accepted_record_counts = Counter(
+        item.meeting_id for item in records if item.meeting_id and item.status == "accepted"
+    )
+    featured_titles_by_meeting: dict[str, list[str]] = {}
+    for meeting in meetings:
+        featured_titles_by_meeting[meeting.id] = [
+            _record_title(record)
+            for record in records
+            if record.meeting_id == meeting.id
+        ][:3]
+
+    arc_steps_by_meeting = Counter()
+    arc_titles_by_meeting: dict[str, set[str]] = {}
+    for arc in arcs:
+        for link in arc["links"]:
+            meeting_id = link.get("meeting_id")
+            if not meeting_id:
+                continue
+            arc_steps_by_meeting[meeting_id] += 1
+            arc_titles_by_meeting.setdefault(meeting_id, set()).add(arc["arc"].title_en)
+
+    timeline = [
+        {
+            "meeting": MeetingOut.model_validate(meeting),
+            "session_count": session_counts.get(meeting.id, 0),
+            "presentation_count": presentation_counts.get(meeting.id, 0),
+            "material_count": material_counts.get(meeting.id, 0),
+            "transcript_count": transcript_counts.get(meeting.id, 0),
+            "record_count": record_counts.get(meeting.id, 0),
+            "accepted_record_count": accepted_record_counts.get(meeting.id, 0),
+            "narrative_arc_step_count": arc_steps_by_meeting.get(meeting.id, 0),
+            "featured_record_titles": featured_titles_by_meeting.get(meeting.id, []),
+            "arc_titles": sorted(arc_titles_by_meeting.get(meeting.id, set())),
+        }
+        for meeting in meetings
+    ]
+    return {
+        "summary": {
+            "meeting_count": len(meetings),
+            "session_count": len(sessions),
+            "presentation_count": len(presentations),
+            "material_count": len(materials),
+            "record_count": len(records),
+            "accepted_record_count": sum(1 for record in records if record.status == "accepted"),
+            "narrative_arc_count": len(arcs),
+            "transcript_segment_count": sum(transcript_counts.values()),
+        },
+        "narrative_treatment": _narrative_treatment(),
+        "timeline": timeline,
+        "arcs": arcs,
+    }
+
+
 @router.patch("/meetings/{meeting_id}", response_model=MeetingOut)
 def update_meeting(
     meeting_id: str,
@@ -292,6 +507,7 @@ def meeting_detail(
             rows = repository_connection.execute(
                 f"""
                 SELECT m.id, m.title, m.source_type, m.status,
+                       m.raw_reference,
                        f.original_filename, f.parser_status, f.parser_message
                 FROM materials m
                 LEFT JOIN files f ON f.material_id = m.id
@@ -300,13 +516,44 @@ def meeting_detail(
                 material_ids,
             ).fetchall()
         repository_metadata = {row["id"]: dict(row) for row in rows}
+    meeting_date = _meeting_date_token(meeting)
+    snapshots: list[LinkedMaterialSnapshot] = []
+    presentations_by_id = {
+        presentation.id: presentation
+        for presentation in presentations
+    }
+    presentation_material_counts = Counter(
+        link.presentation_id for link in materials if link.presentation_id
+    )
+    session_presentation_counts = Counter(
+        presentation.session_id for presentation in presentations if presentation.session_id
+    )
+    session_material_counts = Counter()
+    for link in materials:
+        if not link.presentation_id:
+            continue
+        presentation = presentations_by_id.get(link.presentation_id)
+        if presentation and presentation.session_id:
+            session_material_counts[presentation.session_id] += 1
     material_payload = []
     for link in materials:
         metadata = repository_metadata.get(link.repository_material_id, {})
+        snapshot = LinkedMaterialSnapshot(
+            link_id=link.id,
+            repository_material_id=link.repository_material_id,
+            repository_title=metadata.get("title"),
+            original_filename=metadata.get("original_filename"),
+            source_type=metadata.get("source_type"),
+            raw_reference=metadata.get("raw_reference"),
+            parser_status=metadata.get("parser_status"),
+        )
+        snapshots.append(snapshot)
+        linked_presentation = presentations_by_id.get(link.presentation_id) if link.presentation_id else None
         material_payload.append(
             {
                 "id": link.id,
                 "repository_material_id": link.repository_material_id,
+                "presentation_id": link.presentation_id,
                 "link_status": link.link_status,
                 "notes": link.notes,
                 "repository_title": metadata.get("title"),
@@ -315,8 +562,29 @@ def meeting_detail(
                 "repository_status": metadata.get("status"),
                 "parser_status": metadata.get("parser_status"),
                 "parser_message": metadata.get("parser_message"),
+                "raw_reference": metadata.get("raw_reference"),
+                "display_title": canonical_material_title(
+                    metadata.get("title"),
+                    original_filename=metadata.get("original_filename"),
+                    meeting_date=meeting_date,
+                ),
+                "group_key": normalized_title_key(
+                    metadata.get("title"),
+                    original_filename=metadata.get("original_filename"),
+                    meeting_date=meeting_date,
+                ),
+                "is_transcript_source": is_transcript_snapshot(snapshot),
+                "presentation_title": (
+                    linked_presentation.title_original
+                    if linked_presentation
+                    else None
+                ),
+                "generated_presentation": generated_presentation(linked_presentation.notes if linked_presentation else None),
             }
         )
+    transcript_material_count = sum(1 for snapshot in snapshots if is_transcript_snapshot(snapshot))
+    generated_session_count = sum(1 for item in sessions if generated_session(item.notes))
+    generated_presentation_count = sum(1 for item in presentations if generated_presentation(item.notes))
     transcript_segments = list(
         session.scalars(
             select(TranscriptSegment)
@@ -328,14 +596,69 @@ def meeting_detail(
     transcript_count = session.scalar(
         select(func.count()).select_from(TranscriptSegment).where(TranscriptSegment.meeting_id == meeting_id)
     ) or 0
+    related_record_ids = {record.id for record in records}
+    related_segment_ids = {segment.id for segment in transcript_segments}
+    arc_ids: set[str] = set()
+    if related_record_ids:
+        arc_ids.update(
+            session.scalars(
+                select(ArcLink.arc_id).where(
+                    ArcLink.source_kind == "research_record",
+                    ArcLink.source_id.in_(related_record_ids),
+                )
+            )
+        )
+    if related_segment_ids:
+        arc_ids.update(
+            session.scalars(
+                select(ArcLink.arc_id).where(
+                    ArcLink.source_kind == "transcript_segment",
+                    ArcLink.source_id.in_(related_segment_ids),
+                )
+            )
+        )
+    related_arcs = [
+        _arc_detail_payload(session, arc, current_meeting_id=meeting_id)
+        for arc in session.scalars(
+            select(NarrativeArc).where(NarrativeArc.id.in_(sorted(arc_ids))).order_by(NarrativeArc.created_at)
+        )
+    ] if arc_ids else []
     return {
         "meeting": MeetingOut.model_validate(meeting),
-        "sessions": sessions,
-        "presentations": presentations,
+        "structure": {
+            "session_count": len(sessions),
+            "presentation_count": len(presentations),
+            "material_count": len(materials),
+            "presentation_material_count": len(materials) - transcript_material_count,
+            "transcript_material_count": transcript_material_count,
+            "has_presentations": bool(presentations),
+            "transcript_only": transcript_material_count > 0 and len(materials) == transcript_material_count,
+            "generated_session_count": generated_session_count,
+            "generated_presentation_count": generated_presentation_count,
+            "related_arc_count": len(related_arcs),
+        },
+        "sessions": [
+            {
+                **SessionOut.model_validate(item).model_dump(),
+                "generated": generated_session(item.notes),
+                "presentation_count": session_presentation_counts.get(item.id, 0),
+                "material_count": session_material_counts.get(item.id, 0),
+            }
+            for item in sessions
+        ],
+        "presentations": [
+            {
+                **PresentationOut.model_validate(item).model_dump(),
+                "generated": generated_presentation(item.notes),
+                "material_count": presentation_material_counts.get(item.id, 0),
+            }
+            for item in presentations
+        ],
         "materials": material_payload,
         "transcript_segments": transcript_segments,
         "transcript_count": transcript_count,
         "records": [_record_out(record) for record in records],
+        "related_arcs": related_arcs,
     }
 
 
@@ -400,6 +723,30 @@ def create_session(
     return meeting_session
 
 
+@router.patch("/sessions/{session_id}", response_model=SessionOut)
+def update_session(
+    session_id: str,
+    payload: SessionUpdate,
+    session: Session = Depends(get_session),
+    context: AuthContext = Depends(require_permission("progress:write")),
+):
+    meeting_session = session.get(MeetingSession, session_id)
+    if not meeting_session:
+        raise _not_found("Meeting session")
+    changes = _apply_updates(meeting_session, payload.model_dump(exclude_unset=True))
+    _audit(
+        session,
+        entity_type="meeting_session",
+        entity_id=meeting_session.id,
+        action="updated",
+        actor_id=context.user_id,
+        changes=changes,
+    )
+    _commit(session, "That session order is already used for this meeting.")
+    session.refresh(meeting_session)
+    return meeting_session
+
+
 @router.post("/meetings/{meeting_id}/presentations", status_code=status.HTTP_201_CREATED)
 def create_presentation(
     meeting_id: str,
@@ -418,6 +765,38 @@ def create_presentation(
         entity_id=presentation.id,
         action="created",
         actor_id=context.user_id,
+    )
+    _commit(session)
+    session.refresh(presentation)
+    return presentation
+
+
+@router.patch("/presentations/{presentation_id}", response_model=PresentationOut)
+def update_presentation(
+    presentation_id: str,
+    payload: PresentationUpdate,
+    session: Session = Depends(get_session),
+    context: AuthContext = Depends(require_permission("progress:write")),
+):
+    presentation = session.get(Presentation, presentation_id)
+    if not presentation:
+        raise _not_found("Presentation")
+    updates = payload.model_dump(exclude_unset=True)
+    if "session_id" in updates and updates["session_id"] is not None:
+        meeting_session = session.get(MeetingSession, updates["session_id"])
+        if not meeting_session or meeting_session.meeting_id != presentation.meeting_id:
+            raise HTTPException(status_code=422, detail="Session does not belong to the same meeting.")
+    if "presenter_member_id" in updates and updates["presenter_member_id"] is not None:
+        if not session.get(Member, updates["presenter_member_id"]):
+            raise HTTPException(status_code=422, detail="Presenter member was not found.")
+    changes = _apply_updates(presentation, updates)
+    _audit(
+        session,
+        entity_type="presentation",
+        entity_id=presentation.id,
+        action="updated",
+        actor_id=context.user_id,
+        changes=changes,
     )
     _commit(session)
     session.refresh(presentation)
@@ -445,6 +824,35 @@ def link_material(
         changes={"repository_material_id": link.repository_material_id},
     )
     _commit(session, "That Repository material is already linked to this meeting.")
+    session.refresh(link)
+    return link
+
+
+@router.patch("/material-links/{link_id}", response_model=MaterialLinkOut)
+def update_material_link(
+    link_id: str,
+    payload: MaterialLinkUpdate,
+    session: Session = Depends(get_session),
+    context: AuthContext = Depends(require_permission("progress:write")),
+):
+    link = session.get(RepositoryMaterialLink, link_id)
+    if not link:
+        raise _not_found("Material link")
+    updates = payload.model_dump(exclude_unset=True)
+    if "presentation_id" in updates and updates["presentation_id"] is not None:
+        presentation = session.get(Presentation, updates["presentation_id"])
+        if not presentation or presentation.meeting_id != link.meeting_id:
+            raise HTTPException(status_code=422, detail="Presentation does not belong to the same meeting.")
+    changes = _apply_updates(link, updates)
+    _audit(
+        session,
+        entity_type="repository_material_link",
+        entity_id=link.id,
+        action="updated",
+        actor_id=context.user_id,
+        changes=changes,
+    )
+    _commit(session)
     session.refresh(link)
     return link
 
@@ -491,10 +899,15 @@ def create_record(
     session: Session = Depends(get_session),
     context: AuthContext = Depends(require_permission("progress:write")),
 ):
+    if payload.status in {"accepted", "rejected", "superseded"} and "progress:review" not in context.permissions:
+        raise HTTPException(status_code=403, detail="Only reviewers may create reviewed records.")
     if payload.status == "accepted" and not payload.evidence:
         raise HTTPException(status_code=422, detail="Accepted records require evidence.")
     record_data = payload.model_dump(exclude={"evidence", "concept_ids"})
     record = ResearchRecord(**record_data, created_by=context.user_id)
+    if payload.status in {"accepted", "rejected", "superseded"}:
+        record.reviewed_by = context.user_id
+        record.reviewed_at = datetime.now(timezone.utc)
     session.add(record)
     session.flush()
     for index, evidence_payload in enumerate(payload.evidence):
@@ -945,8 +1358,7 @@ def narrative_arc_detail(
     arc = session.get(NarrativeArc, arc_id)
     if not arc:
         raise _not_found("Narrative arc")
-    links = list(session.scalars(select(ArcLink).where(ArcLink.arc_id == arc_id).order_by(ArcLink.order_index)))
-    return {"arc": NarrativeArcOut.model_validate(arc), "links": links}
+    return _arc_detail_payload(session, arc)
 
 
 @router.post("/narrative-arcs/{arc_id}/links", status_code=status.HTTP_201_CREATED)
@@ -1062,37 +1474,4 @@ async def enqueue_repository_extraction(
     session: Session = Depends(get_session),
     context: AuthContext = Depends(require_permission("progress:write")),
 ):
-    job = ProgressJob(
-        job_type="repository_extract",
-        target_id=material_id,
-        status="queued",
-        payload={"force": force},
-        queued_by=context.user_id,
-    )
-    session.add(job)
-    session.flush()
-    _audit(
-        session,
-        entity_type="progress_job",
-        entity_id=job.id,
-        action="queued",
-        actor_id=context.user_id,
-        changes={"material_id": material_id, "force": force},
-    )
-    _commit(session)
-
-    redis_url = os.getenv("REDIS_PRIVATE_URL") or os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    try:
-        pool = await create_pool(RedisSettings.from_dsn(redis_url))
-        await pool.enqueue_job("extract_repository_material", job.id, _job_id=job.id)
-        await pool.close()
-    except Exception as exc:
-        job.status = "queue_failed"
-        job.error_message = str(exc)
-        _commit(session)
-        raise HTTPException(
-            status_code=503,
-            detail={"message": "Extraction queue is unavailable.", "job_id": job.id},
-        ) from exc
-    session.refresh(job)
-    return job
+    return await enqueue_repository_job(session, "repository_extract", material_id, {"force": force}, context.user_id)

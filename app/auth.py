@@ -10,9 +10,11 @@ from typing import Any, Callable
 import jwt
 from fastapi import Depends, HTTPException, Request, status
 from jwt import PyJWKClient
+from starlette.concurrency import run_in_threadpool
 
 
 ROLE_PERMISSIONS = {
+    "viewer": {"progress:read"},
     "member": {"progress:read", "progress:write"},
     "reviewer": {"progress:read", "progress:write", "progress:review"},
     "admin": {
@@ -37,16 +39,11 @@ def _truthy(value: str | None) -> bool:
     return (value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _permission_set(value: Any) -> set[str]:
-    if isinstance(value, str):
-        return {item.strip() for item in value.split(",") if item.strip()}
-    if isinstance(value, list):
-        return {str(item).strip() for item in value if str(item).strip()}
-    return set()
-
-
 def _auth_disabled() -> bool:
-    return _truthy(os.getenv("AUTH_DISABLED"))
+    disabled = _truthy(os.getenv("AUTH_DISABLED"))
+    if disabled and (os.getenv("APP_ENV", "").strip().lower() == "production" or os.getenv("RAILWAY_PROJECT_ID")):
+        raise HTTPException(status_code=503, detail="Development authentication is disabled in production.")
+    return disabled
 
 
 @lru_cache(maxsize=4)
@@ -96,18 +93,23 @@ def _decode_token(token: str) -> dict[str, Any]:
 
 def _context_from_claims(claims: dict[str, Any]) -> AuthContext:
     organization = claims.get("o") if isinstance(claims.get("o"), dict) else {}
+    expected_organization = os.getenv("CLERK_ORGANIZATION_ID", "").strip()
+    if not expected_organization:
+        raise HTTPException(status_code=503, detail="Project organization is not configured.")
+    organization_id = organization.get("id") or claims.get("org_id")
+    if organization_id != expected_organization:
+        raise HTTPException(status_code=403, detail="Select the authorized project organization.")
     role = str(
         organization.get("rol")
         or claims.get("org_role")
-        or claims.get("role")
-        or "member"
+        or ""
     ).removeprefix("org:")
-    permissions = _permission_set(organization.get("per"))
-    permissions.update(_permission_set(claims.get("org_permissions")))
-    permissions.update(ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["member"]))
+    if role not in ROLE_PERMISSIONS:
+        raise HTTPException(status_code=403, detail="Project role is not authorized.")
+    permissions = ROLE_PERMISSIONS[role]
     return AuthContext(
         user_id=str(claims["sub"]),
-        organization_id=organization.get("id") or claims.get("org_id"),
+        organization_id=organization_id,
         role=role,
         permissions=frozenset(permissions),
         claims=claims,
@@ -132,7 +134,8 @@ async def get_auth_context(request: Request) -> AuthContext:
             detail="Authentication required.",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return _context_from_claims(_decode_token(token))
+    claims = await run_in_threadpool(_decode_token, token)
+    return _context_from_claims(claims)
 
 
 def require_permission(permission: str) -> Callable[..., AuthContext]:

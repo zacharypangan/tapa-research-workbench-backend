@@ -31,7 +31,8 @@ DATABASE_URL = database_url()
 ENGINE = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
-    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
+    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {"connect_timeout": 5} if DATABASE_URL.startswith("postgresql") else {},
+    **({"pool_timeout": 5} if DATABASE_URL.startswith("postgresql") else {}),
 )
 SessionLocal = sessionmaker(bind=ENGINE, expire_on_commit=False, class_=Session)
 

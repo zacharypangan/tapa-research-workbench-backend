@@ -3,7 +3,7 @@
 ## Recommended Layout
 
 - Frontend: deploy `stling_frontend/` to Vercel as a Vite app.
-- Backend: deploy `stling_backend/` to Railway as a Docker service.
+- Backend: deploy `stling_backend/` as one Railway Docker service. The API and sequential ARQ worker run as supervised processes in that service and share its storage volume.
 - Redis: use a Railway Redis service and connect it to the backend.
 - Repository storage: attach a Railway volume at `/app/storage`.
 - AI/Ollama: leave disabled in the first shared-team deployment unless you have a private reachable Ollama host.
@@ -21,12 +21,14 @@ ALLOWED_ORIGINS=https://<vercel-domain>,https://<custom-domain-if-any>
 CLERK_ISSUER=https://<clerk-frontend-api-domain>
 CLERK_AUTHORIZED_PARTIES=https://<vercel-domain>,https://<custom-domain-if-any>
 AUTH_DISABLED=false
+APP_ENV=production
+CLERK_ORGANIZATION_ID=<authorized project organization id>
 REPOSITORY_STORAGE_ROOT=/app/storage/repository
 REPOSITORY_OLLAMA_BASE_URL=
 OLLAMA_BASE_URL=
 ```
 
-Railway provides `PORT`; the Docker command already uses `${PORT:-8000}`.
+Railway provides `PORT`; the process supervisor passes it to Uvicorn, defaulting to 8000 for local use.
 
 Attach a persistent volume:
 
@@ -42,13 +44,13 @@ This preserves:
 /app/storage/repository/images
 ```
 
-Create a second Railway service from the same backend image for durable extraction jobs:
+The Docker startup runs migrations once, then starts the API and worker through `python -m app.service`. It shuts down both if either exits. Do not create a second worker service: separate Railway services cannot share this SQLite/file volume.
 
-```text
-Command: arq app.progress.worker.WorkerSettings
-Variables: DATABASE_URL, REDIS_PRIVATE_URL, REPOSITORY_STORAGE_ROOT
-Volume: mount the same repository storage volume at /app/storage
-```
+Keep this deployment to one replica. Separate services or replicas will require shared database/file storage and a planned migration.
+
+Use `/health` for process liveness and `/ready` to check PostgreSQL tables, repository storage access, and the worker's Redis heartbeat. Set the Railway health-check path to `/ready`.
+
+Link extraction is restricted to administrator-approved public hosts and is disabled when no hosts are configured. To enable it, set `REPOSITORY_ALLOWED_LINK_HOSTS` to exact comma-separated hostnames, including approved redirect targets. Uploaded-file extraction works without that setting. Private addresses, arbitrary ports, oversized responses, and unapproved redirects are rejected.
 
 ## Vercel Frontend
 
@@ -66,6 +68,7 @@ Environment variable:
 
 ```env
 VITE_API_BASE_URL=https://<railway-backend-domain>/api/v1
+VITE_CLERK_PUBLISHABLE_KEY=<production Clerk publishable key>
 ```
 
 Enable Vercel deployment protection or team-only access for the shared-team deployment.
@@ -82,6 +85,7 @@ Expected checks:
 
 ```text
 GET /health
+GET /ready
 GET /api/v1/repository/statuses
 GET /api/v1/repository/materials
 GET /api/v1/progress/status
@@ -114,8 +118,8 @@ The AI status endpoint should report Ollama unavailable instead of breaking the 
 Use Clerk application authentication in addition to platform protection:
 
 - Vercel deployment protection or team-only access for the frontend.
-- Clerk Organizations with member, reviewer, and admin project roles.
-- FastAPI bearer-token verification for Progress and protected Repository operations.
+- Configure one authorized Clerk Organization through `CLERK_ORGANIZATION_ID`, using viewer, member, reviewer, and admin roles. Users select that organization after signing in. Unknown roles and other organizations are denied.
+- FastAPI bearer-token verification for every mounted workbench router. Legacy chat, dataset, and tile routes are not exposed by this workbench app. Repository writes require member permission; review requires reviewer permission; material deletion requires admin permission.
 - CORS restricted with `ALLOWED_ORIGINS`.
 - Railway project access limited to trusted teammates.
 
@@ -132,3 +136,11 @@ pg_dump "$DATABASE_URL" --format=custom --file=progress_predeploy.dump
 ```
 
 Verify restore into a temporary database with `pg_restore`, then run the authenticated smoke check against the restored application environment.
+
+## Evidence and job recovery
+
+Extraction routes return HTTP 202 and a durable job identifier. The browser polls `/api/v1/progress/jobs/{job_id}`; API and worker use the existing Progress job table. Worker startup reconciles queued/running database jobs with Redis. A replayed extraction job reuses its committed extraction run instead of replacing segment identifiers. Image descriptions finish within the same extraction job; standalone image-index jobs use the same queue and database.
+
+Forced re-extraction stages parsing and image files before committing replacements. Failed or empty replacements retain existing evidence. Materials cited by observations, Progress citations, or source alignments cannot be overwritten or deleted: upload a new material/version instead.
+
+Test before publishing: denied anonymous/viewer/member actions, more than 100 materials, a scanned PDF while browsing, failed re-extraction, API/worker restart during extraction, and backup restoration across PostgreSQL plus the complete repository volume. Runtime production variables and backup schedules must be configured on the hosting platform; repository changes do not configure them automatically.

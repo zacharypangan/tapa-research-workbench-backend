@@ -26,7 +26,6 @@ OLLAMA_RETRIEVAL_MODEL = os.getenv("OLLAMA_RETRIEVAL_MODEL", "llama3.1")
 OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llava")
 EMBEDDING_TEXT_LIMIT = 2000
 MULTIMODAL_METHOD_VERSION = "multimodal_evidence_v2_context"
-IMAGE_INDEX_JOBS: dict[str, dict] = {}
 
 SOURCE_TYPES = {
     "publication",

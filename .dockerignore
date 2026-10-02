@@ -2,3 +2,15 @@
 __pycache__/
 .pytest_cache/
 *.pyc
+.env
+.env.*
+!.env.example
+.git/
+storage/
+*.duckdb
+*.duckdb.wal
+*.sqlite
+*.sqlite-*
+*.log
+*_log.txt
+credentials/

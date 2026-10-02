@@ -13,6 +13,7 @@ import urllib.request
 
 CHECKS = [
     ("health", "/health"),
+    ("readiness", "/ready"),
     ("repository statuses", "/api/v1/repository/statuses"),
     ("repository materials", "/api/v1/repository/materials"),
     ("progress portal", "/api/v1/progress/status"),

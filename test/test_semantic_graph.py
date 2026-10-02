@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api import repository as repository_api
+from app.auth import AuthContext, ROLE_PERMISSIONS, get_auth_context
 from app.repository.semantic_graph import (
     build_semantic_graph,
     explain_semantic_relation,
@@ -398,6 +399,9 @@ class SemanticGraphTest(unittest.TestCase):
         try:
             app = FastAPI()
             app.include_router(repository_api.router, prefix="/api/v1")
+            app.dependency_overrides[get_auth_context] = lambda: AuthContext(
+                "viewer", "test-org", "viewer", frozenset(ROLE_PERMISSIONS["viewer"]), {}
+            )
             client = TestClient(app)
 
             rules_response = client.get("/api/v1/repository/graph/semantic/rules")
