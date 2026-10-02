@@ -13,6 +13,7 @@ from app.progress.models import AuditEvent, ProgressJob
 JOB_FUNCTIONS = {
     "repository_extract": "extract_repository_material",
     "repository_image_index": "index_repository_images",
+    "repository_index": "index_repository_material",
 }
 
 

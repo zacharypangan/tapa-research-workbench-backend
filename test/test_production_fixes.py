@@ -44,7 +44,7 @@ class ProductionFixTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         material_id = response.json()["id"]
         if upload:
-            response = self.client.post(f"/api/v1/repository/materials/{material_id}/files", params={"filename": "source.txt"}, content=b"Synthetic evidence for a production regression test.")
+            response = self.client.post(f"/api/v1/repository/materials/{material_id}/files", params={"filename": "source.txt", "process": "false"}, content=b"Synthetic evidence for a production regression test.")
             self.assertEqual(response.status_code, 200, response.text)
         return material_id
 
@@ -73,7 +73,7 @@ class ProductionFixTests(unittest.TestCase):
         image_path.write_bytes(b"synthetic source")
         with repository.get_connection() as con:
             con.execute("INSERT INTO image_evidence(id, material_id, evidence_type, source_kind, source_locator, page_ref, page_index, image_path, extraction_method, created_at) VALUES ('image-1', ?, 'image', 'file', 'source.pdf', '1', 1, ?, 'synthetic', '2026-10-02')", (material_id, str(image_path)))
-            with patch.object(repository, "ai_configured", return_value=True), patch.object(repository, "is_informative_image", return_value=False):
+            with patch.object(repository, "ai_embedding_configured", return_value=True), patch.object(repository, "is_informative_image", return_value=False):
                 result = asyncio.run(repository.index_missing_image_embeddings(con, material_id))
             self.assertEqual(result["skipped_blank_count"], 1)
             self.assertEqual(con.execute("SELECT COUNT(*) FROM image_evidence").fetchone()[0], 1)
@@ -147,7 +147,7 @@ class ProductionFixTests(unittest.TestCase):
 
     def test_upload_stream_limit_and_deduplication(self):
         material_id = self.material()
-        path = f"/api/v1/repository/materials/{material_id}/files?filename=source.txt"
+        path = f"/api/v1/repository/materials/{material_id}/files?filename=source.txt&process=false"
         with patch.object(repository, "MAX_UPLOAD_BYTES", 5):
             response = self.client.post(path, content=iter([b"123", b"456"]))
         self.assertEqual(response.status_code, 413)
@@ -196,11 +196,13 @@ class ProductionFixTests(unittest.TestCase):
             job_id = job.id
         extract = AsyncMock(return_value={"image_evidence_count": 1, "warnings": []})
         index = AsyncMock(return_value={"indexed_count": 1})
-        with patch.object(worker, "extract_material_text", extract), patch.object(worker, "build_image_index", index):
+        text_index = AsyncMock(return_value={"indexed_count": 1})
+        with patch.object(worker, "extract_material_text", extract), patch.object(worker, "build_image_index", index), patch.object(worker, "build_semantic_index", text_index):
             first = asyncio.run(worker.extract_repository_material({}, job_id))
             second = asyncio.run(worker.extract_repository_material({}, job_id))
         extract.assert_awaited_once()
         index.assert_awaited_once()
+        text_index.assert_awaited_once()
         self.assertEqual(first, second)
         self.assertEqual(self.client.get(f"/api/v1/progress/jobs/{job_id}").json()["status"], "completed")
 

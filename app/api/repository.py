@@ -1,5 +1,6 @@
 import os
 import base64
+import io
 import hashlib
 import json
 import math
@@ -91,6 +92,7 @@ from app.progress.database import SessionLocal, get_session
 from app.progress.models import EvidenceCitation, ProgressJob, SourceAlignment
 from app.repository.jobs import enqueue_repository_job
 from app.repository.links import fetch_html
+from app.repository.formats import IMAGE_EXTENSIONS, SUPPORTED_EXTENSIONS, docx_parts, docx_text, supported_upload
 
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
@@ -2921,8 +2923,7 @@ async def request_gemini_embedding(text: str, task_type: str = "RETRIEVAL_DOCUME
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 endpoint,
-                params={"key": GEMINI_API_KEY},
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
                 json=payload,
             )
     except httpx.RequestError as exc:
@@ -2949,14 +2950,19 @@ async def request_gemini_embedding(text: str, task_type: str = "RETRIEVAL_DOCUME
 
 async def request_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list[float]:
     provider = active_embedding_provider()
-    if provider == "gemini":
-        return await request_gemini_embedding(text, task_type=task_type)
-    if provider == "ollama":
-        return await request_ollama_embedding(text)
-    raise HTTPException(
-        status_code=502,
-        detail=f"Unsupported embedding provider: {provider}",
-    )
+    vectors = []
+    for offset in range(0, max(len(text), 1), EMBEDDING_TEXT_LIMIT):
+        chunk = text[offset:offset + EMBEDDING_TEXT_LIMIT]
+        if provider == "gemini":
+            vector = await request_gemini_embedding(chunk, task_type=task_type)
+        elif provider == "ollama":
+            vector = await request_ollama_embedding(chunk)
+        else:
+            raise HTTPException(status_code=502, detail=f"Unsupported embedding provider: {provider}")
+        if not vector or not any(vector) or any(not math.isfinite(value) for value in vector) or (vectors and len(vector) != len(vectors[0])):
+            raise HTTPException(status_code=502, detail="Embedding provider returned an invalid vector.")
+        vectors.append(vector)
+    return normalize_vector([sum(values) / len(vectors) for values in zip(*vectors)])
 
 
 def ocr_image_file(image_path: str) -> str:
@@ -3245,6 +3251,7 @@ async def index_missing_segment_embeddings(
     material_id: Optional[str] = None,
     limit: int = 200,
     force: bool = False,
+    after_id: Optional[int] = None,
 ) -> dict:
     if not ai_configured():
         return {
@@ -3259,6 +3266,9 @@ async def index_missing_segment_embeddings(
     if material_id:
         where.append("es.material_id = ?")
         params.append(material_id)
+    if after_id is not None:
+        where.append("es.id > ?")
+        params.append(after_id)
 
     if not force:
         where.append(
@@ -3313,17 +3323,24 @@ async def index_missing_segment_embeddings(
         "provider_configured": True,
         "indexed_count": indexed_count,
         "model": active_embedding_model_name(),
+        "last_segment_id": rows[-1]["id"] if rows else None,
     }
 
 
 async def semantic_search_segments(payload: SemanticSearchRequest) -> dict:
-    query_embedding = await request_embedding(payload.query, task_type="RETRIEVAL_QUERY")
+    terms = parse_report_terms(payload.query)
+    query_embedding = None
+    if ai_embedding_configured():
+        try:
+            query_embedding = await request_embedding(payload.query, task_type="RETRIEVAL_QUERY")
+        except (HTTPException, httpx.HTTPError, ValueError):
+            pass
 
     with get_connection() as con:
         if payload.material_id:
             ensure_material(con, payload.material_id)
 
-        if payload.auto_index:
+        if payload.auto_index and query_embedding is not None:
             try:
                 index_result = await index_missing_segment_embeddings(
                     con,
@@ -3345,10 +3362,10 @@ async def semantic_search_segments(payload: SemanticSearchRequest) -> dict:
                 "message": "Search used the existing text index. Use indexing preparation to add missing passages.",
             }
 
-        where = "WHERE se.model = ?"
+        where = "WHERE 1 = 1"
         params: list[object] = [active_embedding_model_name()]
         if payload.material_id:
-            where += " AND se.material_id = ?"
+            where += " AND es.material_id = ?"
             params.append(payload.material_id)
 
         rows = con.execute(
@@ -3365,8 +3382,8 @@ async def semantic_search_segments(payload: SemanticSearchRequest) -> dict:
                 es.page_ref,
                 es.page_index,
                 es.content_text
-            FROM segment_embeddings se
-            JOIN extracted_segments es ON es.id = se.segment_id
+            FROM extracted_segments es
+            LEFT JOIN segment_embeddings se ON es.id = se.segment_id AND se.model = ?
             JOIN materials m ON m.id = es.material_id
             {where}
             """,
@@ -3375,14 +3392,17 @@ async def semantic_search_segments(payload: SemanticSearchRequest) -> dict:
 
         scored = []
         for row in rows:
-            embedding = json.loads(row["embedding_json"])
-            score = cosine_similarity(query_embedding, embedding)
+            exact_match = bool(matched_terms_for_text(row["content_text"], terms))
+            indexed = query_embedding is not None and row["embedding_json"] is not None
+            if not indexed and not exact_match:
+                continue
+            score = cosine_similarity(query_embedding, json.loads(row["embedding_json"])) if indexed else 1.0
             item = dict(row)
             item.pop("embedding_json", None)
             item["score"] = score
-            item["semantic_score"] = score
+            item["semantic_score"] = score if indexed else None
             item["evidence_type"] = "text_passage"
-            item["retrieval_basis"] = "Text passage ranked by embedding similarity."
+            item["retrieval_basis"] = "Text passage ranked by embedding similarity." if indexed else "Exact match in extracted text; semantic indexing is unavailable or pending."
             item["citation"] = citation_from_segment(row)
             scored.append(item)
 
@@ -3399,15 +3419,16 @@ async def semantic_search_segments(payload: SemanticSearchRequest) -> dict:
 
     return {
         "query": payload.query,
-        "mode": "semantic_evidence_search",
-        "provider_configured": True,
+        "mode": "semantic_evidence_search" if query_embedding is not None else "exact_evidence_search",
+        "provider_configured": query_embedding is not None,
         "embedding_model": active_embedding_model_name(),
         "index_result": index_result,
         "results": results,
         "related_observations": related_observations,
         "evidence_note": (
-            "Results are semantically retrieved passages. They are evidence candidates, "
-            "not interpretations."
+            "Results combine indexed semantic matches with exact text matches from passages awaiting indexing."
+            if query_embedding is not None else
+            "AI embeddings are unavailable. Results use exact matches in extracted text."
         ),
     }
 
@@ -3429,8 +3450,10 @@ async def index_missing_image_embeddings(
     material_id: Optional[str] = None,
     limit: int = 100,
     force: bool = False,
+    after_id: Optional[str] = None,
 ) -> dict:
-    if not ai_configured():
+    embedding_ready = ai_embedding_configured()
+    if not embedding_ready and not (ai_chat_configured() and OLLAMA_VISION_MODEL):
         return {
             "provider_configured": False,
             "indexed_count": 0,
@@ -3444,20 +3467,23 @@ async def index_missing_image_embeddings(
     if material_id:
         where.append("ie.material_id = ?")
         params.append(material_id)
+    if after_id is not None:
+        where.append("ie.id > ?")
+        params.append(after_id)
 
     if not force:
         where.append(
             """
-            NOT EXISTS (
+            (NOT EXISTS (
                 SELECT 1
                 FROM image_embeddings im
                 WHERE im.image_id = ie.id
                 AND im.model = ?
                 AND im.method_version = ?
-            )
+            ) OR (? AND trim(COALESCE(ie.visual_caption, '')) = ''))
             """
         )
-        params.extend([active_embedding_model_name(), MULTIMODAL_METHOD_VERSION])
+        params.extend([active_embedding_model_name(), MULTIMODAL_METHOD_VERSION, bool(ai_chat_configured() and OLLAMA_VISION_MODEL)])
 
     where_clause = f"WHERE {' AND '.join(where)}" if where else ""
     scan_limit = max(limit * 20, 100)
@@ -3480,7 +3506,7 @@ async def index_missing_image_embeddings(
             ) AS observation_labels
         FROM image_evidence ie
         {where_clause}
-        ORDER BY ie.created_at ASC, ie.page_index ASC
+        ORDER BY ie.id ASC
         LIMIT ?
         """,
         (*params, scan_limit),
@@ -3492,24 +3518,27 @@ async def index_missing_image_embeddings(
     caption_attempted_count = 0
     caption_failed_count = 0
     skipped_blank_count = 0
+    last_image_id = None
     ts = now_iso()
 
     for row in rows:
+        if processed_image_count >= limit:
+            break
+        last_image_id = row["id"]
         if not await run_in_threadpool(is_informative_image, row["image_path"]):
             # Indexing must not delete source evidence that may already be cited.
             skipped_blank_count += 1
             continue
-        if processed_image_count >= limit:
-            break
         processed_image_count += 1
         ocr_text = row["ocr_text"] or await run_in_threadpool(ocr_image_file, row["image_path"])
         context_text = get_image_context_text(con, row)
         should_caption = force or not row["visual_caption"]
         visual_caption = row["visual_caption"] or ""
-        if should_caption:
+        if should_caption and ai_chat_configured():
             caption_attempted_count += 1
-            visual_caption = await request_image_caption(row["image_path"], context_text)
-            if visual_caption:
+            new_caption = await request_image_caption(row["image_path"], context_text)
+            if new_caption:
+                visual_caption = new_caption
                 captioned_count += 1
             else:
                 caption_failed_count += 1
@@ -3526,12 +3555,14 @@ async def index_missing_image_embeddings(
 
         observation_labels = row["observation_labels"] if "observation_labels" in row.keys() else ""
         index_text = clean_extracted_text(
-            "\n\n".join(part for part in [ocr_text, visual_caption, observation_labels] if part)
+            "\n\n".join(part for part in [ocr_text, visual_caption, observation_labels, context_text] if part)
         )
         if not index_text:
             con.commit()
             continue
 
+        if not embedding_ready:
+            continue
         embedding = await request_embedding(index_text)
         con.execute(
             """
@@ -3554,6 +3585,7 @@ async def index_missing_image_embeddings(
 
     return {
         "provider_configured": True,
+        "embedding_configured": embedding_ready,
         "indexed_count": indexed_count,
         "processed_image_count": processed_image_count,
         "captioned_count": captioned_count,
@@ -3561,6 +3593,7 @@ async def index_missing_image_embeddings(
         "caption_failed_count": caption_failed_count,
         "removed_blank_count": 0,
         "skipped_blank_count": skipped_blank_count,
+        "last_image_id": last_image_id,
         "model": active_embedding_model_name(),
         "vision_model": OLLAMA_VISION_MODEL,
         "method_version": MULTIMODAL_METHOD_VERSION,
@@ -3569,7 +3602,12 @@ async def index_missing_image_embeddings(
 
 async def search_image_evidence(payload: MultimodalSearchRequest) -> dict:
     terms = parse_report_terms(payload.query)
-    query_embedding = await request_embedding(payload.query, task_type="RETRIEVAL_QUERY")
+    query_embedding = None
+    if ai_embedding_configured():
+        try:
+            query_embedding = await request_embedding(payload.query, task_type="RETRIEVAL_QUERY")
+        except (HTTPException, httpx.HTTPError, ValueError):
+            pass
 
     with get_connection() as con:
         if payload.material_id:
@@ -3581,7 +3619,7 @@ async def search_image_evidence(payload: MultimodalSearchRequest) -> dict:
                 material_id=payload.material_id,
                 limit=payload.image_index_limit or 25,
             )
-            if payload.auto_index_images and payload.image_index_limit > 0
+            if payload.auto_index_images and payload.image_index_limit > 0 and query_embedding is not None
             else {
                 "provider_configured": True,
                 "indexed_count": 0,
@@ -3590,10 +3628,10 @@ async def search_image_evidence(payload: MultimodalSearchRequest) -> dict:
             }
         )
 
-        where = "WHERE im.model = ? AND im.method_version = ?"
-        params: list[object] = [OLLAMA_EMBEDDING_MODEL, MULTIMODAL_METHOD_VERSION]
+        where = "WHERE 1 = 1"
+        params: list[object] = [active_embedding_model_name(), MULTIMODAL_METHOD_VERSION]
         if payload.material_id:
-            where += " AND im.material_id = ?"
+            where += " AND ie.material_id = ?"
             params.append(payload.material_id)
 
         rows = con.execute(
@@ -3631,8 +3669,8 @@ async def search_image_evidence(payload: MultimodalSearchRequest) -> dict:
                 m.title AS material_title,
                 m.authors AS material_authors,
                 m.year AS material_year
-            FROM image_embeddings im
-            JOIN image_evidence ie ON ie.id = im.image_id
+            FROM image_evidence ie
+            LEFT JOIN image_embeddings im ON ie.id = im.image_id AND im.model = ? AND im.method_version = ?
             JOIN materials m ON m.id = ie.material_id
             {where}
             """,
@@ -3643,7 +3681,7 @@ async def search_image_evidence(payload: MultimodalSearchRequest) -> dict:
         for row in rows:
             evidence_text = image_embedding_text(row)
             matched_terms = matched_terms_for_text(evidence_text, terms)
-            semantic_score = cosine_similarity(query_embedding, json.loads(row["embedding_json"]))
+            semantic_score = cosine_similarity(query_embedding, json.loads(row["embedding_json"])) if query_embedding is not None and row["embedding_json"] else 0.0
             if not matched_terms and semantic_score < 0.62:
                 continue
             item = dict(row)
@@ -3655,7 +3693,7 @@ async def search_image_evidence(payload: MultimodalSearchRequest) -> dict:
             item["matched_terms"] = matched_terms
             item["contains_exact_term"] = bool(matched_terms)
             item["retrieval_basis"] = (
-                f"OCR/caption matched: {', '.join(matched_terms)}; ranked with image-text embedding."
+                f"OCR/caption matched: {', '.join(matched_terms)}."
                 if matched_terms
                 else "Semantic image-text match from OCR/caption text; exact search token not found."
             )
@@ -3672,7 +3710,7 @@ async def search_image_evidence(payload: MultimodalSearchRequest) -> dict:
 
     return {
         "query": payload.query,
-        "provider_configured": True,
+        "provider_configured": query_embedding is not None,
         "index_result": index_result,
         "image_results": results[: payload.limit],
         "evidence_note": (
@@ -3968,8 +4006,19 @@ def extract_images_from_file(file_path: str, filename: str, material_id: str, fi
     lower = filename.lower()
     if lower.endswith(".pdf"):
         return extract_images_from_pdf(file_path, material_id, file_id, filename)
-    if lower.endswith(".pptx") or lower.endswith(".ppt"):
+    if lower.endswith(".pptx"):
         return extract_images_from_pptx(file_path, material_id, file_id, filename)
+    if os.path.splitext(lower)[1] in IMAGE_EXTENSIONS or lower.endswith(".docx"):
+        from PIL import Image, ImageSequence
+        images = []
+        sources = [(filename, None)] if not lower.endswith(".docx") else [(name, data) for name, data in docx_parts(file_path) if name.startswith("word/media/") and os.path.splitext(name.lower())[1] in IMAGE_EXTENSIONS]
+        for source_name, data in sources:
+            with Image.open(io.BytesIO(data) if data is not None else file_path) as image:
+                for frame_index, frame in enumerate(ImageSequence.Iterator(image), start=1):
+                    image_path = os.path.join(material_image_dir(material_id, file_id), f"{uuid.uuid4()}.png")
+                    frame.convert("RGB").save(image_path)
+                    images.append(ImageEvidenceInput(file_id=file_id, evidence_type="document_image", source_kind="file_docx_image" if lower.endswith(".docx") else "file_image", source_locator=filename, page_ref=f"{os.path.basename(source_name)}:{frame_index}", page_index=frame_index, image_path=image_path, mime_type="image/png", width=frame.width, height=frame.height, extraction_method="embedded_image" if lower.endswith(".docx") else "uploaded_image"))
+        return images, []
     return [], []
 
 
@@ -4330,11 +4379,19 @@ def generate_auto_keywords_from_text(text: str, limit: int = 12) -> list[str]:
 
 def extract_text_from_file(file_path: str, filename: str):
     lower = filename.lower()
+    extension = os.path.splitext(lower)[1]
+    if extension in IMAGE_EXTENSIONS:
+        return ExtractionResult(segments=[], warnings=[])
+    if extension == ".docx":
+        text = docx_text(file_path)
+        return ExtractionResult(segments=[SegmentInput(source_kind="file_docx", source_locator=filename, page_ref=f"paragraph:{index + 1}", page_index=index + 1, content_text=chunk) for index, chunk in enumerate(split_text_into_segments(text))], warnings=[])
+    if not supported_upload(filename):
+        return ExtractionResult(segments=[], warnings=[f"{filename}: this format is preserved for download and metadata search; upload a supported text, PDF, DOCX, PPTX, RTF, or image file to search its contents."])
 
     if lower.endswith(".pdf"):
         return extract_text_from_pdf(file_path)
 
-    if lower.endswith(".pptx") or lower.endswith(".ppt"):
+    if lower.endswith(".pptx"):
         return extract_text_from_pptx(file_path)
 
     if lower.endswith(".rtf"):
@@ -4608,6 +4665,17 @@ async def list_materials(
                 OR lower(COALESCE(m.auto_keywords, '')) LIKE ?
                 OR lower(COALESCE(f.original_filename, '')) LIKE ?
                 OR EXISTS (
+                    SELECT 1 FROM extracted_segments es
+                    WHERE es.material_id = m.id AND lower(es.content_text) LIKE ?
+                )
+                OR EXISTS (
+                    SELECT 1 FROM image_evidence ie
+                    WHERE ie.material_id = m.id AND (
+                        lower(COALESCE(ie.ocr_text, '')) LIKE ?
+                        OR lower(COALESCE(ie.visual_caption, '')) LIKE ?
+                    )
+                )
+                OR EXISTS (
                     SELECT 1
                     FROM observations o
                     WHERE o.material_id = m.id
@@ -4620,7 +4688,7 @@ async def list_materials(
             )
             """
         )
-        params.extend([like] * 12)
+        params.extend([like] * 15)
     if status:
         validate_status(status)
         where.append("m.status = ?")
@@ -4770,6 +4838,9 @@ async def add_file(
     request: Request,
     filename: str = Query(..., min_length=1, max_length=500),
     mime_type: Optional[str] = Query(default=None, max_length=255),
+    process: bool = True,
+    session: Session = Depends(get_session),
+    context: AuthContext = Depends(require_permission("progress:write")),
 ):
     with get_connection() as con:
         ensure_material(con, material_id)
@@ -4806,20 +4877,35 @@ async def add_file(
             ensure_material(con, material_id)
             existing = con.execute("SELECT * FROM files WHERE material_id = ? AND sha256 = ?", (material_id, digest.hexdigest())).fetchone()
             if existing:
-                return {**file_from_row(existing), "deduplicated": True}
-            os.replace(temporary_path, stored_path)
-            moved = True
-            ts = now_iso()
-            con.execute(
-                """INSERT INTO files (id, material_id, original_filename, stored_path,
-                mime_type, file_size, uploaded_at, sha256, ingest_source, parser_status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (file_id, material_id, clean_name, stored_path, mime_type, size, ts, digest.hexdigest(), "interactive_upload", "pending"),
-            )
-            con.execute("UPDATE materials SET updated_at = ? WHERE id = ?", (ts, material_id))
-            row = con.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
+                result = {**file_from_row(existing), "deduplicated": True}
+            else:
+                os.replace(temporary_path, stored_path)
+                moved = True
+                ts = now_iso()
+                con.execute(
+                    """INSERT INTO files (id, material_id, original_filename, stored_path,
+                    mime_type, file_size, uploaded_at, sha256, ingest_source, parser_status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (file_id, material_id, clean_name, stored_path, mime_type, size, ts, digest.hexdigest(), "interactive_upload", "pending"),
+                )
+                con.execute("UPDATE materials SET updated_at = ? WHERE id = ?", (ts, material_id))
+                row = con.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
+                result = file_from_row(row)
         committed = True
-        return file_from_row(row)
+        result["processing_status"] = "not_requested"
+        if process and not supported_upload(filename):
+            result["processing_status"] = "unsupported"
+            result["processing_message"] = "File saved. This format supports metadata search; convert it to a supported format to search its contents."
+        elif process:
+            try:
+                job = await enqueue_repository_job(session, "repository_extract", material_id, {"force": False, "extract": {"include_links": False, "max_segments": 5000}}, context.user_id)
+                result.update(processing_job_id=job.id, processing_status=job.status)
+            except Exception as exc:
+                result["processing_status"] = "queue_failed"
+                result["processing_message"] = "File saved, but processing could not be queued. Use Extract to retry."
+                if isinstance(exc, HTTPException) and isinstance(exc.detail, dict):
+                    result["processing_job_id"] = exc.detail.get("job_id")
+        return result
     finally:
         if temporary_path:
             remove_file_quietly(temporary_path)
@@ -4967,14 +5053,18 @@ async def _extract_material_text(
                 "status": previous_run["status"],
                 "warnings": [previous_run["error_message"]] if previous_run["error_message"] else [],
             }
-        if not force and con.execute("SELECT COUNT(*) FROM extracted_segments WHERE material_id = ?", (material_id,)).fetchone()[0]:
-            raise HTTPException(status_code=409, detail="This material already has extracted text. Use force=true to re-extract.")
+        if not force:
+            files = [row for row in files if row["parser_status"] not in {"extracted", "empty", "unsupported"} and not con.execute("SELECT 1 FROM extracted_segments WHERE file_id = ? UNION ALL SELECT 1 FROM image_evidence WHERE file_id = ? LIMIT 1", (row["id"], row["id"])).fetchone()]
         if force:
             ensure_material_uncited(con, material_id)
+        extract_source_url = payload.include_links and material["source_url"] and (
+            force or not con.execute("SELECT 1 FROM extracted_segments WHERE material_id = ? AND file_id IS NULL LIMIT 1", (material_id,)).fetchone()
+        )
 
     all_segments: list[tuple[str | None, SegmentInput]] = []
     all_images: list[ImageEvidenceInput] = []
     extraction_warnings: list[str] = []
+    parsed_files = []
     for file_row in files:
         def parse_file():
             extracted = extract_text_from_file(file_row["stored_path"], file_row["original_filename"])
@@ -4984,9 +5074,17 @@ async def _extract_material_text(
             for image in images:
                 image.file_id = file_row["id"]
                 image.ocr_text = ocr_image_file(image.image_path)
+                if not image.ocr_text:
+                    warnings.append(f"{image.page_ref}: no text was recognized by OCR. Visual labels require an available vision model.")
+                for index, chunk in enumerate(split_text_into_segments(image.ocr_text)):
+                    extracted.segments.append(SegmentInput(source_kind="file_image_ocr", source_locator=file_row["original_filename"], page_ref=f"{image.page_ref}.ocr:{index + 1}", page_index=image.page_index, content_text=chunk))
             return extracted, images, warnings
 
         file_extraction, image_extraction, image_warnings = await run_in_threadpool(parse_file)
+        parser_status = "unsupported"
+        if supported_upload(file_row["original_filename"]):
+            parser_status = "extracted" if file_extraction.segments or image_extraction else "failed" if file_extraction.warnings or image_warnings else "empty"
+        parsed_files.append((file_row["id"], parser_status))
         extraction_warnings.extend(f"{file_row['original_filename']}: {warning}" for warning in file_extraction.warnings)
         for segment in file_extraction.segments:
             segment.source_locator = file_row["original_filename"]
@@ -4997,7 +5095,7 @@ async def _extract_material_text(
             break
 
     link_logs: list[dict] = []
-    if payload.include_links and material["source_url"] and len(all_segments) < payload.max_segments:
+    if extract_source_url and len(all_segments) < payload.max_segments:
         url_segments, url_links = await crawl_and_extract_links(
             material["source_url"],
             payload.max_link_depth,
@@ -5025,6 +5123,10 @@ async def _extract_material_text(
                     "No extractable text found from source URL/link crawl."
                 )
 
+    if len(all_segments) > payload.max_segments:
+        extraction_warnings.append("Extraction reached the passage limit. Split this source into smaller files to search all of its contents.")
+    if len(parsed_files) < len(files):
+        extraction_warnings.append("Some files remain unprocessed because this run reached the passage limit. Run Extract again to prepare the remaining files.")
     all_segments = all_segments[: payload.max_segments]
     all_images, duplicate_image_count = dedupe_image_inputs(all_images)
     if duplicate_image_count:
@@ -5032,7 +5134,7 @@ async def _extract_material_text(
             f"Skipped {duplicate_image_count} duplicate image artifacts across this material."
         )
 
-    run_status = "ok" if all_segments else "empty"
+    run_status = "ok" if all_segments or all_images else "empty"
     run_message = "; ".join(extraction_warnings[:10]) if extraction_warnings else None
 
     if force and not all_segments and not all_images:
@@ -5046,8 +5148,12 @@ async def _extract_material_text(
             old_image_paths = [row["image_path"] for row in con.execute("SELECT image_path FROM image_evidence WHERE material_id = ?", (material_id,))]
             for table in ("segment_embeddings", "image_embeddings", "extracted_segments", "image_evidence", "discovered_links", "extraction_runs"):
                 con.execute(f"DELETE FROM {table} WHERE material_id = ?", (material_id,))
-        elif con.execute("SELECT 1 FROM extracted_segments WHERE material_id = ? LIMIT 1", (material_id,)).fetchone():
-            raise HTTPException(status_code=409, detail="Another extraction completed for this material.")
+        else:
+            processed_ids = {row[0] for row in con.execute("SELECT file_id FROM extracted_segments WHERE material_id = ? UNION SELECT file_id FROM image_evidence WHERE material_id = ?", (material_id, material_id))}
+            all_segments = [(file_id, segment) for file_id, segment in all_segments if file_id is None or file_id not in processed_ids]
+            all_images = [image for image in all_images if image.file_id not in processed_ids]
+        for file_id, parser_status in parsed_files:
+            con.execute("UPDATE files SET parser_status = ?, parser_message = ? WHERE id = ?", (parser_status, run_message, file_id))
         for file_id, segment in all_segments:
             con.execute(
                 """
@@ -5357,30 +5463,37 @@ async def get_ai_status():
         "ollama_base_url": ollama_base_url,
         "embedding_model": embedding_model_name,
         "chat_model": OLLAMA_RETRIEVAL_MODEL,
+        "vision_model": OLLAMA_VISION_MODEL,
+        "vision_configured": bool(ai_chat_configured() and OLLAMA_VISION_MODEL),
         "segment_count": segment_count,
         "embedded_segment_count": embedded_count,
         "image_evidence_count": image_count,
         "embedded_image_count": embedded_image_count,
+        "pending_segment_count": max(0, segment_count - embedded_count),
+        "pending_image_count": max(0, image_count - embedded_image_count),
+        "supported_upload_extensions": sorted(SUPPORTED_EXTENSIONS),
+        "exact_search_available": True,
         "default_mode": "evidence_only",
         "status_message": (
-            "Ollama Cloud generation and embeddings are ready."
+            "AI generation and embeddings are ready."
             if is_chat_available and is_embedding_available
-            else "Ollama Cloud generation is ready. Embeddings are not ready, so related-reference/vector search may be limited."
+            else "AI generation is ready. Exact search is available; semantic indexing is deferred."
             if is_chat_available
-            else "Ollama Cloud generation is not ready. Exact search and observations still work."
+            else "Embeddings are ready. Related-reference search works; AI generation is unavailable."
+            if is_embedding_available
+            else "AI services are unavailable. Extraction, OCR, exact search, and observations still work."
         ),
         "status_detail": chat_status_detail,
         "chat_status_detail": chat_status_detail,
         "embedding_status_detail": embedding_status_detail,
     }
 
-@router.post("/ai/index", dependencies=[Depends(require_permission("progress:write"))])
-async def build_semantic_index(payload: BuildSemanticIndexRequest):
-    if not await ollama_available():
+async def build_semantic_index(payload: BuildSemanticIndexRequest, after_id: Optional[int] = None):
+    if not ai_embedding_configured():
         return {
             "provider_configured": False,
             "indexed_count": 0,
-            "message": ollama_status_message(),
+            "message": embedding_status_message(),
         }
     with get_connection() as con:
         if payload.material_id:
@@ -5390,17 +5503,18 @@ async def build_semantic_index(payload: BuildSemanticIndexRequest):
             material_id=payload.material_id,
             limit=payload.limit,
             force=payload.force,
+            after_id=after_id,
         )
     return result
 
 
-async def build_image_index(payload: BuildSemanticIndexRequest):
-    if not await ollama_available():
+async def build_image_index(payload: BuildSemanticIndexRequest, after_id: Optional[str] = None):
+    if not ai_embedding_configured() and not (ai_chat_configured() and OLLAMA_VISION_MODEL):
         return {
             "provider_configured": False,
             "indexed_count": 0,
             "captioned_count": 0,
-            "message": ollama_status_message(),
+            "message": embedding_status_message(),
         }
     with get_connection() as con:
         if payload.material_id:
@@ -5410,8 +5524,23 @@ async def build_image_index(payload: BuildSemanticIndexRequest):
             material_id=payload.material_id,
             limit=payload.limit,
             force=payload.force,
+            after_id=after_id,
         )
     return result
+
+
+@router.post("/ai/index", status_code=202)
+@router.post("/ai/index/start", status_code=202)
+async def start_search_index_job(
+    payload: BuildSemanticIndexRequest,
+    session: Session = Depends(get_session),
+    context: AuthContext = Depends(require_permission("progress:write")),
+):
+    if payload.material_id:
+        with get_connection() as con:
+            ensure_material(con, payload.material_id)
+    job = await enqueue_repository_job(session, "repository_index", payload.material_id or "corpus", payload.model_dump(), context.user_id)
+    return {"job_id": job.id, "status": job.status, "material_id": payload.material_id}
 
 
 @router.post("/ai/image-index", status_code=202)
@@ -5443,17 +5572,6 @@ async def semantic_search(
 ):
     if payload.auto_index and "progress:write" not in context.permissions:
         raise HTTPException(status_code=403, detail="Index preparation requires write permission.")
-    if not await ollama_available():
-        return {
-            "query": payload.query,
-            "mode": "semantic_evidence_search",
-            "provider_configured": False,
-            "results": [],
-            "related_observations": [],
-            "evidence_note": (
-                "Related-reference search is available when Ollama Cloud is configured and reachable."
-            ),
-        }
 
     return await semantic_search_segments(payload)
 
@@ -5465,18 +5583,6 @@ async def multimodal_search(
 ):
     if payload.auto_index_images and "progress:write" not in context.permissions:
         raise HTTPException(status_code=403, detail="Index preparation requires write permission.")
-    if not await ollama_available():
-        return {
-            "query": payload.query,
-            "mode": "multimodal_evidence_search",
-            "provider_configured": False,
-            "results": [],
-            "image_results": [],
-            "related_observations": [],
-            "evidence_note": (
-                "Text and image assisted review is available when Ollama Cloud is configured and reachable."
-            ),
-        }
 
     text_payload = SemanticSearchRequest(
         query=payload.query,
@@ -5494,7 +5600,7 @@ async def multimodal_search(
     return {
         "query": payload.query,
         "mode": "multimodal_evidence_search",
-        "provider_configured": True,
+        "provider_configured": bool(text_results.get("provider_configured") or image_results.get("provider_configured")),
         "embedding_model": active_embedding_model_name(),
         "vision_model": OLLAMA_VISION_MODEL,
         "method_version": MULTIMODAL_METHOD_VERSION,
@@ -5576,16 +5682,6 @@ async def generate_ai_evidence_report(
 ):
     if payload.auto_index and "progress:write" not in context.permissions:
         raise HTTPException(status_code=403, detail="Index preparation requires write permission.")
-    if not await ollama_available():
-        return {
-            "query": payload.query,
-            "provider_configured": False,
-            "themes": [],
-            "related_observations": [],
-            "evidence_note": (
-                "Organized assisted review reports are available when Ollama Cloud is configured and reachable."
-            ),
-        }
 
     retrieval = await semantic_search_segments(payload)
     image_retrieval = await search_image_evidence(
@@ -5718,7 +5814,7 @@ async def generate_ai_evidence_report(
 
     return {
         "query": payload.query,
-        "provider_configured": True,
+        "provider_configured": bool(retrieval.get("provider_configured") or image_retrieval.get("provider_configured")),
         "themes": themes,
         "image_results": [
             image
