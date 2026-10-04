@@ -25,6 +25,7 @@ from app.progress.models import (
     Presentation,
     RepositoryMaterialLink,
     ResearchRecord,
+    RecordEvidence,
     TranscriptSegment,
 )
 
@@ -203,10 +204,53 @@ class ProgressApiTests(unittest.TestCase):
         self.role = "reviewer"
         review = self.client.post(
             f"/api/v1/progress/records/{record['id']}/review",
-            json={"decision": "accepted"},
+            json={"decision": "accepted", "notes": "  Checked against the original Japanese source.  "},
         )
         self.assertEqual(review.status_code, 200, review.text)
         self.assertEqual(review.json()["status"], "accepted")
+        self.assertEqual(review.json()["notes"], "Checked against the original Japanese source.")
+        self.assertEqual(review.json()["reviewed_by"], "reviewer-1")
+        self.assertIsNotNone(review.json()["reviewed_at"])
+        provenance = self.client.get(f"/api/v1/progress/records/{record['id']}/provenance")
+        self.assertEqual(provenance.status_code, 200, provenance.text)
+        self.assertIsNone(provenance.json()["ai_run"])
+        self.assertEqual(provenance.json()["review_history"][0]["changes"]["notes"]["after"], review.json()["notes"])
+
+    def test_evidence_response_preserves_relation_and_bilingual_quotations(self):
+        response = self.client.post(
+            "/api/v1/progress/records",
+            json={
+                "record_type": "spatial_issue",
+                "title_en": "Regional boundary is uncertain",
+                "status": "candidate",
+                "evidence": [{
+                    "source_kind": "note",
+                    "source_locator": "field-note:4",
+                    "citation_text_original": "境界は不明確です。",
+                    "citation_text_en": "The boundary is unclear.",
+                    "citation_text_ja": "境界は不明確です。",
+                }],
+            },
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        record_id = response.json()["id"]
+        with self.sessions() as session:
+            link = session.scalars(select(RecordEvidence).where(RecordEvidence.record_id == record_id)).one()
+            link.relation = "contradicts"
+            session.commit()
+        records = self.client.get("/api/v1/progress/records").json()
+        evidence = next(item for item in records if item["id"] == record_id)["evidence"][0]
+        self.assertEqual(evidence["relation"], "contradicts")
+        self.assertEqual(evidence["source_locator"], "field-note:4")
+        self.assertEqual(evidence["citation_text_en"], "The boundary is unclear.")
+        self.assertEqual(evidence["citation_text_ja"], "境界は不明確です。")
+
+    def test_record_provenance_requires_read_permission_and_existing_record(self):
+        self.assertEqual(self.client.get("/api/v1/progress/records/missing/provenance").status_code, 404)
+        self.client.app.dependency_overrides[get_auth_context] = lambda: AuthContext(
+            user_id="no-access", organization_id="org-1", role="member", permissions=frozenset(), claims={},
+        )
+        self.assertEqual(self.client.get("/api/v1/progress/records/missing/provenance").status_code, 403)
 
     def test_archive_structure_backfill_is_idempotent_and_groups_variants(self):
         with self.sessions() as session:
@@ -406,6 +450,7 @@ class ProgressApiTests(unittest.TestCase):
             segment = TranscriptSegment(
                 meeting_id=meeting["id"],
                 original_text="GIS should be used as an analytical interface.",
+                translation_ja="GISを分析インターフェースとして利用すべきです。",
                 language="en",
                 source_locator="cue:2",
             )
@@ -427,8 +472,8 @@ class ProgressApiTests(unittest.TestCase):
         ]
         with patch(
             "app.api.progress.request_candidate_extraction",
-            new=AsyncMock(return_value=("[]", generated)),
-        ):
+            new=AsyncMock(return_value=("private raw model response", generated)),
+        ), patch("app.api.progress.provider_metadata", return_value=("ollama", "test-local-model")):
             response = self.client.post(
                 "/api/v1/progress/ai/extract",
                 json={"source_kind": "transcript_segment", "source_ids": [segment_id]},
@@ -440,6 +485,29 @@ class ProgressApiTests(unittest.TestCase):
         self.assertEqual(run.status, "completed")
         self.assertEqual(record.status, "candidate")
         self.assertEqual(len(response.json()["candidate_record_ids"]), 1)
+        self.role = "member"
+        provenance = self.client.get(f"/api/v1/progress/records/{record.id}/provenance")
+        self.assertEqual(provenance.status_code, 200, provenance.text)
+        metadata = provenance.json()["ai_run"]
+        self.assertEqual(metadata["provider"], "ollama")
+        self.assertEqual(metadata["model"], "test-local-model")
+        self.assertEqual(metadata["source_count"], 1)
+        self.assertEqual(metadata["prompt_hash"], run.prompt_hash)
+        self.assertNotIn("raw_response", metadata)
+        self.assertNotIn("source_ids", metadata)
+        self.assertNotIn("private raw model response", provenance.text)
+        evidence = self.client.get("/api/v1/progress/records").json()[0]["evidence"][0]
+        self.assertEqual(evidence["citation_text_original"], "GIS should be used as an analytical interface.")
+        self.assertEqual(evidence["citation_text_ja"], "GISを分析インターフェースとして利用すべきです。")
+
+        forged = self.client.post(
+            "/api/v1/progress/records",
+            json={"record_type": "method_claim", "details": {"ai_run_id": run.id}},
+        )
+        self.assertEqual(forged.status_code, 201, forged.text)
+        forged_provenance = self.client.get(f"/api/v1/progress/records/{forged.json()['id']}/provenance")
+        self.assertEqual(forged_provenance.status_code, 200, forged_provenance.text)
+        self.assertIsNone(forged_provenance.json()["ai_run"])
 
     def test_meeting_and_narrative_reports_preserve_evidence(self):
         meeting = self.create_meeting()

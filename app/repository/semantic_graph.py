@@ -3,6 +3,7 @@ import json
 import math
 import re
 import sqlite3
+import unicodedata
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -95,6 +96,16 @@ def clean_text(value: object) -> str:
 
 
 def normalize_label(value: object) -> str:
+    text = unicodedata.normalize("NFC", clean_text(value).lower())
+    text = "".join(
+        char if char.isspace() or char in ".'-" or unicodedata.category(char)[0] in "LNM" else " "
+        for char in text
+    )
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def legacy_ascii_label(value: object) -> str:
+    """Recognize old identities without assigning their lossy keys to new labels."""
     text = clean_text(value).lower()
     text = re.sub(r"[^a-z0-9\s.'-]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
@@ -415,6 +426,15 @@ def candidate_id(subject_id: str, predicate: str, object_id: str, method: str) -
     return stable_id("kgc", ordered[0], predicate, ordered[1], method)
 
 
+def is_legacy_lossy_entity(row: sqlite3.Row) -> bool:
+    legacy_label = legacy_ascii_label(row["label"])
+    return (
+        normalize_label(row["label"]) != legacy_label
+        and row["canonical_key"] == legacy_label
+        and row["id"] == stable_id("kge", row["entity_type"], legacy_label)
+    )
+
+
 def ensure_entity(
     con: sqlite3.Connection,
     entity_type: str,
@@ -426,11 +446,19 @@ def ensure_entity(
         raise ValueError(f"Unsupported semantic entity type: {entity_type}")
     clean_label = clean_text(label) or "Untitled"
     canonical = normalize_label(canonical_key)
+    # Some callers may supply a key produced by the previous ASCII-only normalizer.
+    if canonical == legacy_ascii_label(clean_label) and canonical != normalize_label(clean_label):
+        canonical = normalize_label(clean_label)
     item_id = entity_id(entity_type, canonical)
     existing = con.execute(
-        "SELECT properties_json, created_at FROM kg_entities WHERE id = ?",
+        "SELECT * FROM kg_entities WHERE id = ?",
         (item_id,),
     ).fetchone()
+    if existing and is_legacy_lossy_entity(existing):
+        # A new ASCII label can share an old lossy ID. Keep both records separate.
+        canonical = f"unicode-safe-identity-{canonical}-{stable_id('key', entity_type, canonical)}"
+        item_id = entity_id(entity_type, canonical)
+        existing = con.execute("SELECT * FROM kg_entities WHERE id = ?", (item_id,)).fetchone()
     merged = parse_json(existing["properties_json"], {}) if existing else {}
     merged.update({key: value for key, value in (properties or {}).items() if value not in (None, "", [], {})})
     ts = now_iso()
@@ -827,6 +855,7 @@ def load_resolution_overrides(con: sqlite3.Connection, table_name: str) -> dict[
         row["normalized_label"]: dict(row)
         for row in rows
         if row["resolution_status"] in {"resolved", "rejected"}
+        and row["normalized_label"] == normalize_label(row["mention_label"])
     }
 
 
@@ -881,6 +910,8 @@ def load_legacy_review_state(con: sqlite3.Connection) -> tuple[dict[tuple, str],
 
 
 def clear_generated_semantic_graph(con: sqlite3.Connection):
+    entities = con.execute("SELECT * FROM kg_entities").fetchall()
+    legacy_entities = [row for row in entities if is_legacy_lossy_entity(row)]
     for table_name in [
         "kg_candidate_evidence",
         "kg_candidate_relations",
@@ -891,9 +922,23 @@ def clear_generated_semantic_graph(con: sqlite3.Connection):
         "kg_resolution_evidence",
         "kg_place_resolution",
         "kg_time_resolution",
-        "kg_entities",
     ]:
         con.execute(f"DELETE FROM {table_name}")
+    legacy_ids = {row["id"] for row in legacy_entities}
+    con.executemany(
+        "DELETE FROM kg_entities WHERE id = ?",
+        [(row["id"],) for row in entities if row["id"] not in legacy_ids],
+    )
+    for row in legacy_entities:
+        properties = parse_json(row["properties_json"], {})
+        properties.update(
+            identity_status="legacy_lossy",
+            identity_note="Preserved old identity; source forms may have been conflated and require review.",
+        )
+        con.execute(
+            "UPDATE kg_entities SET properties_json = ? WHERE id = ?",
+            (compact_json(properties), row["id"]),
+        )
 
 
 def upsert_resolution_evidence(
@@ -2252,6 +2297,9 @@ def build_semantic_graph(con: sqlite3.Connection, material_id: Optional[str] = N
     counts = {
         "material_count": len(materials),
         "entity_count": con.execute("SELECT COUNT(*) FROM kg_entities").fetchone()[0],
+        "legacy_identity_review_count": sum(
+            is_legacy_lossy_entity(row) for row in con.execute("SELECT * FROM kg_entities").fetchall()
+        ),
         "relation_count": con.execute("SELECT COUNT(*) FROM kg_relations").fetchone()[0],
         "mention_count": con.execute("SELECT COUNT(*) FROM kg_mentions").fetchone()[0],
         "candidate_count": con.execute("SELECT COUNT(*) FROM kg_candidate_relations").fetchone()[0],

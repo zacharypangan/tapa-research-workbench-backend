@@ -234,11 +234,39 @@ class ResearchRecordUpdate(BaseModel):
 
 class ReviewRequest(BaseModel):
     decision: Literal["accepted", "rejected", "needs_review", "superseded"]
-    notes: str | None = None
+    notes: str | None = Field(default=None, max_length=10000)
 
 
 class EvidenceOut(EvidenceCreate, OrmModel):
     id: str
+    relation: str = "supports"
+
+
+class AiRunMetadataOut(BaseModel):
+    id: str
+    provider: str
+    model: str
+    prompt_version: str
+    prompt_hash: str
+    source_kind: str
+    source_count: int
+    status: str
+    requested_by: str
+    created_at: datetime
+    finished_at: datetime | None
+
+
+class ReviewEventOut(OrmModel):
+    id: str
+    actor_id: str
+    occurred_at: datetime
+    changes: dict[str, Any]
+
+
+class RecordProvenanceOut(BaseModel):
+    record_id: str
+    ai_run: AiRunMetadataOut | None = None
+    review_history: list[ReviewEventOut] = Field(default_factory=list)
 
 
 class ResearchRecordOut(OrmModel):

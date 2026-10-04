@@ -74,6 +74,9 @@ from app.progress.schemas import (
     PresentationUpdate,
     ResearchRecordCreate,
     ResearchRecordOut,
+    RecordProvenanceOut,
+    AiRunMetadataOut,
+    ReviewEventOut,
     ResearchRecordUpdate,
     ReviewRequest,
     AlignmentCreate,
@@ -137,7 +140,10 @@ def _apply_updates(instance: Any, updates: dict[str, Any]) -> dict[str, Any]:
 
 
 def _record_out(record: ResearchRecord) -> ResearchRecordOut:
-    evidence = [EvidenceOut.model_validate(link.evidence) for link in record.evidence_links]
+    evidence = [
+        EvidenceOut.model_validate(link.evidence).model_copy(update={"relation": link.relation})
+        for link in sorted(record.evidence_links, key=lambda item: item.order_index)
+    ]
     return ResearchRecordOut.model_validate(record).model_copy(update={"evidence": evidence})
 
 
@@ -992,22 +998,71 @@ def review_record(
     if payload.decision == "accepted" and not record.evidence_links:
         raise HTTPException(status_code=422, detail="Accepted records require evidence.")
     previous = record.status
+    previous_notes = record.notes
     record.status = payload.decision
     record.reviewed_by = context.user_id
     record.reviewed_at = datetime.now(timezone.utc)
-    if payload.notes:
-        record.notes = payload.notes
+    if payload.notes is not None:
+        record.notes = payload.notes.strip() or None
+    changes = {"status": {"before": previous, "after": payload.decision}}
+    if previous_notes != record.notes:
+        changes["notes"] = {"before": previous_notes, "after": record.notes}
     _audit(
         session,
         entity_type="research_record",
         entity_id=record.id,
         action="reviewed",
         actor_id=context.user_id,
-        changes={"status": {"before": previous, "after": payload.decision}},
+        changes=changes,
     )
     _commit(session)
     session.refresh(record)
     return _record_out(record)
+
+
+@router.get("/records/{record_id}/provenance", response_model=RecordProvenanceOut)
+def get_record_provenance(
+    record_id: str,
+    session: Session = Depends(get_session),
+    _context: AuthContext = Depends(require_permission("progress:read")),
+):
+    record = session.get(ResearchRecord, record_id)
+    if not record:
+        raise _not_found("Research record")
+    ai_run = None
+    run_id = (record.details or {}).get("ai_run_id")
+    if isinstance(run_id, str):
+        run = session.get(AiExtractionRun, run_id)
+        # Details are editable. A claimed run ID alone is not proof of provenance.
+        if run and record.id in (run.candidate_record_ids or []):
+            ai_run = AiRunMetadataOut(
+                id=run.id,
+                provider=run.provider,
+                model=run.model,
+                prompt_version=run.prompt_version,
+                prompt_hash=run.prompt_hash,
+                source_kind=run.source_kind,
+                source_count=len(run.source_ids or []),
+                status=run.status,
+                requested_by=run.requested_by,
+                created_at=run.created_at,
+                finished_at=run.finished_at,
+            )
+    reviews = session.scalars(
+        select(AuditEvent)
+        .where(
+            AuditEvent.entity_type == "research_record",
+            AuditEvent.entity_id == record_id,
+            AuditEvent.action == "reviewed",
+        )
+        .order_by(AuditEvent.occurred_at.desc())
+        .limit(20)
+    )
+    return RecordProvenanceOut(
+        record_id=record.id,
+        ai_run=ai_run,
+        review_history=[ReviewEventOut.model_validate(event) for event in reviews],
+    )
 
 
 @router.get("/concepts", response_model=list[ConceptOut])
@@ -1284,6 +1339,8 @@ async def extract_ai_candidates(
                     repository_segment_id=source.repository_segment_id,
                     source_locator=source.source_locator,
                     citation_text_original=source.original_text,
+                    citation_text_en=source.translation_en,
+                    citation_text_ja=source.translation_ja,
                 )
                 session.add(evidence)
                 session.flush()

@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+import json
 import sqlite3
 import unittest
 
@@ -10,9 +11,16 @@ from app.auth import AuthContext, ROLE_PERMISSIONS, get_auth_context
 from app.repository.semantic_graph import (
     build_semantic_graph,
     explain_semantic_relation,
+    ensure_entity,
+    entity_id,
+    init_semantic_graph_schema,
+    load_resolution_overrides,
+    normalize_label,
     review_semantic_candidate,
     review_semantic_relation,
     semantic_graph_payload,
+    save_review_decision,
+    stable_id,
 )
 from app.repository.semantic_rules import (
     RELATION_RULES,
@@ -84,6 +92,112 @@ def create_source_schema(con: sqlite3.Connection):
     )
 
 
+class SemanticIdentityTest(unittest.TestCase):
+    def setUp(self):
+        self.con = sqlite3.connect(":memory:")
+        self.con.row_factory = sqlite3.Row
+        self.con.execute("PRAGMA foreign_keys = ON")
+        create_source_schema(self.con)
+        init_semantic_graph_schema(self.con)
+
+    def tearDown(self):
+        self.con.close()
+
+    def legacy_entity(self, label, canonical):
+        item_id = stable_id("kge", "concept", canonical)
+        self.con.execute(
+            """
+            INSERT INTO kg_entities (
+                id, entity_type, label, normalized_label, canonical_key,
+                properties_json, created_at, updated_at
+            ) VALUES (?, 'concept', ?, ?, ?, '{"research_note":"retain"}', 'old', 'old')
+            """,
+            (item_id, label, canonical, canonical),
+        )
+        return item_id
+
+    def test_japanese_entities_remain_distinct_and_preserve_script(self):
+        tokyo = ensure_entity(self.con, "place", "東京", "東京")
+        kyoto = ensure_entity(self.con, "place", "京都", "京都")
+        self.assertNotEqual(tokyo, kyoto)
+        self.assertEqual(normalize_label("  東京  "), "東京")
+        self.assertEqual(
+            self.con.execute("SELECT canonical_key FROM kg_entities WHERE id = ?", (tokyo,)).fetchone()[0],
+            "東京",
+        )
+
+    def test_accents_and_decomposed_unicode_have_distinct_correct_identities(self):
+        composed = ensure_entity(self.con, "concept", "Café", "Café")
+        decomposed = ensure_entity(self.con, "concept", "Cafe\u0301", "Cafe\u0301")
+        unaccented = ensure_entity(self.con, "concept", "Cafe", "Cafe")
+        self.assertEqual(composed, decomposed)
+        self.assertNotEqual(composed, unaccented)
+        self.assertEqual(normalize_label("Cafe\u0301"), "café")
+        self.assertEqual(normalize_label("हिन्दी"), "हिन्दी")
+
+    def test_ascii_identity_and_explicit_keys_remain_compatible(self):
+        self.assertEqual(normalize_label("  Barkcloth_Weaving: 1900 / 1910! "), "barkcloth weaving 1900 1910")
+        expected = stable_id("kge", "concept", "barkcloth weaving")
+        first = ensure_entity(self.con, "concept", "Barkcloth Weaving", "Barkcloth_Weaving")
+        second = ensure_entity(self.con, "concept", "BARKCLOTH WEAVING", "barkcloth weaving")
+        self.assertEqual(first, expected)
+        self.assertEqual(second, expected)
+        self.assertEqual(entity_id("concept", "Barkcloth_Weaving"), expected)
+        self.assertEqual(
+            ensure_entity(self.con, "material", "日本語資料", "material-1"),
+            stable_id("kge", "material", "material-1"),
+        )
+
+    def test_lossy_keys_do_not_overwrite_legacy_entities_or_references(self):
+        legacy_japanese = self.legacy_entity("東京", "")
+        save_review_decision(self.con, "relation", "legacy-relation", "rejected", "Prior researcher decision")
+        self.con.execute("CREATE TABLE saved_entity_reference (entity_id TEXT REFERENCES kg_entities(id))")
+        self.con.execute("INSERT INTO saved_entity_reference VALUES (?)", (legacy_japanese,))
+        tokyo = ensure_entity(self.con, "concept", "東京", "")
+        kyoto = ensure_entity(self.con, "concept", "京都", "")
+        self.assertEqual(len({legacy_japanese, tokyo, kyoto}), 3)
+        self.assertEqual(
+            self.con.execute("SELECT label FROM kg_entities WHERE id = ?", (legacy_japanese,)).fetchone()[0],
+            "東京",
+        )
+        counts = build_semantic_graph(self.con)
+        retained = self.con.execute("SELECT * FROM kg_entities WHERE id = ?", (legacy_japanese,)).fetchone()
+        self.assertIsNotNone(retained)
+        properties = json.loads(retained["properties_json"])
+        self.assertEqual(properties["identity_status"], "legacy_lossy")
+        self.assertEqual(properties["research_note"], "retain")
+        self.assertEqual(counts["legacy_identity_review_count"], 1)
+        self.assertEqual(self.con.execute("SELECT entity_id FROM saved_entity_reference").fetchone()[0], legacy_japanese)
+        self.assertEqual(
+            self.con.execute("SELECT notes FROM kg_review_decisions WHERE target_key = 'legacy-relation'").fetchone()[0],
+            "Prior researcher decision",
+        )
+
+    def test_ascii_collision_with_legacy_accented_identity_stays_separate(self):
+        legacy = self.legacy_entity("Café", "caf")
+        accented = ensure_entity(self.con, "concept", "Café", "caf")
+        ascii_entity = ensure_entity(self.con, "concept", "Caf", "caf")
+        self.assertEqual(len({legacy, accented, ascii_entity}), 3)
+        self.assertEqual(ensure_entity(self.con, "concept", "Caf", "caf"), ascii_entity)
+        self.assertEqual(
+            self.con.execute("SELECT label FROM kg_entities WHERE id = ?", (legacy,)).fetchone()[0],
+            "Café",
+        )
+
+    def test_legacy_lossy_resolution_is_not_applied_to_a_new_ascii_label(self):
+        self.con.executemany(
+            """
+            INSERT INTO kg_place_resolution (
+                id, mention_label, normalized_label, resolution_status, evidence_count, updated_at
+            ) VALUES (?, ?, ?, 'resolved', 1, 'old')
+            """,
+            [("legacy-place", "Café", "caf"), ("valid-place", "Fiji", "fiji")],
+        )
+        overrides = load_resolution_overrides(self.con, "kg_place_resolution")
+        self.assertNotIn("caf", overrides)
+        self.assertIn("fiji", overrides)
+
+
 class SemanticGraphTest(unittest.TestCase):
     def setUp(self):
         self.con = sqlite3.connect(":memory:", check_same_thread=False)
@@ -144,6 +258,31 @@ class SemanticGraphTest(unittest.TestCase):
 
     def tearDown(self):
         self.con.close()
+
+    def test_multilingual_projection_preserves_distinct_entities_and_reviews_on_rebuild(self):
+        self.con.execute(
+            "UPDATE materials SET keywords = '東京都; 京都市; Café; Cafe' WHERE id = 'material-1'"
+        )
+        build_semantic_graph(self.con)
+        entities = self.con.execute(
+            "SELECT * FROM kg_entities WHERE entity_type = 'concept' AND normalized_label IN ('東京都', '京都市', 'café', 'cafe')"
+        ).fetchall()
+        first_ids = {row["normalized_label"]: row["id"] for row in entities}
+        self.assertEqual(len(first_ids), 4)
+        self.assertEqual(len(set(first_ids.values())), 4)
+        relation = self.con.execute(
+            "SELECT * FROM kg_relations WHERE predicate = 'has_topic' AND object_entity_id = ?",
+            (first_ids["café"],),
+        ).fetchone()
+        review_semantic_relation(self.con, relation["id"], "rejected")
+        build_semantic_graph(self.con)
+        for label, first_id in first_ids.items():
+            row = self.con.execute("SELECT id FROM kg_entities WHERE normalized_label = ?", (label,)).fetchone()
+            self.assertEqual(row["id"], first_id)
+        self.assertEqual(
+            self.con.execute("SELECT assertion_status FROM kg_relations WHERE id = ?", (relation["id"],)).fetchone()[0],
+            "rejected",
+        )
 
     def test_semantic_projection_is_stable_and_reviewable(self):
         first = build_semantic_graph(self.con)

@@ -3180,14 +3180,34 @@ async def request_image_caption(image_path: str, context_text: str = "") -> str:
         return ""
 
 
+EVIDENCE_PASSAGE_CHARACTER_LIMIT = 1600
+
+
+def evidence_answer_passages(evidence: list[dict]) -> list[dict]:
+    """Describe the same source excerpts sent to the answer provider."""
+    return [
+        {
+            "citation_number": index + 1,
+            "segment_id": item["segment_id"],
+            "material_id": item["material_id"],
+            "material_title": item["material_title"],
+            "page_ref": item.get("page_ref"),
+            "source_locator": item.get("source_locator"),
+            "excerpt": item["content_text"][:EVIDENCE_PASSAGE_CHARACTER_LIMIT],
+            "truncated": len(item["content_text"]) > EVIDENCE_PASSAGE_CHARACTER_LIMIT,
+        }
+        for index, item in enumerate(evidence)
+    ]
+
+
 async def request_evidence_answer(question: str, evidence: list[dict]) -> str:
     evidence_text = "\n\n".join(
         (
-            f"[{index + 1}] {item['material_title']} "
+            f"[{item['citation_number']}] {item['material_title']} "
             f"({item.get('page_ref') or 'unknown page'}): "
-            f"{item['content_text'][:1600]}"
+            f"{item['excerpt']}"
         )
-        for index, item in enumerate(evidence)
+        for item in evidence_answer_passages(evidence)
     )
 
     system_prompt = (
@@ -3392,7 +3412,8 @@ async def semantic_search_segments(payload: SemanticSearchRequest) -> dict:
 
         scored = []
         for row in rows:
-            exact_match = bool(matched_terms_for_text(row["content_text"], terms))
+            matched_terms = matched_terms_for_text(row["content_text"], terms)
+            exact_match = bool(matched_terms)
             indexed = query_embedding is not None and row["embedding_json"] is not None
             if not indexed and not exact_match:
                 continue
@@ -3401,6 +3422,8 @@ async def semantic_search_segments(payload: SemanticSearchRequest) -> dict:
             item.pop("embedding_json", None)
             item["score"] = score
             item["semantic_score"] = score if indexed else None
+            item["retrieval_method"] = "embedding_similarity" if indexed else "exact_text"
+            item["matched_terms"] = matched_terms
             item["evidence_type"] = "text_passage"
             item["retrieval_basis"] = "Text passage ranked by embedding similarity." if indexed else "Exact match in extracted text; semantic indexing is unavailable or pending."
             item["citation"] = citation_from_segment(row)
@@ -3433,16 +3456,19 @@ async def semantic_search_segments(payload: SemanticSearchRequest) -> dict:
     }
 
 
+def image_search_text_sources(row: sqlite3.Row) -> dict[str, str]:
+    return {
+        "ocr_text": row["ocr_text"] or "",
+        "visual_caption": row["visual_caption"] or "",
+        "observation_labels": (row["observation_labels"] or "") if "observation_labels" in row.keys() else "",
+        "metadata": "\n\n".join(
+            row[key] for key in ("page_ref", "source_locator", "evidence_type") if row[key]
+        ),
+    }
+
+
 def image_embedding_text(row: sqlite3.Row) -> str:
-    parts = [
-        row["ocr_text"] or "",
-        row["visual_caption"] or "",
-        row["observation_labels"] if "observation_labels" in row.keys() else "",
-        row["page_ref"] or "",
-        row["source_locator"] or "",
-        row["evidence_type"] or "",
-    ]
-    return clean_extracted_text("\n\n".join(part for part in parts if part))
+    return clean_extracted_text("\n\n".join(part for part in image_search_text_sources(row).values() if part))
 
 
 async def index_missing_image_embeddings(
@@ -3679,31 +3705,56 @@ async def search_image_evidence(payload: MultimodalSearchRequest) -> dict:
 
         results = []
         for row in rows:
-            evidence_text = image_embedding_text(row)
-            matched_terms = matched_terms_for_text(evidence_text, terms)
-            semantic_score = cosine_similarity(query_embedding, json.loads(row["embedding_json"])) if query_embedding is not None and row["embedding_json"] else 0.0
-            if not matched_terms and semantic_score < 0.62:
+            matches_by_source = {
+                source: matches
+                for source, text in image_search_text_sources(row).items()
+                if (matches := matched_terms_for_text(clean_extracted_text(text), terms))
+            }
+            matched_terms = [term for term in terms if any(term in matches for matches in matches_by_source.values())]
+            indexed = query_embedding is not None and row["embedding_json"] is not None
+            semantic_score = cosine_similarity(query_embedding, json.loads(row["embedding_json"])) if indexed else None
+            if not matched_terms and (semantic_score is None or semantic_score < 0.62):
                 continue
             item = dict(row)
             item.pop("embedding_json", None)
             item.pop("image_path", None)
             item["image_url"] = image_url(row["material_id"], row["image_id"])
             item["semantic_score"] = semantic_score
-            item["score"] = semantic_score
+            item["score"] = semantic_score if semantic_score is not None else 0.0
+            item["retrieval_method"] = "embedding_similarity" if indexed else "exact_text"
             item["matched_terms"] = matched_terms
+            item["matched_text_sources"] = list(matches_by_source)
             item["contains_exact_term"] = bool(matched_terms)
+            source_labels = {
+                "ocr_text": "OCR text",
+                "visual_caption": "AI image description",
+                "observation_labels": "researcher observation labels",
+                "metadata": "image metadata",
+            }
             item["retrieval_basis"] = (
-                f"OCR/caption matched: {', '.join(matched_terms)}."
+                "Exact matches in " + "; ".join(
+                    f"{source_labels[source]}: {', '.join(matches)}"
+                    for source, matches in matches_by_source.items()
+                ) + "."
                 if matched_terms
-                else "Semantic image-text match from OCR/caption text; exact search token not found."
+                else "Embedding similarity to image search text; no exact text match."
             )
-            item["evidence_level"] = "direct_image_text_match" if matched_terms else "semantic_image_neighbor"
+            source_levels = {
+                "ocr_text": "direct_image_text_match",
+                "visual_caption": "ai_description_text_match",
+                "observation_labels": "observation_label_match",
+                "metadata": "image_metadata_match",
+            }
+            item["evidence_level"] = (
+                source_levels[next(iter(matches_by_source))]
+                if matched_terms else "semantic_image_neighbor"
+            )
             results.append(item)
 
         results.sort(
             key=lambda item: (
                 1 if item["matched_terms"] else 0,
-                item["semantic_score"],
+                item["semantic_score"] if item["semantic_score"] is not None else 0.0,
             ),
             reverse=True,
         )
@@ -3714,8 +3765,8 @@ async def search_image_evidence(payload: MultimodalSearchRequest) -> dict:
         "index_result": index_result,
         "image_results": results[: payload.limit],
         "evidence_note": (
-            "Image evidence is searched separately using OCR and model-generated captions. "
-            "Captions describe visible evidence and are not interpretations."
+            "Images are searched through OCR, AI descriptions, researcher labels, and metadata. "
+            "AI descriptions are generated suggestions; verify them against the source image."
         ),
     }
 
@@ -5413,6 +5464,90 @@ async def get_material_extracted(material_id: str, limit: int = Query(200, ge=1,
     }
 
 
+def repository_search_coverage(con: sqlite3.Connection, material_id: Optional[str] = None) -> dict:
+    """Count searchable evidence in the selected scope without calling an AI provider."""
+    if material_id:
+        ensure_material(con, material_id)
+    scope_params = [material_id] if material_id else []
+    material_where = "WHERE m.id = ?" if material_id else ""
+    file_where = "WHERE f.material_id = ?" if material_id else ""
+    segment_where = "WHERE es.material_id = ?" if material_id else ""
+    image_where = "WHERE ie.material_id = ?" if material_id else ""
+    evidence_where = "WHERE material_id = ?" if material_id else ""
+    embedding_model = active_embedding_model_name()
+
+    materials = con.execute(
+        f"""
+        SELECT COUNT(*) AS material_count,
+            COALESCE(SUM(NOT EXISTS (
+                SELECT 1 FROM extracted_segments es WHERE es.material_id = m.id
+            )), 0) AS materials_without_text_count,
+            COALESCE(SUM((
+                SELECT er.status FROM extraction_runs er WHERE er.material_id = m.id
+                ORDER BY er.created_at DESC, er.id DESC LIMIT 1
+            ) IN ('error', 'failed')), 0) AS materials_with_failed_extraction_count
+        FROM materials m {material_where}
+        """,
+        scope_params,
+    ).fetchone()
+    files = con.execute(
+        f"""
+        WITH evidence_files AS (
+            SELECT file_id FROM extracted_segments {evidence_where}
+            UNION
+            SELECT file_id FROM image_evidence {evidence_where}
+        )
+        SELECT COUNT(*) AS uploaded_file_count,
+            COALESCE(SUM(ef.file_id IS NULL), 0) AS files_without_extracted_evidence_count,
+            COALESCE(SUM(f.parser_status = 'failed'), 0) AS files_with_failed_extraction_count,
+            COALESCE(SUM(f.parser_status = 'unsupported'), 0) AS files_with_unsupported_format_count
+        FROM files f LEFT JOIN evidence_files ef ON ef.file_id = f.id {file_where}
+        """,
+        scope_params * 3,
+    ).fetchone()
+    segments = con.execute(
+        f"""
+        SELECT COUNT(*) AS segment_count, COUNT(se.segment_id) AS embedded_segment_count
+        FROM extracted_segments es
+        LEFT JOIN segment_embeddings se ON se.segment_id = es.id AND se.model = ?
+        {segment_where}
+        """,
+        [embedding_model, *scope_params],
+    ).fetchone()
+    images = con.execute(
+        f"""
+        SELECT COUNT(*) AS image_evidence_count, COUNT(im.image_id) AS embedded_image_count
+        FROM image_evidence ie
+        LEFT JOIN image_embeddings im ON im.image_id = ie.id
+            AND im.model = ? AND im.method_version = ?
+        {image_where}
+        """,
+        [embedding_model, MULTIMODAL_METHOD_VERSION, *scope_params],
+    ).fetchone()
+    counts = {**dict(materials), **dict(files), **dict(segments), **dict(images)}
+    return {
+        "scope": "material" if material_id else "repository",
+        "material_id": material_id,
+        "embedding_model": embedding_model,
+        "method_version": MULTIMODAL_METHOD_VERSION,
+        **counts,
+        "pending_segment_count": counts["segment_count"] - counts["embedded_segment_count"],
+        "pending_image_count": counts["image_evidence_count"] - counts["embedded_image_count"],
+    }
+
+
+@router.get("/ai/coverage")
+def get_search_coverage(material_id: Optional[str] = Query(None, min_length=1, max_length=255)):
+    # Startup normally initializes these tables. Also support an empty installation
+    # without acquiring the schema writer lock on every coverage refresh.
+    with get_connection() as con:
+        if con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'materials'").fetchone():
+            return repository_search_coverage(con, material_id)
+    init_repository_db()
+    with get_connection() as con:
+        return repository_search_coverage(con, material_id)
+
+
 @router.get("/ai/status")
 async def get_ai_status():
     init_repository_db()
@@ -5664,6 +5799,13 @@ async def ask_corpus(payload: AskCorpusRequest):
         "question": payload.question,
         "provider_configured": True,
         "answer": answer,
+        "generation_context": {
+            "provider": ollama_provider_name(),
+            "model": OLLAMA_RETRIEVAL_MODEL,
+            "images_included": False,
+            "passage_character_limit": EVIDENCE_PASSAGE_CHARACTER_LIMIT,
+            "passages": evidence_answer_passages(evidence),
+        },
         "citations": [item["citation"] for item in evidence],
         "retrieved_passages": evidence,
         "image_results": image_retrieval["image_results"],
@@ -5713,6 +5855,11 @@ async def generate_ai_evidence_report(
                 "segment_id": item["segment_id"],
                 "page_ref": item["page_ref"],
                 "score": item["score"],
+                "semantic_score": item["semantic_score"],
+                "retrieval_method": item["retrieval_method"],
+                "retrieval_basis": item["retrieval_basis"],
+                "matched_terms": item["matched_terms"],
+                "source_locator": item["source_locator"],
                 "content_text": item["content_text"],
             },
             item["content_text"],
