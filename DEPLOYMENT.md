@@ -1,5 +1,26 @@
 # Deployment: Vercel Frontend + Railway Backend
 
+## Document graph staging
+
+Use `codex/mvp-document-graphs` in both repositories. It starts from the hosted
+`mvp-ollama-cloud` branch and adds only the document graph workflow. Deploy the
+backend branch to the Railway `graph-staging` environment in the existing
+Workbench project, with its own persistent volume mounted at `/app/storage`.
+The API starts and recovers graph jobs itself; no additional worker or database
+is needed. `uv.lock` includes the approved static web extraction dependency.
+
+The corresponding Vercel **preview branch override** is:
+
+```text
+Branch: codex/mvp-document-graphs
+VITE_API_BASE_URL=https://tapa-research-workbench-backend-graph-staging.up.railway.app/api/v1
+```
+
+Pushes to this branch update graph staging. The existing production branch and
+production storage are independent. Verify `/api/v1/research-runs/capabilities`
+and a document-to-graph run before sharing the preview. See
+`docs/knowledge-graphs.md` for the method, API and focused checks.
+
 ## Recommended Layout
 
 - Frontend: deploy `stling_frontend/` to Vercel as a Vite app.

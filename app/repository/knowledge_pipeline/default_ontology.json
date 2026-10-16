@@ -1,0 +1,305 @@
+{
+  "alignments": {
+    "cultural_heritage_reference": "https://cidoc-crm.org/sites/default/files/Documents/cidoc_crm_version_7.1.3.html",
+    "labels_and_concept_schemes": "https://www.w3.org/TR/skos-reference/",
+    "processing_lineage": "https://www.w3.org/TR/prov-o/",
+    "spatial_export_reference": "https://www.ogc.org/standards/geosparql/",
+    "temporal_reference": "https://www.w3.org/TR/owl-time/"
+  },
+  "constraints": {
+    "alignment_is_not_physical_identity_or_historical_transmission": true,
+    "every_assertion_has_evidence": true,
+    "quarantined_platform_content_is_not_projected_as_domain_claims": true,
+    "scope_and_evidence_versions_are_part_of_assertion_version": true,
+    "source_scoped_identity_is_preserved": true,
+    "specialist_review_is_not_automatically_generated": true,
+    "unknown_is_not_absence": true
+  },
+  "design": "Source-scoped entities and evidence-bearing assertions; project proposals and historical interpretations retain separate epistemic kinds.",
+  "entity_types": {
+    "ActivityType": "A category of work such as procurement, soaking or beating.",
+    "ArchaeologicalObject": "A distinguishable archaeological object; proposed function is not assumed by its class.",
+    "Assemblage": "A reported group of objects, including counts without separable identities.",
+    "Community": "A reported social group; not interchangeable with its settlement or every resident.",
+    "ComparisonHypothesis": "An interpretation or comparison with explicit scope/premises; not an observed causal fact.",
+    "Concept": "A source-scoped concept awaiting any more specific classification.",
+    "DatingAssessment": "An attributed dating statement with dated referent and basis, including unknown/conflicting assessments.",
+    "DesignConcept": "A reported design, motif or design category.",
+    "EnvironmentContext": "Reported environmental conditions or sourcing context.",
+    "ExchangeRecord": "An observed transaction or explicitly reported exchange practice, distinguished by scope.",
+    "Feature": "A morphological or contextual feature described by a source.",
+    "FindContext": "An excavation layer, recovery locality/context or contextual archaeological unit.",
+    "LanguageVariety": "An attributed language/variety identity, not inferred from a document's location alone.",
+    "LinguisticAttestation": "A sourced expression and proposed referent in a stated language/context.",
+    "MaterialBatch": "An identified batch/sample, distinct from its general material kind.",
+    "MaterialKind": "A reported material category.",
+    "MethodProposal": "An attributed research-method suggestion.",
+    "Participant": "An evidenced participant; anonymous speakers remain anonymous.",
+    "Participation": "Association of a participant or reported group with an activity and role.",
+    "Place": "A named locality or region as reported; precise coordinates require separately evidenced geometry.",
+    "PlantTaxon": "A reported botanical taxon; identification certainty is preserved.",
+    "ProductionCase": "A bounded account of an observed, habitual, recalled or secondary-reported production practice.",
+    "ProjectTask": "A project request/assignment; does not infer an accepted deadline or owner unless evidenced.",
+    "RecoveryRecord": "An attributed description of recovery, collection or museum observation.",
+    "ReportedStage": "An activity described within a production case; not necessarily a witnessed event.",
+    "ResearchQuestion": "A project question, not a statement that its proposed relationship is true.",
+    "Role": "A role description whose application is scoped to participation or a reported practice.",
+    "SourceLead": "A cited/retrieved reference candidate whose underlying original may remain unconsulted.",
+    "TimeExpression": "A raw or checked normalized period/date expression with conventions retained.",
+    "ToolForm": "A form/category of tools; does not identify a physical object.",
+    "ToolInstance": "An identified physical tool whose identity is evidenced.",
+    "TypeCategory": "A category within one typology scheme; codes are not globally equivalent.",
+    "TypologyScheme": "A classification belonging to a stated source or tradition."
+  },
+  "namespace": "urn:tapa:vocab:",
+  "ontology_id": "urn:tapa:ontology:current-materials",
+  "predicates": {
+    "aligns_reported_concept_with": {
+      "definition": "Provisional alignment of source-local generic concepts or reported names. Not physical identity, accepted taxonomic equivalence or historical transmission.",
+      "requires_object": true
+    },
+    "assigned_period": {
+      "definition": "Source's cultural-period attribution with contextual qualifiers."
+    },
+    "assigned_type_by_source": {
+      "definition": "A source-specific classification assignment.",
+      "object_types": [
+        "TypeCategory",
+        "ToolForm"
+      ],
+      "requires_object": true
+    },
+    "attested_term_for": {
+      "definition": "Source reports a term referring to a concept in a stated linguistic context.",
+      "subject_types": [
+        "LinguisticAttestation"
+      ]
+    },
+    "broader_category": {
+      "definition": "Source-local broader category; does not merge separate typology schemes."
+    },
+    "calibration_status": {
+      "definition": "Explicit calibration convention or unknown status.",
+      "subject_types": [
+        "DatingAssessment",
+        "TimeExpression"
+      ]
+    },
+    "category_describes_tool_form": {
+      "definition": "Paper-local typology category describes forms within the reported tool-form terminology; no independent validation of tool function.",
+      "object_types": [
+        "ToolForm"
+      ],
+      "requires_object": true,
+      "subject_types": [
+        "TypeCategory"
+      ]
+    },
+    "cites_source": {
+      "definition": "Citation/discovery lead; cited original is not presumed consulted.",
+      "object_types": [
+        "SourceLead"
+      ],
+      "requires_object": true
+    },
+    "collected_from": {
+      "definition": "Reported material sourcing/procurement relation.",
+      "requires_case_scope": true
+    },
+    "compared_with": {
+      "definition": "A comparison made by a source; similarity does not establish identity or transmission."
+    },
+    "dated_referent": {
+      "definition": "Identifies what the dating assessment concerns.",
+      "subject_types": [
+        "DatingAssessment"
+      ]
+    },
+    "dating_basis": {
+      "definition": "Stated measurement, layer, phase, assemblage or analogy basis.",
+      "subject_types": [
+        "DatingAssessment",
+        "FindContext",
+        "TimeExpression"
+      ]
+    },
+    "found_in_context": {
+      "definition": "Object/assemblage is reported in a specified recovery context.",
+      "object_types": [
+        "FindContext",
+        "RecoveryRecord"
+      ],
+      "requires_object": true
+    },
+    "has_activity": {
+      "definition": "Case includes a reported stage or work category.",
+      "literal_definition": "A literal preserves an attributed activity description from an uncertain secondary excerpt; it does not instantiate a witnessed stage or production case.",
+      "object_types": [
+        "ReportedStage",
+        "ActivityType"
+      ]
+    },
+    "has_activity_type": {
+      "definition": "Categorizes a reported stage.",
+      "object_types": [
+        "ActivityType"
+      ],
+      "requires_object": true,
+      "subject_types": [
+        "ReportedStage"
+      ]
+    },
+    "has_comparative_context": {
+      "definition": "Analyst-proposed comparison for a paper question; original sources did not necessarily make this comparison. Does not confirm archaeological function.",
+      "requires_object": true
+    },
+    "has_definition": {
+      "definition": "Source-local definition of a category, concept or scheme."
+    },
+    "has_feature": {
+      "definition": "Attributed morphological or descriptive feature; uncertainty is retained."
+    },
+    "has_participant_role": {
+      "definition": "Role scoped to participation or a reported production case.",
+      "requires_case_scope": true
+    },
+    "has_related_concept_context": {
+      "definition": "Provisional comparison across differing concept granularity, taxonomic rank or tradition. Direction does not imply exact equivalence or automatic fact transfer.",
+      "requires_object": true
+    },
+    "has_reported_place_context": {
+      "definition": "Place named in the specific source account, with its exact attribution role retained. Not an inferred production place, findspot or coordinate.",
+      "object_types": [
+        "Place"
+      ],
+      "requires_object": true
+    },
+    "identification_uncertain": {
+      "definition": "Source explicitly questions identity, classification or attribution."
+    },
+    "located_in": {
+      "definition": "Source locates one spatial entity in another.",
+      "literal_definition": "A literal preserves administrative or geographic wording exactly as reported, without claiming resolved modern boundaries or parent-place identity.",
+      "object_types": [
+        "Place",
+        "EnvironmentContext"
+      ]
+    },
+    "precedes_in_case": {
+      "definition": "Reported ordering within one production case; not a universal sequence.",
+      "object_types": [
+        "ReportedStage",
+        "ActivityType"
+      ],
+      "requires_case_scope": true,
+      "requires_object": true,
+      "subject_types": [
+        "ReportedStage",
+        "ActivityType"
+      ]
+    },
+    "processes_material": {
+      "definition": "Activity processes a reported material category/batch.",
+      "object_types": [
+        "MaterialKind",
+        "MaterialBatch",
+        "PlantTaxon"
+      ],
+      "requires_case_scope": true,
+      "requires_object": true
+    },
+    "proposed_connection": {
+      "definition": "Attributed historical, geographical or linguistic connection hypothesis."
+    },
+    "proposed_function": {
+      "definition": "Author/source function interpretation, never an automatic observation."
+    },
+    "proposes_method": {
+      "definition": "Attributed method option/proposal, not a settled research result."
+    },
+    "reported_alias": {
+      "definition": "Source associates labels; external/gazetteer identity still requires checking."
+    },
+    "reported_at": {
+      "definition": "Source associates a record with a reported place.",
+      "literal_definition": "A literal preserves an attributed place/distribution description when distinct Place identities are unresolved; it never supplies coordinates.",
+      "object_types": [
+        "Place",
+        "FindContext"
+      ]
+    },
+    "reported_count": {
+      "definition": "Count whose scope distinguishes illustrated views/specimens and assemblage totals."
+    },
+    "reported_date": {
+      "definition": "Raw attributed date/chronology attached to its assessment/context, not automatically a direct object date.",
+      "subject_types": [
+        "DatingAssessment",
+        "FindContext",
+        "TimeExpression"
+      ]
+    },
+    "reported_dimensions": {
+      "definition": "Source measurement with units and dimensional labels where known."
+    },
+    "reported_environment": {
+      "definition": "Environment attributed by a source; does not create a causal explanation by itself.",
+      "requires_case_scope": true
+    },
+    "reported_exchange": {
+      "definition": "Source-reported exchange context or practice, not an invented transaction.",
+      "requires_case_scope": true
+    },
+    "reported_material": {
+      "definition": "Material attributed by the source, without unreported mineral/taxon specificity."
+    },
+    "reported_recovery": {
+      "definition": "Attributed recovery/collection status or event description."
+    },
+    "reported_season": {
+      "definition": "Seasonality stated by a source; unknown stays unknown.",
+      "requires_case_scope": true
+    },
+    "requests_information": {
+      "definition": "Project request for information, not a domain fact."
+    },
+    "source_classifies_as_tool_form": {
+      "definition": "Source-explicit terminology or form classification for a described object, preserving disputed function.",
+      "object_types": [
+        "ToolForm"
+      ],
+      "requires_object": true,
+      "subject_types": [
+        "ArchaeologicalObject",
+        "ToolInstance"
+      ]
+    },
+    "states_limitation": {
+      "definition": "Source or project states an evidential/methodological limitation."
+    },
+    "uses_design": {
+      "definition": "Reported application of a design in a production context.",
+      "requires_case_scope": true
+    },
+    "uses_tool": {
+      "definition": "Reported use of an identified physical tool in a scoped case.",
+      "object_types": [
+        "ToolInstance",
+        "ArchaeologicalObject"
+      ],
+      "requires_case_scope": true,
+      "requires_object": true
+    },
+    "uses_tool_form": {
+      "definition": "Reported use of a tool form in a scoped case.",
+      "object_types": [
+        "ToolForm",
+        "TypeCategory"
+      ],
+      "requires_case_scope": true,
+      "requires_object": true
+    }
+  },
+  "status": "source-scoped graph with explicitly provisional paper-seeded alignment layer",
+  "version": "0.2.0"
+}

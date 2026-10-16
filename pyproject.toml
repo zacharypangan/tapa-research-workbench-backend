@@ -26,4 +26,5 @@ dependencies = [
     "pytesseract>=0.3.13",
     "striprtf",
     "PyMuPDF",
+    "beautifulsoup4>=4.13,<5",
 ]
