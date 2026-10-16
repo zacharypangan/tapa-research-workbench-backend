@@ -28,6 +28,10 @@ Branch: codex/mvp-document-graphs
 VITE_API_BASE_URL=https://tapa-research-workbench-backend-graph-staging.up.railway.app/api/v1
 ```
 
+This temporary Preview override is for pre-release verification. Remove it
+before selecting this branch as Vercel's Production branch; Production keeps
+the existing production API setting. Already-built previews retain their API URL.
+
 Pushes to this branch update graph staging. The existing production branch and
 production storage are independent. Verify `/api/v1/research-runs/capabilities`
 and a document-to-graph run before sharing the preview. See
