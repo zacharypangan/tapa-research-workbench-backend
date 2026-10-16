@@ -154,6 +154,12 @@ class ResearchPipeline:
             if checkpoint.exists():
                 outputs.append(read_json(checkpoint))
                 continue
+            rejected = path / "rejected_batches" / f"{identifier}.json"
+            if rejected.exists() and identifier not in responses:
+                # Repeating an invalid provider call cannot silently complete a
+                # batch. Preserve its audit and wait for corrected annotations.
+                missing.append(identifier)
+                continue
             metadata = {"method": "submitted_annotation", "ontology_sha256": digest(config["ontology"])}
             if identifier in responses:
                 response = responses[identifier]
@@ -170,11 +176,20 @@ class ResearchPipeline:
                 missing.append(identifier)
                 continue
             output["processing_metadata"] = metadata
+            if output.get("rejections"):
+                write_json(rejected, {"validation": output, "response": response,
+                                      "processing_metadata": metadata})
+                missing.append(identifier)
+                continue
             write_json(checkpoint, output)
             outputs.append(output)
         if missing:
+            rejected_ids = [identifier for identifier in missing
+                            if (path / "rejected_batches" / f"{identifier}.json").exists()]
             self.store.state(path, "awaiting_annotations", name, missing_batch_ids=missing,
-                             detail="Submit source-grounded annotations or configure the existing Ollama runtime")
+                             rejected_batch_ids=rejected_ids,
+                             detail="Extraction could not be validated. Add source-grounded annotations; original responses and rejection reasons are saved under rejected_batches/."
+                             if rejected_ids else "Submit source-grounded annotations or configure the existing Ollama runtime")
             return None
         result = merge_outputs(outputs)
         result["processing_runs"] = [{"batch_id": batch["batch_id"],
@@ -305,8 +320,10 @@ class ResearchPipeline:
             state = read_json(path / "state.json")
             if state["status"] != "awaiting_annotations" and not (state["status"] == "failed" and state["stage"] in {"primary", "augmented"}):
                 raise ValueError("Run is not awaiting annotations")
-            known = {batch["batch_id"] for name in ("primary", "augmented")
+            known = {batch["batch_id"]: batch for name in ("primary", "augmented")
                      for batch in read_json(path / f"{name}_batches.json", [])}
+            ontology = read_json(path / "inputs.json")["config"]["ontology"]
+            from .processing import process_response
             existing = read_json(path / "responses.json", {})
             for key, value in responses.items():
                 if key not in known:
@@ -315,6 +332,9 @@ class ResearchPipeline:
                     raise ValueError("Annotation is immutable; create a new run for corrected source processing")
                 if (path / "processed" / f"{key}.json").exists() and key not in existing:
                     raise ValueError("Batch already processed by provider")
+                checked = process_response(value, known[key]["units"], ontology)
+                if checked["rejections"]:
+                    raise ValueError("Annotations could not be validated: " + checked["rejections"][0]["reason"])
             write_json(path / "responses.json", {**existing, **responses})
         return self.store.describe(run_id)
 

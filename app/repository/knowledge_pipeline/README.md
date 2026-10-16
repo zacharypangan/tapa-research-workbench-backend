@@ -42,6 +42,8 @@ Use the printed UUID as `RUN_ID`. `advance` ingests and processes until an expli
 
 Ollama mode reuses the Workbench's existing provider configuration and authorization helper. It sends structured extraction requests; it does not derive claims from headings or filenames. An unavailable configured provider preserves checkpoints and fails the current stage; unprocessed failed extraction batches can also receive submitted annotations before resume. Manual mode (the default) creates `primary_batches.json` and pauses at `awaiting_annotations`. Each batch includes exact unit IDs/text; `schema RUN_ID` prints the extraction response schema. Submit a JSON object keyed by batch ID using `annotate RUN_ID responses.json`, then `advance` again. Processed annotations are immutable; corrections require a new run.
 
+Rejected model output pauses the affected batch at `awaiting_annotations`, with its raw response and validation reasons preserved under `rejected_batches/`. It is never coerced into claims or counted as a successful empty extraction. Submit a validated annotation for that unprocessed batch and resume; rejected responses remain available for audit, and already valid batches retain their checkpoints.
+
 At `awaiting_frontier`, inspect `seeds.json`. Register URLs against those IDs:
 
 ```json

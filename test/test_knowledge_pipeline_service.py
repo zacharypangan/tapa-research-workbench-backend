@@ -185,6 +185,65 @@ class PipelineTests(unittest.TestCase):
         self.pipeline.submit_responses(run_id, {batch["batch_id"]: response_for(batch["units"])})
         self.assertEqual(self.advance(run_id)["status"], "awaiting_review")
 
+    def test_invalid_provider_batch_pauses_without_empty_graph_and_accepts_correction(self):
+        invalid = {"entities": [{"local_id": "E1", "label": "stone beater", "type": "ToolForm"}],
+                   "features": [], "assertions": []}
+        async def wrong_shape(units, ontology):
+            self.calls["model"] += 1
+            return {**process_response(invalid, units, ontology), "provider_response": invalid,
+                    "provider_metadata": {"method": "synthetic_invalid_provider"}}
+        self.pipeline.provider = wrong_shape
+        run_id = self.create(enabled=False)
+        state = self.advance(run_id)
+        path = self.store.path(run_id)
+        batch = read_json(path / "primary_batches.json")[0]
+        identifier = batch["batch_id"]
+        self.assertEqual(state["status"], "awaiting_annotations")
+        self.assertEqual(state["rejected_batch_ids"], [identifier])
+        self.assertFalse((path / "primary.json").exists())
+        self.assertFalse((path / "graph_input.json").exists())
+        self.assertFalse((path / "processed" / f"{identifier}.json").exists())
+        audit = read_json(path / "rejected_batches" / f"{identifier}.json")
+        self.assertEqual(audit["response"], invalid)
+        self.assertEqual(audit["validation"]["rejections"][0]["item_kind"], "batch")
+        self.assertEqual(self.advance(run_id)["status"], "awaiting_annotations")
+        self.assertEqual(self.calls["model"], 1)
+        with self.assertRaisesRegex(ValueError, "Annotations could not be validated"):
+            self.pipeline.submit_responses(run_id, {identifier: invalid})
+        self.assertFalse((path / "responses.json").exists())
+        self.pipeline.submit_responses(run_id, {identifier: response_for(batch["units"])})
+        self.assertEqual(self.advance(run_id)["status"], "awaiting_review")
+        graph = read_json(path / "graph_input.json")
+        self.assertEqual(len(graph["entities"]), 2)
+        self.assertEqual(len(graph["assertions"]), 1)
+        self.assertEqual(self.calls["model"], 1)
+        self.assertEqual(read_json(path / "rejected_batches" / f"{identifier}.json")["response"], invalid)
+
+    def test_rejected_web_batch_pauses_without_losing_valid_primary_checkpoint(self):
+        valid_provider = self.pipeline.provider
+        async def partly_invalid(units, ontology):
+            if units[0]["source_id"] != "WEB_FIXTURE":
+                return await valid_provider(units, ontology)
+            invalid = response_for(units)
+            invalid["entities"][0]["label_original"] = "unsupported hammer"
+            return {**process_response(invalid, units, ontology), "provider_response": invalid}
+        self.pipeline.provider = partly_invalid
+        run_id = self.create()
+        self.assertEqual(self.advance(run_id)["status"], "awaiting_frontier")
+        path = self.store.path(run_id)
+        primary = (path / "primary.json").read_bytes()
+        seed = read_json(path / "seeds.json")[0]["seed_id"]
+        self.pipeline.submit_frontier(run_id, [{"url": "https://example.org/fixture", "seed_ids": [seed]}], "fixture")
+        state = self.advance(run_id)
+        self.assertEqual(state["status"], "awaiting_annotations")
+        self.assertEqual(state["stage"], "augmented")
+        self.assertEqual((path / "primary.json").read_bytes(), primary)
+        self.assertFalse((path / "graph_input.json").exists())
+        batch = read_json(path / "augmented_batches.json")[0]
+        self.pipeline.submit_responses(run_id, {batch["batch_id"]: response_for(batch["units"])})
+        self.assertEqual(self.advance(run_id)["status"], "awaiting_review")
+        self.assertEqual((path / "primary.json").read_bytes(), primary)
+
 
 if __name__ == "__main__":
     unittest.main()
