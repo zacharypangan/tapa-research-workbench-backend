@@ -1,5 +1,17 @@
 # Deployment: Vercel Frontend + Railway Backend
 
+## Shared Workbench release branch
+
+The shared frontend URL is `https://tapa-research-workbench-frontend.vercel.app`.
+Use `codex/mvp-document-graphs` as the Vercel production branch and as the branch
+connected to the existing Railway `production` backend service. Keep its
+existing `/app/storage` volume and production API hostname:
+`https://tapa-research-workbench-backend-production.up.railway.app/api/v1`.
+Do not point the shared frontend at the empty staging repository. Check the
+existing material IDs before and after rollout, `/health`, and
+`/api/v1/research-runs/capabilities`. The graph workflow adds files beneath
+the existing repository storage root without a database migration.
+
 ## Document graph staging
 
 Use `codex/mvp-document-graphs` in both repositories. It starts from the hosted
