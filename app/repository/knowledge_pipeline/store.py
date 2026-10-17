@@ -149,15 +149,23 @@ class RunStore:
                 "augmentation_enabled": inputs["config"].get("augmentation", {}).get("enabled", False),
                 "max_pages": inputs["config"].get("augmentation", {}).get("max_pages", 5)}
 
-    def list_runs(self, limit: int = 20, offset: int = 0) -> dict:
+    def list_runs(self, limit: int = 20, offset: int = 0, material_id: str | None = None) -> dict:
         if not 1 <= limit <= 100 or not 0 <= offset <= 100000:
             raise ValueError("Run listing requires a limit of 1–100 and an offset of 0–100000")
+        if material_id is not None and (not isinstance(material_id, str) or not 1 <= len(material_id) <= 255 or "/" in material_id):
+            raise ValueError("Material ID must contain 1–255 characters without slashes")
         entries = []
         for path in self.root.iterdir():
             if not path.is_dir() or path.is_symlink():
                 continue
             try:
-                entries.append(self.summary(path.name))
+                summary = self.summary(path.name)
+                if material_id is not None and not any(
+                    document["locator"].startswith(f"workbench:material/{material_id}/file/")
+                    for document in summary["documents"]
+                ):
+                    continue
+                entries.append(summary)
             except (ValueError, FileNotFoundError):
                 # A concurrent create has no visible inputs until its atomic
                 # write completes; non-run storage entries are not listed.

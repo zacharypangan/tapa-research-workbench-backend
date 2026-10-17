@@ -98,6 +98,33 @@ class ResearchRunApiTests(unittest.TestCase):
         escaped = self.client.get(f"/api/v1/research-runs/{first['run_id']}/artifacts/%2E%2E/repository.sqlite")
         self.assertEqual(escaped.status_code, 404)
 
+    def test_material_filter_matches_exact_ids_before_pagination(self):
+        source = self.root / "document.txt"
+        source.write_text("A stone beater processes barkcloth.")
+        config = validate_config({"ontology": ONTOLOGY, "augmentation": {"enabled": False}})
+        def create_for(material_ids, title):
+            return self.scheduler.store.create([
+                {"path": source, "locator": f"workbench:material/{material_id}/file/file-1"}
+                for material_id in material_ids
+            ], config, "fixture", title=title)
+        first = create_for(["doc-1"], "First matching graph")
+        second = create_for(["other", "doc-1"], "Second matching graph")
+        create_for(["doc-10"], "Prefix must not match")
+        create_for(["unrelated"], "Newer unrelated graph")
+        endpoint = "/api/v1/research-runs"
+        page = self.client.get(endpoint, params={"material_id": "doc-1", "limit": 1}).json()
+        self.assertEqual(page["total"], 2)
+        self.assertEqual([item["run_id"] for item in page["items"]], [second["run_id"]])
+        page = self.client.get(endpoint, params={"material_id": "doc-1", "limit": 1, "offset": 1}).json()
+        self.assertEqual(page["total"], 2)
+        self.assertEqual([item["run_id"] for item in page["items"]], [first["run_id"]])
+        self.assertEqual(self.client.get(endpoint).json()["total"], 4)
+        self.assertEqual(self.client.get(endpoint, params={"material_id": "doc"}).json()["total"], 0)
+        for invalid in ("", "x" * 256, "doc-1/file"):
+            self.assertEqual(self.client.get(endpoint, params={"material_id": invalid}).status_code, 422)
+            with self.assertRaises(ValueError):
+                self.scheduler.store.list_runs(material_id=invalid)
+
     def test_capabilities_reuse_hosted_model_configuration_without_secrets(self):
         with patch.object(repository, "ai_chat_configured", return_value=True), patch.object(research_runs, "find_spec", return_value=object()):
             capabilities = self.client.get("/api/v1/research-runs/capabilities")

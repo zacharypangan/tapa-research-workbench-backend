@@ -119,8 +119,9 @@ async def create_run(body: RunCreate, idempotency_key: str | None = Header(defau
 
 
 @router.get("")
-def list_runs(limit: int = Query(default=20, ge=1, le=100), offset: int = Query(default=0, ge=0, le=100000)):
-    return pipeline_for().store.list_runs(limit, offset)
+def list_runs(limit: int = Query(default=20, ge=1, le=100), offset: int = Query(default=0, ge=0, le=100000),
+              material_id: str | None = Query(default=None, min_length=1, max_length=255, pattern=r"^[^/]+$")):
+    return pipeline_for().store.list_runs(limit, offset, material_id=material_id)
 
 
 @router.get("/capabilities")
