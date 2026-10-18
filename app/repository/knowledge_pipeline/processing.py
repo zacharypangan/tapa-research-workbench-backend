@@ -644,9 +644,10 @@ def _parse_json(text: str) -> dict:
 
 class ExtractionProviderError(RuntimeError):
     """Safe public error with private per-attempt diagnostics for checkpointing."""
-    def __init__(self, message: str, attempts: list[dict]):
+    def __init__(self, message: str, attempts: list[dict], *, output_format_only: bool = False):
         super().__init__(message)
         self.attempts = attempts
+        self.output_format_only = output_format_only
 
 
 def _remap_evidence_units(response: Any, mapping: dict[str, str]) -> Any:
@@ -781,7 +782,7 @@ async def call_ollama(units: list[dict], ontology: dict, base_url: str, model: s
         body["format"] = schema
     endpoint_base = _string(base_url, "base_url").rstrip("/")
     endpoint = endpoint_base + ("/chat" if endpoint_base.endswith("/api") else "/api/chat")
-    attempts, last_error, final_result, parsed, content, provider = [], None, None, None, "", {}
+    attempts, last_error, selected = [], None, None
     async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=15.0), follow_redirects=False) as client:
         for number in range(1, MAX_PROVIDER_ATTEMPTS + 1):
             if number > 1:
@@ -798,6 +799,12 @@ async def call_ollama(units: list[dict], ontology: dict, base_url: str, model: s
                     provider = response.json()
                 except (ValueError, TypeError):
                     raise RuntimeError("Extraction provider returned malformed JSON") from None
+                if isinstance(provider, dict):
+                    for key in ("total_duration", "load_duration", "prompt_eval_count", "prompt_eval_duration", "eval_count", "eval_duration"):
+                        if type(provider.get(key)) is int and provider[key] >= 0:
+                            audit[key] = provider[key]
+                    if isinstance(provider.get("done_reason"), str) and provider["done_reason"] in {"stop", "length", "load", "unload"}:
+                        audit["done_reason"] = provider["done_reason"]
                 if not isinstance(provider, dict) or provider.get("done") is not True:
                     raise RuntimeError("Extraction provider response was incomplete")
                 message = provider.get("message")
@@ -811,10 +818,13 @@ async def call_ollama(units: list[dict], ontology: dict, base_url: str, model: s
                     provider_parsed = _parse_json(content)
                     parsed = _remap_evidence_units(provider_parsed, aliases)
                 except (ValueError, TypeError):
+                    audit["failure_category"] = "invalid_output_json"
                     raise RuntimeError("Extraction provider content was not strict JSON") from None
                 final_result = process_response(parsed, units, ontology)
                 audit["validation"] = copy.deepcopy(final_result)
                 audit["response"] = parsed
+                selected = {"result": final_result, "response": parsed, "content": content,
+                            "attempt": number, "audit": audit}
                 attempts.append(audit)
                 if not final_result["rejections"]:
                     break
@@ -845,22 +855,33 @@ async def call_ollama(units: list[dict], ontology: dict, base_url: str, model: s
                     ]
             if not transient:
                 break
-    if final_result is None or not attempts[-1].get("validation"):
-        raise ExtractionProviderError(last_error or "Extraction provider failed", attempts)
-    result = final_result
+    # A real provider/auth/network failure still aborts. A later format repair
+    # cannot erase the last strictly parsed, independently validated candidate.
+    trailing_attempts = attempts[selected["attempt"]:] if selected else []
+    if selected is None or any(attempt.get("http_status") != 200 or (
+            "error" in attempt and attempt.get("failure_category") != "invalid_output_json") for attempt in trailing_attempts):
+        output_only = bool(attempts) and all(attempt.get("http_status") == 200
+                    and attempt.get("failure_category") == "invalid_output_json" for attempt in attempts)
+        raise ExtractionProviderError(last_error or "Extraction provider failed", attempts, output_format_only=output_only)
+    result, parsed, content, audit = selected["result"], selected["response"], selected["content"], selected["audit"]
     metadata = {
         "provider": "ollama", "model": model, "prompt_version": PROMPT_VERSION,
         "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
-        "schema_sha256": _hash(schema), "request_sha256": attempts[-1]["request_sha256"],
+        "schema_sha256": _hash(schema), "request_sha256": audit["request_sha256"],
         "response_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
         "structured_response_sha256": _hash(parsed), "ontology_sha256": _hash(ontology),
         "structured_output": capability["structured_output"], "schema_enforced": False,
         "attempt_count": len(attempts), "max_attempts": MAX_PROVIDER_ATTEMPTS,
+        "selected_attempt": selected["attempt"], "fallback_to_validated_attempt": selected["attempt"] != len(attempts),
         "evidence_unit_aliases": aliases,
     }
+    if metadata["fallback_to_validated_attempt"]:
+        metadata["fallback_reason"] = "later_attempts_contained_invalid_output_json"
     for key in ("total_duration", "load_duration", "prompt_eval_count", "prompt_eval_duration", "eval_count", "eval_duration"):
-        if type(provider.get(key)) is int and provider[key] >= 0:
-            metadata[key] = provider[key]
+        if key in audit:
+            metadata[key] = audit[key]
+    if "done_reason" in audit:
+        metadata["done_reason"] = audit["done_reason"]
     result["provider_metadata"] = metadata
     result["provider_response"] = parsed
     result["provider_attempts"] = attempts

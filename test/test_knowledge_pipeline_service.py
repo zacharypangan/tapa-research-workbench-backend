@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from app.repository.knowledge_pipeline.adapters import ingest_document
-from app.repository.knowledge_pipeline.processing import process_response
+from app.repository.knowledge_pipeline.processing import process_response, ExtractionProviderError
 from app.repository.knowledge_pipeline.service import ResearchPipeline, batches_for, blocking_stage, validate_config
 from app.repository.knowledge_pipeline.store import RunStore, digest, file_hash, read_json, write_json
 
@@ -112,6 +112,51 @@ class PipelineTests(unittest.TestCase):
             self.pipeline.submit_responses(run_id, {batch["batch_id"]: {"entities": [], "assertions": []}})
         self.assertEqual(self.advance(run_id)["status"], "awaiting_review")
         self.assertEqual(self.calls, {"model": 0, "web": 0})
+
+    def test_malformed_provider_batch_keeps_later_source_candidates_and_rejection_audit(self):
+        for failures, expected_calls in ((1, 3), (2, 2)):
+            with self.subTest(failures=failures):
+                run_id = self.create(enabled=False)
+                path = self.store.path(run_id)
+                documents = [ingest_document(self.document, f"SOURCE_{index}", "Fixture", path / f"fixture-{index}")
+                             for index in range(3)]
+                units = [unit for item in documents for unit in item["units"]]
+                write_json(path / "ingest.json", {"sources": [item["source"] for item in documents], "units": units})
+                calls = []
+                async def provider(source_units, ontology):
+                    calls.append(source_units[0]["source_id"])
+                    if len(calls) <= failures:
+                        raise ExtractionProviderError("Invalid candidate JSON", [{"attempt": 1, "http_status": 200,
+                            "failure_category": "invalid_output_json", "raw_content": '{"entities":'}], output_format_only=True)
+                    response = response_for(source_units)
+                    return {**process_response(response, source_units, ontology), "provider_response": response}
+                self.pipeline.provider = provider
+                config = read_json(path / "inputs.json")["config"]
+                self.assertIsNone(asyncio.run(self.pipeline._process(path, "primary", units, config)))
+                self.assertEqual(len(calls), expected_calls)
+                state = read_json(path / "state.json")
+                self.assertEqual(state["status"], "awaiting_annotations")
+                self.assertEqual(state["provider_format_budget_reached"], failures == 2)
+                preview = read_json(path / "validated_preview.json")
+                self.assertEqual(len(preview["entities"]), 4 if failures == 1 else 0)
+                self.assertTrue(preview["partial_extraction"])
+                rejected = list((path / "rejected_batches").glob("*.json"))
+                self.assertEqual(len(rejected), failures)
+                self.assertIsNone(read_json(rejected[0])["response"])
+                self.assertEqual(read_json(rejected[0])["validation"]["rejections"][0]["reason"], "provider_output_not_strict_json")
+                self.assertTrue(list((path / "provider_attempts").glob("*/attempt-01.json")))
+
+    def test_global_provider_error_still_aborts_instead_of_becoming_empty_graph(self):
+        run_id = self.create(enabled=False)
+        async def provider(units, ontology):
+            raise ExtractionProviderError("Extraction provider returned HTTP 401", [{"attempt": 1, "http_status": 401}])
+        self.pipeline.provider = provider
+        with self.assertRaises(ExtractionProviderError):
+            self.advance(run_id)
+        path = self.store.path(run_id)
+        self.assertEqual(read_json(path / "state.json")["status"], "failed")
+        self.assertFalse((path / "validated_preview.json").exists())
+        self.assertTrue(list((path / "provider_attempts").glob("*/attempt-01.json")))
 
     def test_derived_retry_revalidates_completed_primary_response_without_provider_work(self):
         parent = self.create(enabled=False)

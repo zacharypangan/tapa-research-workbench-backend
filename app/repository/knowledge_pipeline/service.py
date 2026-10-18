@@ -201,7 +201,9 @@ class ResearchPipeline:
         self.store.state(path, "running", stage)
         responses = read_json(path / "responses.json", {})
         missing, outputs = [], []
-        for batch in batches:
+        format_failure_streak = 0
+        format_budget_reached = False
+        for batch_index, batch in enumerate(batches):
             identifier = batch["batch_id"]
             checkpoint = path / "processed" / f"{identifier}.json"
             if checkpoint.exists():
@@ -225,15 +227,28 @@ class ResearchPipeline:
                 output, response, metadata = reused
                 write_json(path / "provider_responses" / f"{identifier}.json", response)
             elif config["processing"]["mode"] == "ollama" and self.provider:
+                response = None
                 try:
                     output = await self.provider(batch["units"], config["ontology"])
                 except ExtractionProviderError as exc:
                     for attempt in exc.attempts:
                         write_json(path / "provider_attempts" / identifier / f"attempt-{attempt['attempt']:02d}.json", attempt)
-                    raise
+                    if not exc.output_format_only:
+                        raise
+                    # A completed HTTP-200 response with malformed candidate
+                    # JSON rejects this batch; it does not invalidate another
+                    # source's evidence. Repeated format failures stop the pass.
+                    output = {"entities": [], "assertions": [], "evidence": [],
+                              "rejections": [{"item_kind": "batch", "reason": "provider_output_not_strict_json"}]}
+                    metadata = {"method": "provider_output_rejected", "attempt_count": len(exc.attempts),
+                                "failure_category": "invalid_output_json", "ontology_sha256": digest(config["ontology"])}
+                    response = None
+                    format_failure_streak += 1
+                else:
+                    format_failure_streak = 0
                 for attempt in output.pop("provider_attempts", []):
                     write_json(path / "provider_attempts" / identifier / f"attempt-{attempt['attempt']:02d}.json", attempt)
-                metadata = output.pop("provider_metadata", {})
+                metadata = output.pop("provider_metadata", metadata)
                 response = output.pop("provider_response", None)
                 if response is not None:
                     write_json(path / "provider_responses" / f"{identifier}.json", response)
@@ -249,6 +264,10 @@ class ResearchPipeline:
                 write_json(rejected, {"validation": output, "response": response,
                                       "processing_metadata": metadata})
                 missing.append(identifier)
+                if format_failure_streak >= 2:
+                    format_budget_reached = True
+                    missing.extend(item["batch_id"] for item in batches[batch_index + 1:])
+                    break
                 continue
             write_json(checkpoint, output)
             outputs.append(output)
@@ -265,7 +284,9 @@ class ResearchPipeline:
                             if (path / "rejected_batches" / f"{identifier}.json").exists()]
             self.store.state(path, "awaiting_annotations", stage, missing_batch_ids=missing,
                              rejected_batch_ids=rejected_ids,
-                             detail="Extraction could not be validated. Add source-grounded annotations; original responses and rejection reasons are saved under rejected_batches/."
+                             provider_format_budget_reached=format_budget_reached,
+                             detail="Two consecutive batches returned malformed candidate JSON; provider work stopped for this pass. Correct rejected batches or retry with corrected provider settings; remaining batches are preserved."
+                             if format_budget_reached else "Extraction could not be validated. Add source-grounded annotations; original responses and rejection reasons are saved under rejected_batches/."
                              if rejected_ids else "Submit source-grounded annotations or configure the existing Ollama runtime")
             return None
         result = merge_outputs(outputs)

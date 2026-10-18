@@ -28,6 +28,7 @@ def representation_signature() -> dict:
     source = Path(__file__).read_bytes()
     adapters = Path(__file__).parent / "knowledge_pipeline" / "adapters.py"
     source += adapters.read_bytes() if adapters.exists() else b""
+    source += (Path(__file__).parent / "pdf_workers.py").read_bytes()
     packages = {}
     for package in ("PyMuPDF", "pypdf", "pytesseract", "Pillow"):
         try:
@@ -132,6 +133,11 @@ def _write_json(path: Path, value: dict, *, immutable: bool = False):
 
 
 def _parse_pdf(path: Path, runtime: dict, page_cache: Path | None = None) -> tuple[list, list, dict]:
+    from .pdf_workers import run_pdf_operation
+    return run_pdf_operation("parse", str(path), runtime, str(page_cache) if page_cache is not None else None)
+
+
+def _parse_pdf_native(path: Path, runtime: dict, page_cache: Path | None = None) -> tuple[list, list, dict]:
     units, warnings, unreadable = [], [], []
     ocr_attempted = 0
     import fitz

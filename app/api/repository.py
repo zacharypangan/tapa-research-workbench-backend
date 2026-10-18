@@ -2135,6 +2135,15 @@ def material_image_dir(material_id: str, file_id: str):
 
 
 def extract_images_from_pdf(file_path: str, material_id: str, file_id: str, source_locator: str):
+    from app.repository.pdf_workers import run_pdf_operation
+    try:
+        images, warnings = run_pdf_operation("images", str(file_path), material_id, file_id, source_locator, str(IMAGES_ROOT))
+        return [ImageEvidenceInput(**image) for image in images], warnings
+    except Exception as exc:
+        return [], [f"PDF image extraction failed for `{source_locator}`: {type(exc).__name__}."]
+
+
+def _extract_images_from_pdf_native(file_path: str, material_id: str, file_id: str, source_locator: str, images_root: str):
     images: list[ImageEvidenceInput] = []
     warnings: list[str] = []
     seen_fingerprints: set[str] = set()
@@ -2142,95 +2151,95 @@ def extract_images_from_pdf(file_path: str, material_id: str, file_id: str, sour
     try:
         import fitz
 
-        image_dir = material_image_dir(material_id, file_id)
-        doc = fitz.open(file_path)
+        image_dir = os.path.join(images_root, material_id, file_id)
+        os.makedirs(image_dir, exist_ok=True)
+        with fitz.open(file_path) as doc:
 
-        if doc.page_count > 1000:
-            warnings.append(f"{source_locator}: image extraction page budget reached (1000 of {doc.page_count}).")
-        for page_index in range(min(doc.page_count, 1000)):
-            if len(images) >= 3000:
-                warnings.append(f"{source_locator}: image extraction budget reached (3000); remaining pages omitted.")
-                break
-            page = doc.load_page(page_index)
-            page_number = page_index + 1
-            page_text = clean_extracted_text(page.get_text("text") or "")
-
-            for image_index, image_info in enumerate(page.get_images(full=True), start=1):
+            if doc.page_count > 1000:
+                warnings.append(f"{source_locator}: image extraction page budget reached (1000 of {doc.page_count}).")
+            for page_index in range(min(doc.page_count, 1000)):
                 if len(images) >= 3000:
+                    warnings.append(f"{source_locator}: image extraction budget reached (3000); remaining pages omitted.")
                     break
-                xref = image_info[0]
-                extracted = doc.extract_image(xref)
-                image_bytes = extracted.get("image")
-                ext = extracted.get("ext") or "png"
-                if not image_bytes:
-                    continue
+                page = doc.load_page(page_index)
+                page_number = page_index + 1
+                page_text = clean_extracted_text(page.get_text("text") or "")
 
-                image_id = str(uuid.uuid4())
-                image_path = os.path.join(image_dir, f"{image_id}.{ext}")
-                with open(image_path, "wb") as f:
-                    f.write(image_bytes)
-                width, height = image_dimensions(image_path)
-                if width < 120 or height < 120 or not is_informative_image(image_path):
-                    remove_file_quietly(image_path)
-                    continue
-                fingerprint = image_fingerprint(image_path)
-                if is_duplicate_fingerprint(fingerprint, seen_fingerprints):
-                    remove_file_quietly(image_path)
-                    duplicate_count += 1
-                    continue
-                if fingerprint:
-                    seen_fingerprints.add(fingerprint)
-                images.append(
-                    ImageEvidenceInput(
-                        file_id=file_id,
-                        evidence_type="document_image",
-                        source_kind="file_pdf_image",
-                        source_locator=source_locator,
-                        page_ref=f"page:{page_number}.image:{image_index}",
-                        page_index=page_number,
-                        image_path=image_path,
-                        mime_type=f"image/{'jpeg' if ext.lower() == 'jpg' else ext.lower()}",
-                        width=width,
-                        height=height,
-                        extraction_method="pdf_embedded_image",
-                        fingerprint=fingerprint,
+                for image_index, image_info in enumerate(page.get_images(full=True), start=1):
+                    if len(images) >= 3000:
+                        break
+                    xref = image_info[0]
+                    extracted = doc.extract_image(xref)
+                    image_bytes = extracted.get("image")
+                    ext = extracted.get("ext") or "png"
+                    if not image_bytes:
+                        continue
+
+                    image_id = str(uuid.uuid4())
+                    image_path = os.path.join(image_dir, f"{image_id}.{ext}")
+                    with open(image_path, "wb") as f:
+                        f.write(image_bytes)
+                    width, height = image_dimensions(image_path)
+                    if width < 120 or height < 120 or not is_informative_image(image_path):
+                        remove_file_quietly(image_path)
+                        continue
+                    fingerprint = image_fingerprint(image_path)
+                    if is_duplicate_fingerprint(fingerprint, seen_fingerprints):
+                        remove_file_quietly(image_path)
+                        duplicate_count += 1
+                        continue
+                    if fingerprint:
+                        seen_fingerprints.add(fingerprint)
+                    images.append(
+                        ImageEvidenceInput(
+                            file_id=file_id,
+                            evidence_type="document_image",
+                            source_kind="file_pdf_image",
+                            source_locator=source_locator,
+                            page_ref=f"page:{page_number}.image:{image_index}",
+                            page_index=page_number,
+                            image_path=image_path,
+                            mime_type=f"image/{'jpeg' if ext.lower() == 'jpg' else ext.lower()}",
+                            width=width,
+                            height=height,
+                            extraction_method="pdf_embedded_image",
+                            fingerprint=fingerprint,
+                        )
                     )
-                )
 
-            if len(page_text) < 80 and len(images) < 3000:
-                image_id = str(uuid.uuid4())
-                image_path = os.path.join(image_dir, f"{image_id}_page_{page_number}.png")
-                pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
-                pix.save(image_path)
-                width, height = image_dimensions(image_path)
-                if width < 120 or height < 120 or not is_informative_image(image_path):
-                    remove_file_quietly(image_path)
-                    continue
-                fingerprint = image_fingerprint(image_path)
-                if is_duplicate_fingerprint(fingerprint, seen_fingerprints):
-                    remove_file_quietly(image_path)
-                    duplicate_count += 1
-                    continue
-                if fingerprint:
-                    seen_fingerprints.add(fingerprint)
-                images.append(
-                    ImageEvidenceInput(
-                        file_id=file_id,
-                        evidence_type="page_snapshot",
-                        source_kind="file_pdf_page_snapshot",
-                        source_locator=source_locator,
-                        page_ref=f"page:{page_number}.snapshot",
-                        page_index=page_number,
-                        image_path=image_path,
-                        mime_type="image/png",
-                        width=width,
-                        height=height,
-                        extraction_method="pdf_page_snapshot_text_poor",
-                        fingerprint=fingerprint,
+                if len(page_text) < 80 and len(images) < 3000:
+                    image_id = str(uuid.uuid4())
+                    image_path = os.path.join(image_dir, f"{image_id}_page_{page_number}.png")
+                    pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+                    pix.save(image_path)
+                    width, height = image_dimensions(image_path)
+                    if width < 120 or height < 120 or not is_informative_image(image_path):
+                        remove_file_quietly(image_path)
+                        continue
+                    fingerprint = image_fingerprint(image_path)
+                    if is_duplicate_fingerprint(fingerprint, seen_fingerprints):
+                        remove_file_quietly(image_path)
+                        duplicate_count += 1
+                        continue
+                    if fingerprint:
+                        seen_fingerprints.add(fingerprint)
+                    images.append(
+                        ImageEvidenceInput(
+                            file_id=file_id,
+                            evidence_type="page_snapshot",
+                            source_kind="file_pdf_page_snapshot",
+                            source_locator=source_locator,
+                            page_ref=f"page:{page_number}.snapshot",
+                            page_index=page_number,
+                            image_path=image_path,
+                            mime_type="image/png",
+                            width=width,
+                            height=height,
+                            extraction_method="pdf_page_snapshot_text_poor",
+                            fingerprint=fingerprint,
+                        )
                     )
-                )
 
-        doc.close()
     except Exception as exc:
         warnings.append(f"PDF image extraction failed for `{source_locator}`: {str(exc)}")
     if duplicate_count:

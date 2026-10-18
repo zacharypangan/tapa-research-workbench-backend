@@ -19,6 +19,9 @@ class DocumentRepresentationTests(unittest.TestCase):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+        # OCR unit fixtures exercise the native parser with local mocks. Real
+        # spawned-process behavior is covered independently in test_pdf_workers.
+        self.stack.enter_context(patch.object(representation, "_parse_pdf", side_effect=representation._parse_pdf_native))
 
     def pdf(self, name="scan.pdf", text=None):
         import fitz

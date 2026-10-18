@@ -15,6 +15,7 @@ from app.repository.knowledge_pipeline.processing import (
     repair_feedback,
     provider_capabilities,
     process_response,
+    ExtractionProviderError,
 )
 
 
@@ -276,6 +277,56 @@ class AlignmentTests(unittest.TestCase):
 
 
 class OllamaTests(unittest.IsolatedAsyncioTestCase):
+    async def test_later_malformed_repair_preserves_matching_validated_candidate_and_audit(self):
+        partial = {"entities": [
+            {"local_id": "good", "entity_type": "ToolForm", "label_original": "stone beater",
+             "evidence": [{"unit_id": "U1", "span_id": "S1"}]},
+            {"local_id": "bad", "entity_type": "ToolForm", "label_original": "absent tool",
+             "evidence": [{"unit_id": "U1", "span_id": "S1"}]},
+        ], "assertions": []}
+        contents = ['{"entities":', json.dumps(partial), '{"entities":[']
+        requests = []
+        def transport(request):
+            requests.append(request)
+            index = len(requests) - 1
+            return httpx.Response(200, json={"done": True, "done_reason": "stop" if index == 1 else "length",
+                "eval_count": 100 + index, "prompt_eval_count": 200, "private": "SECRET",
+                "message": {"content": contents[index]}})
+        client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
+        with patch("app.repository.knowledge_pipeline.processing.httpx.AsyncClient", return_value=client), \
+                patch("app.repository.knowledge_pipeline.processing.RETRY_DELAYS", (0, 0)):
+            result = await call_ollama([unit()], ONTOLOGY, "https://ollama.com/api", "fixture")
+        self.assertEqual(len(result["entities"]), 1)
+        self.assertTrue(result["rejections"])
+        metadata = result["provider_metadata"]
+        self.assertEqual(metadata["selected_attempt"], 2)
+        self.assertEqual(metadata["response_sha256"], hashlib.sha256(contents[1].encode()).hexdigest())
+        self.assertEqual(metadata["eval_count"], 101)
+        self.assertEqual(metadata["done_reason"], "stop")
+        self.assertEqual(metadata["fallback_reason"], "later_attempts_contained_invalid_output_json")
+        self.assertEqual(result["provider_response"]["entities"][0]["evidence"][0]["unit_id"], "u1")
+        self.assertEqual(result["provider_attempts"][2]["done_reason"], "length")
+        self.assertEqual(result["provider_attempts"][2]["eval_count"], 102)
+        self.assertNotIn("SECRET", json.dumps(result))
+
+    async def test_all_malformed_candidates_are_typed_but_provider_failure_is_not_hidden(self):
+        partial = {"entities": [{"local_id": "bad", "entity_type": "ToolForm", "label_original": "absent tool",
+                                 "evidence": [{"unit_id": "U1", "span_id": "S1"}]}], "assertions": []}
+        for statuses in ((200, 200, 200), (200, 401)):
+            requests = []
+            def transport(request):
+                requests.append(request)
+                index = len(requests) - 1
+                content = json.dumps(partial) if len(statuses) == 2 else '{"entities":'
+                return httpx.Response(statuses[index], json={"done": True, "message": {"content": content}})
+            client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
+            with patch("app.repository.knowledge_pipeline.processing.httpx.AsyncClient", return_value=client), \
+                    patch("app.repository.knowledge_pipeline.processing.RETRY_DELAYS", (0, 0)):
+                with self.assertRaises(ExtractionProviderError) as raised:
+                    await call_ollama([unit()], ONTOLOGY, "https://ollama.com/api", "fixture")
+            self.assertEqual(raised.exception.output_format_only, len(statuses) == 3)
+            self.assertEqual(len(raised.exception.attempts), len(statuses))
+
     async def test_short_unit_aliases_round_trip_only_exact_registered_addresses(self):
         source_id = "PAPER:" + "a" * 64 + ":unit:" + "b" * 64
         source = unit("A stone beater was found.", source_id)
