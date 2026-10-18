@@ -208,6 +208,14 @@ class ResearchPipeline:
             write_json(checkpoint, output)
             outputs.append(output)
         if missing:
+            if name == "primary":
+                partial = outputs + [read_json(path / "validated_candidates" / f"{batch['batch_id']}.json")
+                                     for batch in batches if (path / "validated_candidates" / f"{batch['batch_id']}.json").exists()
+                                     and not (path / "processed" / f"{batch['batch_id']}.json").exists()]
+                safe = merge_outputs(partial)
+                write_json(path / "validated_preview.json", {**safe,
+                    "sources": read_json(path / "ingest.json", {}).get("sources", []), "alignments": [],
+                    "partial_extraction": True, "pending_batch_count": len(missing)})
             rejected_ids = [identifier for identifier in missing
                             if (path / "rejected_batches" / f"{identifier}.json").exists()]
             self.store.state(path, "awaiting_annotations", stage, missing_batch_ids=missing,
