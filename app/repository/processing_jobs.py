@@ -19,6 +19,13 @@ STAGES = ("extract", "graph", "text_index", "image_index")
 _scheduler = None
 
 
+class ProcessingStageError(RuntimeError):
+    """Stage failure that distinguishes a retry from a configuration correction."""
+    def __init__(self, message, *, retryable=True):
+        super().__init__(message)
+        self.retryable = retryable
+
+
 def stamp():
     return datetime.now(timezone.utc).isoformat()
 
@@ -131,6 +138,25 @@ class ProcessingScheduler:
                 continue
         return sorted(jobs, key=lambda job: job["created_at"], reverse=True)
 
+    def resolve(self, job_id):
+        seen = set()
+        original = self.get(job_id)
+        job = original
+        for _ in range(20):
+            if job["job_id"] in seen:
+                raise ValueError("Preparation replacement chain contains a cycle")
+            seen.add(job["job_id"])
+            if job["status"] != "superseded" or not job.get("replacement_job_id"):
+                return job
+            job = self.get(job["replacement_job_id"])
+            if job.get("material_id") != original.get("material_id"):
+                raise ValueError("Preparation replacement belongs to another source")
+        raise ValueError("Preparation replacement chain exceeds limit")
+
+    def current_for(self, material_id):
+        jobs = self.list_for(material_id)
+        return self.resolve(jobs[0]["job_id"]) if jobs else None
+
     def enqueue_group(self, material_ids, stages, force=False):
         children = [self.enqueue(material_id, stages, force)["job_id"] for material_id in material_ids]
         job_id = str(uuid.uuid5(uuid.NAMESPACE_URL, digest(children)))
@@ -143,13 +169,19 @@ class ProcessingScheduler:
         return self.get(job_id)
 
     def retry(self, job_id):
-        job = self.get(job_id)
-        if job["status"] == "superseded" and job.get("replacement_job_id"):
-            return self.retry(job["replacement_job_id"])
+        job = self.resolve(job_id)
         if job["status"] in {"running", "queued"}:
             return job
+        if job.get("kind") == "group":
+            for child in job["child_job_ids"]:
+                if self.resolve(child)["status"] == "error":
+                    self.retry(child)
+        elif "image_index" in job.get("stages", []):
+            from app.api.repository import clear_image_description_failure_guard
+            clear_image_description_failure_guard()
         changes = {"completed_stages": {}} if job["status"] == "done" else {}
-        job = self.update(job_id, status="queued", attempts=0, error=None, detail="Retrying unfinished stages", **changes)
+        job = self.update(job["job_id"], status="queued", attempts=0, error=None,
+                          stage_errors={}, retryable=None, detail="Retrying unfinished stages", **changes)
         self.wake()
         return job
 
@@ -195,14 +227,7 @@ class ProcessingScheduler:
     async def process(self, job_id):
         job = self.get(job_id)
         if job.get("kind") == "group":
-            children = []
-            for child_id in job["child_job_ids"]:
-                child = self.get(child_id)
-                for _ in range(10):
-                    if child["status"] != "superseded" or not child.get("replacement_job_id"):
-                        break
-                    child = self.get(child["replacement_job_id"])
-                children.append(child)
+            children = [self.resolve(child_id) for child_id in job["child_job_ids"]]
             statuses = [child["status"] for child in children]
             status = "error" if any(value in {"error", "superseded"} for value in statuses) else "done" if all(value == "done" for value in statuses) else "queued"
             self.update(job_id, status=status, result={"completed": statuses.count("done"), "total": len(children)})
@@ -229,6 +254,10 @@ class ProcessingScheduler:
                 for stage in job["stages"]:
                     if stage in completed:
                         continue
+                    if job["attempts"] > 1 and stage_errors.get(stage, {}).get("retryable") is False:
+                        # Other transient stages may retry; this one needs a user
+                        # correction/explicit retry instead of another identical call.
+                        continue
                     if await asyncio.to_thread(material_inputs, job["material_id"]) != job["inputs"]:
                         replacement = await asyncio.to_thread(self.enqueue, job["material_id"], job["stages"])
                         self.update(job_id, status="superseded", replacement_job_id=replacement["job_id"])
@@ -245,7 +274,8 @@ class ProcessingScheduler:
                             pass
                         raise
                     except Exception as exc:
-                        stage_errors[stage] = {"error": type(exc).__name__, "detail": str(exc)[:500]}
+                        stage_errors[stage] = {"error": type(exc).__name__, "detail": str(exc)[:500],
+                                               "retryable": getattr(exc, "retryable", True)}
                         self.update(job_id, stage_errors=stage_errors)
                         if stage == "extract":
                             raise
@@ -259,17 +289,19 @@ class ProcessingScheduler:
                     replacement = await asyncio.to_thread(self.enqueue, job["material_id"], job["stages"])
                     self.update(job_id, status="superseded", replacement_job_id=replacement["job_id"])
                 elif stage_errors:
-                    raise RuntimeError("Stages need retry: " + ", ".join(stage_errors))
+                    retryable = any(error.get("retryable", True) for error in stage_errors.values())
+                    raise ProcessingStageError("Stages need attention: " + ", ".join(stage_errors), retryable=retryable)
                 else:
                     self.update(job_id, status="done", stage="complete", finished_at=stamp(),
-                                error=None, detail=None, stage_errors={})
+                                error=None, detail=None, stage_errors={}, retryable=None)
             except asyncio.CancelledError:
                 self.update(job_id, status="queued", detail="Restart interrupted preparation; completed stages are saved")
                 raise
             except Exception as exc:
                 # Retry transient provider failures using already saved per-item outputs.
-                status = "queued" if job["attempts"] < 3 else "error"
-                self.update(job_id, status=status, error=type(exc).__name__, detail=str(exc)[:500])
+                retryable = getattr(exc, "retryable", True)
+                status = "queued" if retryable and job["attempts"] < 3 else "error"
+                self.update(job_id, status=status, error=type(exc).__name__, detail=str(exc)[:500], retryable=retryable)
                 LOG.warning("Document preparation failed: job=%s stage=%s error=%s", job_id, stage if 'stage' in locals() else 'inputs', type(exc).__name__)
                 if status == "queued":
                     await asyncio.sleep(min(2 ** job["attempts"], 8))
@@ -331,17 +363,27 @@ class ProcessingScheduler:
                 scheduler.wake()
             return {"run_id": run["run_id"], "status": run["status"], "review_required": True}
         if not repo.ai_embedding_configured():
-            raise RuntimeError("Embedding provider is not configured; extracted text and graph drafts remain available")
+            raise ProcessingStageError("Embedding provider is not configured; extracted text and graph drafts remain available", retryable=False)
         operation = repo.index_missing_segment_embeddings if stage == "text_index" else repo.index_missing_image_embeddings
         progress = self.get(job["job_id"]).get("stage_progress", {}).get(stage, {})
         total, skipped = progress.get("indexed_count", 0), progress.get("skipped_count", 0)
-        failed_ids = set()
+        failed_ids, failed_retryability, error_counts = set(), {}, {}
         for batch in range(100):
             with repo.get_connection() as connection:
                 result = await operation(connection, material_id=material_id, limit=200, force=False, skip_ids=failed_ids)
             total += result.get("indexed_count", 0)
             skipped += result.get("skipped_count", 0)
             failed_ids.update(result.get("failed_ids", []))
+            for outcome in result.get("outcomes", []):
+                if outcome.get("status") != "failed":
+                    continue
+                item_id = outcome.get("id")
+                if item_id is not None:
+                    failed_retryability[item_id] = outcome.get("retryable", True) is not False
+                category = outcome.get("error_category", "processing_error")
+                http_status = outcome.get("http_status")
+                key = (category, http_status, outcome.get("retryable", True) is not False)
+                error_counts[key] = error_counts.get(key, 0) + 1
             with (self.root / (job["job_id"] + "." + stage + ".outcomes.jsonl")).open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps({"at": stamp(), "outcomes": result.get("outcomes", [])}, ensure_ascii=False) + "\n")
             stage_progress = self.get(job["job_id"]).get("stage_progress", {})
@@ -349,10 +391,14 @@ class ProcessingScheduler:
                                      "pending_count": result.get("pending_count"),
                                      "failed_count": len(failed_ids),
                                      "failed_ids": sorted(failed_ids, key=str),
+                                     "error_summary": [{"error_category": category, "http_status": status,
+                                                        "retryable": retryable, "count": count}
+                                                       for (category, status, retryable), count in error_counts.items()],
                                      "batch": batch + 1, "last_outcomes": result.get("outcomes", [])[-20:]}
             self.update(job["job_id"], stage_progress=stage_progress)
             if failed_ids and (not result.get("outcomes") or result.get("pending_count", 0) <= len(failed_ids)):
-                raise RuntimeError(f"{stage}: {len(failed_ids)} item(s) need retry; other eligible items were processed")
+                raise ProcessingStageError(f"{stage}: {len(failed_ids)} item(s) need retry or correction; other eligible items were processed",
+                                           retryable=any(failed_retryability.get(item, True) for item in failed_ids))
             if not result.get("pending_count", result.get("indexed_count", 0)):
                 return {**result, "total_indexed_count": total}
             if result.get("indexed_count", 0) == 0 and result.get("skipped_count", 0) == 0 and not result.get("failed_count", 0):

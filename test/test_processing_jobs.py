@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.repository.processing_jobs import ProcessingScheduler
+from app.repository.processing_jobs import ProcessingScheduler, ProcessingStageError
 
 
 class PreparationJobTests(unittest.TestCase):
@@ -125,6 +125,89 @@ class PreparationJobTests(unittest.TestCase):
         retried = scheduler.retry(job["job_id"])
         self.assertEqual(retried["status"], "queued")
         self.assertEqual(retried["attempts"], 0)
+
+    def test_permanent_stage_failure_stops_automatic_retry_and_explicit_retry_probes(self):
+        calls = []
+        async def runner(stage, job):
+            calls.append(stage)
+            raise ProcessingStageError("Provider HTTP 404 needs configuration correction", retryable=False)
+        scheduler = ProcessingScheduler(self.root, stage_runner=runner)
+        job = scheduler.enqueue("fixture", ("text_index",))
+        asyncio.run(scheduler.process(job["job_id"]))
+        final = scheduler.get(job["job_id"])
+        self.assertEqual(final["status"], "error")
+        self.assertFalse(final["retryable"])
+        self.assertEqual(final["attempts"], 1)
+        self.assertFalse(asyncio.run(scheduler.process(job["job_id"])))
+        self.assertEqual(calls, ["text_index"])
+        retried = scheduler.retry(job["job_id"])
+        self.assertEqual(retried["stage_errors"], {})
+        asyncio.run(scheduler.process(job["job_id"]))
+        self.assertEqual(calls, ["text_index", "text_index"])
+
+    def test_permanent_stage_is_skipped_while_other_transient_stage_recovers(self):
+        calls = []
+        async def runner(stage, job):
+            calls.append(stage)
+            if stage == "text_index":
+                raise ProcessingStageError("Missing embedding model", retryable=False)
+            if calls.count("image_index") == 1:
+                raise ProcessingStageError("Rate limited", retryable=True)
+            return {"synthetic": True}
+        scheduler = ProcessingScheduler(self.root, stage_runner=runner)
+        job = scheduler.enqueue("fixture", ("text_index", "image_index"))
+        with patch("app.repository.processing_jobs.asyncio.sleep", return_value=None):
+            asyncio.run(scheduler.process(job["job_id"]))
+            self.assertEqual(scheduler.get(job["job_id"])["status"], "queued")
+            asyncio.run(scheduler.process(job["job_id"]))
+        self.assertEqual(calls, ["text_index", "image_index", "image_index"])
+        final = scheduler.get(job["job_id"])
+        self.assertEqual(final["status"], "error")
+        self.assertFalse(final["retryable"])
+        self.assertEqual(set(final["stage_errors"]), {"text_index"})
+
+    def test_index_permanent_outcomes_are_aggregated_without_automatic_retry(self):
+        scheduler = ProcessingScheduler(self.root)
+        job = scheduler.enqueue("fixture", ("text_index",))
+        result = {"indexed_count": 0, "pending_count": 2, "failed_count": 2, "failed_ids": [1, 2],
+                  "outcomes": [{"id": item, "status": "failed", "error_category": "provider_http_error",
+                                "http_status": 404, "retryable": False} for item in [1, 2]]}
+        with patch("app.api.repository.ai_embedding_configured", return_value=True), \
+                patch("app.api.repository.get_connection", return_value=MagicMock()), \
+                patch("app.api.repository.index_missing_segment_embeddings", AsyncMock(return_value=result)):
+            with self.assertRaises(ProcessingStageError) as caught:
+                asyncio.run(scheduler.run_stage("text_index", job))
+        self.assertFalse(caught.exception.retryable)
+        summary = scheduler.get(job["job_id"])["stage_progress"]["text_index"]["error_summary"]
+        self.assertEqual(summary, [{"error_category": "provider_http_error", "http_status": 404, "retryable": False, "count": 2}])
+
+    def test_current_status_and_retry_follow_replacement_with_older_timestamp(self):
+        scheduler = ProcessingScheduler(self.root)
+        original = scheduler.enqueue("fixture", ("text_index",))
+        newer = scheduler.enqueue("fixture", ("text_index",), force=True)
+        scheduler.update(original["job_id"], status="error")
+        scheduler.update(newer["job_id"], status="superseded", replacement_job_id=original["job_id"])
+        self.assertEqual(scheduler.current_for("fixture")["job_id"], original["job_id"])
+        self.assertEqual(scheduler.retry(newer["job_id"])["job_id"], original["job_id"])
+        scheduler.update(original["job_id"], status="superseded", replacement_job_id=newer["job_id"])
+        with self.assertRaisesRegex(ValueError, "cycle"):
+            scheduler.current_for("fixture")
+
+    def test_retry_group_requeues_failed_children(self):
+        scheduler = ProcessingScheduler(self.root)
+        with patch("app.repository.processing_jobs.material_inputs", side_effect=lambda material: {**self.inputs, "material_id": material}):
+            group = scheduler.enqueue_group(["fixture", "other"], ("text_index",))
+        child, completed = group["child_job_ids"]
+        checkpoint = {"text_index": {"finished_at": "saved", "result": {"synthetic": True}}}
+        scheduler.update(completed, status="done", completed_stages=checkpoint)
+        scheduler.update(child, status="error", stage_errors={"text_index": {"retryable": False}})
+        asyncio.run(scheduler.process(group["job_id"]))
+        self.assertEqual(scheduler.get(group["job_id"])["status"], "error")
+        scheduler.retry(group["job_id"])
+        self.assertEqual(scheduler.get(child)["status"], "queued")
+        self.assertEqual(scheduler.get(child)["stage_errors"], {})
+        self.assertEqual(scheduler.get(completed)["status"], "done")
+        self.assertEqual(scheduler.get(completed)["completed_stages"], checkpoint)
 
     def test_new_upload_supersedes_old_plan(self):
         calls = []

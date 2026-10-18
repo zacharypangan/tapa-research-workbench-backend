@@ -29,8 +29,11 @@ def material_processing(material_id: str):
     with repository.get_connection() as connection:
         repository.ensure_material(connection, material_id)
         coverage = repository.embedding_coverage(connection, material_id=material_id)
-    jobs = get_processing_scheduler().list_for(material_id)
-    return {"material_id": material_id, "job": jobs[0] if jobs else None, "coverage": coverage}
+    try:
+        job = get_processing_scheduler().current_for(material_id)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(422, "Preparation replacement could not be resolved") from exc
+    return {"material_id": material_id, "job": job, "coverage": coverage}
 
 
 @router.get("/processing-jobs/{job_id}")

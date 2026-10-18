@@ -149,6 +149,46 @@ class ResearchPipeline:
     def __init__(self, store: RunStore, provider=None, collector=None):
         self.store, self.provider, self.collector = store, provider, collector
 
+    def _reuse_primary_batch(self, path: Path, batch: dict, config: dict):
+        """Revalidate a parent's completed primary response; never copy acceptance."""
+        from .processing import process_response
+        try:
+            inputs = read_json(path / "inputs.json")
+            if not inputs.get("parent_run_id"):
+                return None
+            parent = self.store.path(inputs["parent_run_id"])
+            original = read_json(parent / "inputs.json")
+            if (inputs["documents"] != original["documents"]
+                    or digest(config["ontology"]) != original["ontology_sha256"]):
+                return None
+            identifier = batch["batch_id"]
+            checkpoint = parent / "processed" / f"{identifier}.json"
+            response_path = parent / "provider_responses" / f"{identifier}.json"
+            if (not checkpoint.is_file() or not response_path.is_file()
+                    or (parent / "rejected_batches" / f"{identifier}.json").exists()):
+                return None
+            previous = read_json(checkpoint)
+            old_batch = next((item for item in read_json(parent / "primary_batches.json", [])
+                              if item.get("batch_id") == identifier), None)
+            if old_batch != batch or previous.get("rejections"):
+                return None
+            response = read_json(response_path)
+            output = process_response(response, batch["units"], config["ontology"])
+            # Changed validation behavior cannot silently alter the old candidate
+            # set. Any discrepancy falls back to a fresh extraction/repair.
+            if output["rejections"] or any(output[key] != previous.get(key) for key in ("entities", "assertions", "evidence")):
+                return None
+            metadata = copy.deepcopy(previous["processing_metadata"])
+            metadata["response_reuse"] = {"reused_from_run_id": parent.name,
+                "parent_response_sha256": file_hash(response_path), "parent_checkpoint_sha256": file_hash(checkpoint),
+                "revalidated_implementation_sha256": {key: inputs.get("implementation_sha256", {}).get(key)
+                                                       for key in ("processing.py", "service.py")},
+                "revalidated_pipeline_version": inputs["pipeline_version"],
+                "revalidated_at": now(), "validation": "unchanged_source_ontology_and_candidate_output"}
+            return output, response, metadata
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
+
     async def _process(self, path: Path, name: str, units: list[dict], config: dict) -> dict | None:
         from .processing import process_response, ExtractionProviderError
 
@@ -174,10 +214,15 @@ class ResearchPipeline:
                 missing.append(identifier)
                 continue
             metadata = {"method": "submitted_annotation", "ontology_sha256": digest(config["ontology"])}
+            reused = (self._reuse_primary_batch(path, batch, config)
+                      if name == "primary" and config["processing"]["mode"] == "ollama" and identifier not in responses else None)
             if identifier in responses:
                 response = responses[identifier]
                 output = process_response(response, batch["units"], config["ontology"])
                 metadata["response_sha256"] = digest(response)
+                write_json(path / "provider_responses" / f"{identifier}.json", response)
+            elif reused is not None:
+                output, response, metadata = reused
                 write_json(path / "provider_responses" / f"{identifier}.json", response)
             elif config["processing"]["mode"] == "ollama" and self.provider:
                 try:

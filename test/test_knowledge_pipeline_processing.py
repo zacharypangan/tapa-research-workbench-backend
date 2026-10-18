@@ -276,6 +276,80 @@ class AlignmentTests(unittest.TestCase):
 
 
 class OllamaTests(unittest.IsolatedAsyncioTestCase):
+    async def test_short_unit_aliases_round_trip_only_exact_registered_addresses(self):
+        source_id = "PAPER:" + "a" * 64 + ":unit:" + "b" * 64
+        source = unit("A stone beater was found.", source_id)
+        selected = {"entities": [{"local_id": "x", "entity_type": "ToolForm", "label_original": "stone beater",
+                                  "evidence": [{"unit_id": "U1", "span_id": "S1"}]}], "assertions": []}
+        requests = []
+        def transport(request):
+            requests.append(json.loads(request.content))
+            return httpx.Response(200, json={"done": True, "message": {"content": json.dumps(selected)}})
+        client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
+        with patch("app.repository.knowledge_pipeline.processing.httpx.AsyncClient", return_value=client):
+            result = await call_ollama([source], ONTOLOGY, "https://ollama.com/api", "fixture")
+        prompt = requests[0]["messages"][1]["content"]
+        self.assertIn('"unit_id":"U1"', prompt)
+        self.assertNotIn(source_id, prompt)
+        self.assertEqual(result["rejections"], [])
+        self.assertEqual(result["evidence"][0]["unit_id"], source_id)
+        self.assertEqual(result["provider_response"]["entities"][0]["evidence"][0]["unit_id"], source_id)
+        self.assertEqual(result["provider_metadata"]["evidence_unit_aliases"], {"U1": source_id})
+        self.assertEqual(json.loads(result["provider_attempts"][0]["raw_content"]), selected)
+        # Neither a mistyped address nor a corrupted canonical hash is guessed.
+        for unknown in ("U01", source_id[:-1] + "c"):
+            selected["entities"][0]["evidence"][0]["unit_id"] = unknown
+            client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
+            with patch("app.repository.knowledge_pipeline.processing.httpx.AsyncClient", return_value=client), \
+                    patch("app.repository.knowledge_pipeline.processing.RETRY_DELAYS", (0, 0)):
+                result = await call_ollama([source], ONTOLOGY, "https://ollama.com/api", "fixture")
+            self.assertEqual(result["entities"], [])
+            self.assertEqual(result["rejections"][0]["reason"], "unknown evidence unit_id")
+
+    async def test_aliases_cannot_shadow_original_unit_ids(self):
+        sources = [unit("A stone beater was found.", "U2"), unit("A wooden paddle was nearby.", "U1")]
+        value = {"entities": [{"local_id": "x", "entity_type": "ToolForm", "label_original": "stone beater",
+                               "evidence": [{"unit_id": "U1x", "span_id": "S1"}]}], "assertions": []}
+        client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(
+            200, json={"done": True, "message": {"content": json.dumps(value)}})))
+        with patch("app.repository.knowledge_pipeline.processing.httpx.AsyncClient", return_value=client):
+            result = await call_ollama(sources, ONTOLOGY, "https://ollama.com/api", "fixture")
+        self.assertEqual(result["rejections"], [])
+        self.assertEqual(result["evidence"][0]["unit_id"], "U2")
+
+    def test_repair_feedback_exposes_original_spacing_and_endpoint_unit_requirements(self):
+        sources = [unit("石 拍 用于制作。", "zh1"), unit("永乐遗址发现石 拍。", "zh2")]
+        value = {"entities": [
+            {"local_id": "x", "entity_type": "ToolForm", "label_original": "石拍", "evidence": [{"unit_id": "zh1", "span_id": "S1"}]},
+            {"local_id": "p", "entity_type": "Place", "label_original": "永乐遗址", "evidence": [{"unit_id": "zh2", "span_id": "S1"}]},
+        ], "assertions": []}
+        hints = repair_feedback(value, process_response(value, sources, ONTOLOGY), sources)
+        self.assertEqual(hints[0]["matching_source_spans"], [])
+        self.assertEqual(hints[0]["selected_source_spans"][0]["text"], sources[0]["text"])
+        self.assertIn("OCR spaces", hints[0]["original_wording_rule"])
+        self.assertEqual(process_response(value, sources, ONTOLOGY)["entities"][0]["local_id"], "p")
+        # A relation lacking a shared unit is still rejected; hints only describe
+        # the existing endpoints and never manufacture an evidence selection.
+        value["entities"][0]["label_original"] = "石 拍"
+        value["assertions"] = [{"local_id": "a", "subject": "x", "object": "p", "predicate": "has_definition",
+                                "scope": {}, "polarity": "positive", "epistemic_kind": "source_report",
+                                "rationale": "Proposed relation", "evidence": [{"unit_id": "zh2", "span_id": "S1"}]}]
+        checked = process_response(value, sources, ONTOLOGY)
+        hints = repair_feedback(value, checked, sources)
+        self.assertEqual(checked["assertions"], [])
+        self.assertEqual(hints[0]["referenced_entities"][0]["selected_unit_ids"], ["zh1"])
+        self.assertEqual(hints[0]["referenced_entities"][1]["selected_unit_ids"], ["zh2"])
+        self.assertIn("not only separate mentions", hints[0]["relationship_rule"])
+
+    def test_malformed_evidence_or_references_do_not_break_repair_feedback(self):
+        value = {"entities": [{"local_id": "x", "entity_type": "ToolForm", "label_original": "stone beater",
+                               "evidence": [{"unit_id": {}, "span_id": "S1"}]}],
+                 "assertions": [{"local_id": "a", "subject": [], "object": {}}]}
+        hints = repair_feedback(value, process_response(value, [unit()], ONTOLOGY), [unit()])
+        self.assertEqual(len(hints), 2)
+        self.assertEqual(hints[0]["selected_source_spans"], [])
+        self.assertEqual(hints[1]["referenced_entities"], [])
+
     async def test_repair_hints_fix_wrong_span_without_bypassing_grounding(self):
         units = [unit("A stone beater was found. A wooden paddle was nearby.")]
         invalid = {"entities": [{"local_id": "x", "entity_type": "ToolForm", "label_original": "stone beater",

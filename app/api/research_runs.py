@@ -176,6 +176,7 @@ def get_capabilities():
                        "label": "Collect from linked public web pages",
                        "detail": "Public web pages must be linked to concepts from your documents." if collection_available
                        else "Web collection needs the approved BeautifulSoup runtime in the worker environment."},
+        "image_description": repository.image_description_diagnostics(),
         "supported_formats": ["pdf", "txt", "md", "json", "docx"],
         "retry": {"creates_derived_run": True, "preserves_original": True},
         "ontology_templates": ONTOLOGY_TEMPLATES,

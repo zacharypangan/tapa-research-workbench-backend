@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 import httpx
 
 
-PROMPT_VERSION = "source-local-extraction-v4-grounded-repair"
+PROMPT_VERSION = "source-local-extraction-v5-addressable-evidence"
 MAX_PROVIDER_ATTEMPTS = 3
 RETRY_DELAYS = (1.0, 2.0)
 POLARITIES = ("positive", "negative", "uncertain")
@@ -612,9 +612,11 @@ def extraction_prompt(units: list[dict], ontology: dict) -> str:
         "Extract only source-supported candidates. Use unique local IDs and declared entity types and predicates. "
         "Keep labels/aliases in original wording and quote exact contiguous substrings with unit_id. "
         "Before returning an entity, check that its label_original occurs in at least one of its OWN selected spans, not merely somewhere else in the document. "
+        "Copy original wording including OCR-inserted spaces; do not silently join Chinese characters, complete abbreviated names or normalize names in label_original. "
         "A span ID is local to its unit_id: copy both from the same supplied unit. Put translations only in label_en, never in label_original or aliases. "
         "Do not invent entities or relations from general knowledge. "
         "Each assertion needs its own quote and must use exactly one entity object or literal value. Preserve negative and uncertain wording, author interpretations and source attribution. "
+        "Each referenced entity must cite at least one unit also cited by that assertion. Select the actual relationship passage and supported endpoint mentions; co-occurrence alone does not establish a relationship. "
         + ("Obey predicate subject/object type restrictions and required case_id scope; case_id must reference a local ProductionCase. "
          if "ProductionCase" in ontology["entity_types"] else "Obey predicate subject/object type restrictions. Leave scope empty unless an explicit source-supported qualification is needed; never add an undeclared entity type. ")
         + "Do not infer barkcloth function from stone-beater classification, plant species from genus/family, production place from museum location, or coordinates from place names. "
@@ -647,6 +649,23 @@ class ExtractionProviderError(RuntimeError):
         self.attempts = attempts
 
 
+def _remap_evidence_units(response: Any, mapping: dict[str, str]) -> Any:
+    """Resolve only exact registered request aliases, never fuzzy or guessed IDs."""
+    result = copy.deepcopy(response)
+    if not isinstance(result, dict):
+        return result
+    for kind in ("entities", "assertions"):
+        if not isinstance(result.get(kind), list):
+            continue
+        for item in result[kind]:
+            if not isinstance(item, dict) or not isinstance(item.get("evidence"), list):
+                continue
+            for selection in item["evidence"]:
+                if isinstance(selection, dict) and isinstance(selection.get("unit_id"), str):
+                    selection["unit_id"] = mapping.get(selection["unit_id"], selection["unit_id"])
+    return result
+
+
 def repair_feedback(response: dict, validation: dict, units: list[dict]) -> list[dict]:
     """Point to source-supported selections without changing or accepting a proposal.
 
@@ -655,30 +674,67 @@ def repair_feedback(response: dict, validation: dict, units: list[dict]) -> list
     The subsequent provider response must still pass the unchanged validator.
     """
     feedback = []
+    spans_by_unit = {unit["unit_id"]: evidence_spans(unit) for unit in units}
+    entities = response.get("entities", []) if isinstance(response, dict) else []
+    indexed_entities = {item["local_id"]: item for item in entities
+                        if isinstance(item, dict) and isinstance(item.get("local_id"), str)} if isinstance(entities, list) else {}
+
+    def selections_for(entity: dict, limit: int = 3) -> list[dict]:
+        selections = []
+        label = entity.get("label_original")
+        if isinstance(label, str) and label.strip():
+            for unit in units:
+                for span in spans_by_unit[unit["unit_id"]]:
+                    if _lexical_support(label, [span]):
+                        selections.append({"unit_id": unit["unit_id"], "span_id": span["span_id"], "text": span["text"]})
+                        if len(selections) == limit:
+                            return selections
+        return selections
+
     for rejection in validation["rejections"][:20]:
         item = {key: value for key, value in rejection.items()
                 if key in {"reason", "item_kind", "local_id", "index"}}
         index = rejection.get("index")
-        entities = response.get("entities", []) if isinstance(response, dict) else []
         if (rejection.get("item_kind") == "entity" and type(index) is int
                 and isinstance(entities, list) and 0 <= index < len(entities)
                 and isinstance(entities[index], dict)):
             label = entities[index].get("label_original")
             if isinstance(label, str) and label.strip():
-                selections = []
-                for unit in units:
-                    for span in evidence_spans(unit):
-                        if _lexical_support(label, [span]):
-                            selections.append({"unit_id": unit["unit_id"], "span_id": span["span_id"],
-                                               "text": span["text"]})
-                            if len(selections) == 3:
-                                break
-                    if len(selections) == 3:
-                        break
+                selections = selections_for(entities[index])
                 item["label_original"] = label[:300]
                 item["matching_source_spans"] = selections
                 item["hint_status"] = ("lexical_candidates_only_choose_if_context_supports_entity" if selections else
                                        "no_single_matching_span_check_original_wording_and_source")
+                selected = []
+                evidence = entities[index].get("evidence", [])
+                for selection in evidence if isinstance(evidence, list) else []:
+                    if not isinstance(selection, dict) or not isinstance(selection.get("unit_id"), str):
+                        continue
+                    for span in spans_by_unit.get(selection.get("unit_id"), []):
+                        if span["span_id"] == selection.get("span_id"):
+                            selected.append({"unit_id": selection["unit_id"], "span_id": span["span_id"], "text": span["text"]})
+                    if len(selected) >= 3:
+                        break
+                item["selected_source_spans"] = selected[:3]
+                item["original_wording_rule"] = "Copy source wording including OCR spaces; do not rewrite the source to fit a proposed label."
+        assertions = response.get("assertions", []) if isinstance(response, dict) else []
+        if (rejection.get("item_kind") == "assertion" and type(index) is int
+                and isinstance(assertions, list) and 0 <= index < len(assertions)
+                and isinstance(assertions[index], dict)):
+            referenced = []
+            for side in ("subject", "object"):
+                reference = assertions[index].get(side)
+                entity = indexed_entities.get(reference) if isinstance(reference, str) else None
+                if entity is not None:
+                    evidence = entity.get("evidence", [])
+                    referenced.append({"side": side, "local_id": entity["local_id"],
+                                       "label_original": entity.get("label_original"),
+                                       "selected_unit_ids": sorted({selection["unit_id"] for selection in evidence
+                                            if isinstance(selection, dict) and isinstance(selection.get("unit_id"), str)
+                                            and selection["unit_id"] in spans_by_unit}) if isinstance(evidence, list) else [],
+                                       "matching_source_spans": selections_for(entity, 2)})
+            item["referenced_entities"] = referenced
+            item["relationship_rule"] = "Each endpoint must have evidence in a unit cited by this claim; select a passage supporting the relationship, not only separate mentions."
         feedback.append(item)
     return feedback
 
@@ -697,7 +753,19 @@ def provider_capabilities(base_url: str) -> dict:
 
 async def call_ollama(units: list[dict], ontology: dict, base_url: str, model: str, headers: dict | None = None) -> dict:
     """Bounded best-effort extraction. Repairs never bypass the evidence validator."""
-    prompt = extraction_prompt(units, ontology)
+    _units(units)
+    aliases = {}
+    original_ids = {unit["unit_id"] for unit in units}
+    for index, unit in enumerate(units, 1):
+        alias = f"U{index}"
+        while alias in original_ids:
+            alias += "x"
+        aliases[alias] = unit["unit_id"]
+    reverse_aliases = {unit_id: alias for alias, unit_id in aliases.items()}
+    # Long content-addressed IDs proved easy to corrupt in real-paper responses.
+    # Short request-local addresses resolve exactly before the unchanged validator.
+    prompt_units = [{**unit, "unit_id": reverse_aliases[unit["unit_id"]]} for unit in units]
+    prompt = extraction_prompt(prompt_units, ontology)
     schema = extraction_schema(ontology)
     model = _string(model, "model")
     capability = provider_capabilities(base_url)
@@ -718,7 +786,7 @@ async def call_ollama(units: list[dict], ontology: dict, base_url: str, model: s
         for number in range(1, MAX_PROVIDER_ATTEMPTS + 1):
             if number > 1:
                 await asyncio.sleep(RETRY_DELAYS[number - 2])
-            audit = {"attempt": number, "request_sha256": _hash(body)}
+            audit = {"attempt": number, "request_sha256": _hash(body), "evidence_unit_aliases": aliases}
             transient = True
             try:
                 response = await client.post(endpoint, json=body, headers=headers or {})
@@ -740,7 +808,8 @@ async def call_ollama(units: list[dict], ontology: dict, base_url: str, model: s
                     raise RuntimeError("Extraction provider content exceeded response limit")
                 audit["raw_content"] = content
                 try:
-                    parsed = _parse_json(content)
+                    provider_parsed = _parse_json(content)
+                    parsed = _remap_evidence_units(provider_parsed, aliases)
                 except (ValueError, TypeError):
                     raise RuntimeError("Extraction provider content was not strict JSON") from None
                 final_result = process_response(parsed, units, ontology)
@@ -750,7 +819,7 @@ async def call_ollama(units: list[dict], ontology: dict, base_url: str, model: s
                 if not final_result["rejections"]:
                     break
                 last_error = "Extraction provider candidates failed source validation"
-                feedback = repair_feedback(parsed, final_result, units)
+                feedback = repair_feedback(provider_parsed, final_result, prompt_units)
                 # A fresh bounded repair request retains the immutable source. Invalid
                 # candidate text remains explicitly untrusted and cannot add evidence.
                 body["messages"] = body["messages"][:2] + [
@@ -787,6 +856,7 @@ async def call_ollama(units: list[dict], ontology: dict, base_url: str, model: s
         "structured_response_sha256": _hash(parsed), "ontology_sha256": _hash(ontology),
         "structured_output": capability["structured_output"], "schema_enforced": False,
         "attempt_count": len(attempts), "max_attempts": MAX_PROVIDER_ATTEMPTS,
+        "evidence_unit_aliases": aliases,
     }
     for key in ("total_duration", "load_duration", "prompt_eval_count", "prompt_eval_duration", "eval_count", "eval_duration"):
         if type(provider.get(key)) is int and provider[key] >= 0:

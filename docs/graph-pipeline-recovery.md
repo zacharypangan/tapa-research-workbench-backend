@@ -14,7 +14,9 @@ Implemented 19 October 2026. This is an implementation contract; candidate valid
 
 ## Public API
 
-The `source-local-extraction-v4-grounded-repair` prompt checks that an original label appears in its own selected evidence span. Bounded repair feedback includes at most three lexically matching registered spans for each of at most twenty rejected entities. These are selection hints, not accepted facts or automatic corrections. Original responses, rejection reasons and later attempts remain in the audit; the exact-evidence validator is unchanged.
+The `source-local-extraction-v5-addressable-evidence` prompt uses short request-local unit addresses with an exact audited mapping to immutable IDs. An original label must appear in its own selected evidence, including original OCR spacing. Repair feedback includes bounded matching/selected source spans and endpoint-unit hints for relationships. These are selection hints, not accepted facts or automatic corrections. Original responses, mappings, rejection reasons and attempts remain in the audit; the validator is unchanged.
+
+Derived retries may reuse a parent's completed primary response only when document descriptors, ontology, batch and units are identical and current validation produces identical entities, assertions and evidence. Original provider metadata remain with explicit reuse provenance, parent response/checkpoint hashes and current implementation hashes. Any mismatch/rejection uses normal extraction. Rejected parent batches and web augmentation do not qualify.
 
 - `POST /api/v1/research-runs` accepts the existing config plus:
   ```json

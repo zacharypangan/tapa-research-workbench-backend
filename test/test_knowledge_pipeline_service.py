@@ -9,7 +9,7 @@ from pathlib import Path
 from app.repository.knowledge_pipeline.adapters import ingest_document
 from app.repository.knowledge_pipeline.processing import process_response
 from app.repository.knowledge_pipeline.service import ResearchPipeline, batches_for, blocking_stage, validate_config
-from app.repository.knowledge_pipeline.store import RunStore, digest, read_json
+from app.repository.knowledge_pipeline.store import RunStore, digest, file_hash, read_json, write_json
 
 
 ONTOLOGY = {"version": "test-1", "entity_types": {"ToolForm": {}, "MaterialKind": {}},
@@ -112,6 +112,67 @@ class PipelineTests(unittest.TestCase):
             self.pipeline.submit_responses(run_id, {batch["batch_id"]: {"entities": [], "assertions": []}})
         self.assertEqual(self.advance(run_id)["status"], "awaiting_review")
         self.assertEqual(self.calls, {"model": 0, "web": 0})
+
+    def test_derived_retry_revalidates_completed_primary_response_without_provider_work(self):
+        parent = self.create(enabled=False)
+        self.assertEqual(self.advance(parent)["status"], "awaiting_review")
+        child = self.store.derive(parent, "researcher")["run_id"]
+        self.assertEqual(self.advance(child)["status"], "awaiting_review")
+        self.assertEqual(self.calls["model"], 1)
+        parent_path, child_path = self.store.path(parent), self.store.path(child)
+        batch = read_json(parent_path / "primary_batches.json")[0]["batch_id"]
+        previous = read_json(parent_path / "processed" / f"{batch}.json")
+        current = read_json(child_path / "processed" / f"{batch}.json")
+        for key in ("entities", "assertions", "evidence"):
+            self.assertEqual(previous[key], current[key])
+        metadata = current["processing_metadata"]
+        self.assertEqual(metadata["method"], previous["processing_metadata"]["method"])
+        self.assertEqual(metadata["response_reuse"]["reused_from_run_id"], parent)
+        self.assertEqual(metadata["response_reuse"]["parent_response_sha256"], file_hash(parent_path / "provider_responses" / f"{batch}.json"))
+        self.assertEqual(metadata["response_reuse"]["revalidated_implementation_sha256"],
+                         {key: file_hash(Path(__file__).parents[1] / "app/repository/knowledge_pipeline" / key)
+                          for key in ("processing.py", "service.py")})
+        self.assertEqual(read_json(parent_path / "provider_responses" / f"{batch}.json"),
+                         read_json(child_path / "provider_responses" / f"{batch}.json"))
+
+    def test_derived_retry_does_not_reuse_rejected_primary_batch(self):
+        valid_provider = self.pipeline.provider
+        async def invalid_provider(units, ontology):
+            self.calls["model"] += 1
+            response = response_for(units)
+            response["entities"][0]["label_original"] = "unsupported hammer"
+            return {**process_response(response, units, ontology), "provider_response": response}
+        self.pipeline.provider = invalid_provider
+        parent = self.create(enabled=False)
+        self.assertEqual(self.advance(parent)["status"], "awaiting_annotations")
+        self.pipeline.provider = valid_provider
+        child = self.store.derive(parent, "researcher")["run_id"]
+        self.assertEqual(self.advance(child)["status"], "awaiting_review")
+        self.assertEqual(self.calls["model"], 2)
+        checkpoint = next((self.store.path(child) / "processed").glob("*.json"))
+        self.assertNotIn("response_reuse", read_json(checkpoint)["processing_metadata"])
+
+    def test_derived_retry_does_not_reuse_same_batch_with_changed_input_identity(self):
+        parent = self.create(enabled=False)
+        self.advance(parent)
+        child = self.store.derive(parent, "researcher", source_metadata={"document.txt": {"filename": "changed-original-name.txt"}})["run_id"]
+        self.assertEqual(self.advance(child)["status"], "awaiting_review")
+        self.assertEqual(read_json(self.store.path(parent) / "primary_batches.json"), read_json(self.store.path(child) / "primary_batches.json"))
+        self.assertEqual(self.calls["model"], 2)
+
+    def test_derived_retry_falls_back_when_fresh_validation_changes_candidates(self):
+        parent = self.create(enabled=False)
+        self.advance(parent)
+        checkpoint = next((self.store.path(parent) / "processed").glob("*.json"))
+        previous = read_json(checkpoint)
+        previous["entities"][0]["review_status"] = "unexpected_legacy_status"
+        write_json(checkpoint, previous)
+        child = self.store.derive(parent, "researcher")["run_id"]
+        self.assertEqual(self.advance(child)["status"], "awaiting_review")
+        self.assertEqual(self.calls["model"], 2)
+        current = read_json(self.store.path(child) / "processed" / checkpoint.name)
+        self.assertNotIn("response_reuse", current["processing_metadata"])
+        self.assertTrue(all(entity["review_status"] == "needs_specialist_review" for entity in current["entities"]))
 
     def test_idempotency_snapshot_and_tenant_isolation(self):
         run_id = self.create(key="request-1")
