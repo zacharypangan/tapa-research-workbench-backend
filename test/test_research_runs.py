@@ -309,3 +309,49 @@ class SchedulerLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(run["run_id"], recovered.pending())
             self.assertTrue(await recovered.process(run["run_id"]))
             self.assertEqual(store.describe(run["run_id"])["status"], "awaiting_annotations")
+
+    async def test_two_consumers_allow_short_run_beside_long_run_without_duplicates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            doc = root / "doc.txt"
+            doc.write_text("A stone beater processes barkcloth.")
+            store = RunStore(root / "runs", SHARED_WORKSPACE)
+            runs = [store.create([{"path": doc}], validate_config({"ontology": ONTOLOGY,
+                "augmentation": {"enabled": False}}), "fixture")["run_id"] for _ in range(4)]
+            entered, short_done, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+            active, max_active, calls = set(), 0, []
+            class WaitingPipeline:
+                async def run(self, run_id):
+                    nonlocal max_active
+                    calls.append(run_id)
+                    active.add(run_id)
+                    max_active = max(max_active, len(active))
+                    try:
+                        if run_id == runs[0]:
+                            entered.set()
+                            await release.wait()
+                        else:
+                            await entered.wait()
+                            short_done.set()
+                            await asyncio.sleep(0.01)
+                    finally:
+                        active.remove(run_id)
+            scheduler = GraphScheduler(store, pipeline_factory=lambda target: WaitingPipeline(), poll_seconds=0.01)
+            for run in runs:
+                scheduler.enqueue(run)
+            scheduler.start()
+            try:
+                await asyncio.wait_for(short_done.wait(), 2)
+                self.assertIn(runs[0], active)
+                self.assertEqual(max_active, 2)
+                release.set()
+                for _ in range(100):
+                    if not scheduler.pending():
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertCountEqual(calls, runs)
+                self.assertEqual(len(calls), len(set(calls)))
+                self.assertEqual(max_active, 2)
+            finally:
+                await scheduler.stop()
+            self.assertFalse(active)

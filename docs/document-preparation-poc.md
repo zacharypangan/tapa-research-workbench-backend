@@ -93,6 +93,8 @@ PDF native text, page rendering/OCR and image extraction now run in at most two 
 
 The current-paper v5 run exposed a repair-selection bug: a malformed third response discarded an earlier parsed response with visible validation rejections and aborted later batches. The implementation now preserves that response with matching hashes and selected-attempt metadata; fully malformed batches have explicit rejection records and a two-consecutive-batch stop budget. See [graph recovery](graph-pipeline-recovery.md). This improves failure isolation, not scientific recall or acceptance.
 
+Graph scheduling now uses two bounded consumers per API process so a short document can proceed beside a long corpus run. Existing per-run execution locks prevent duplicate processing across consumers/processes; cancellation requeues each interrupted run. OCR-only image vectors validate their saved description model against current image bytes/context, so changing the vision model preserves unchanged OCR/observation retrieval while full caption readiness remains pending. Changed image bytes, context or indexed transcription still invalidate retrieval. Focused fixtures cover these boundaries.
+
 Staged v5 diagnostics confirmed the configured model is `llava`, absent from the public cloud catalog at verification time. No environment setting was changed by the code rollout.
 
 ### Read-only audit for any saved document graph

@@ -335,6 +335,30 @@ class RepositoryIndexingTests(unittest.TestCase):
                 self.assertEqual(replay["processed_image_count"], 0)
                 self.assertEqual(caption.await_count, 2)
 
+    def test_ocr_vector_survives_vision_model_change_but_not_changed_image_or_text(self):
+        self.image("stone beater OCR")
+        with repository.get_connection() as con:
+            con.execute("UPDATE image_evidence SET visual_caption = ''")
+            con.commit()
+        with patch.object(repository, "is_informative_image", return_value=True), \
+                patch.object(repository, "request_image_caption", new=AsyncMock(return_value="")), \
+                patch.object(repository, "request_embedding", new=AsyncMock(return_value=[1., 0.])) as embed:
+            with repository.get_connection() as con:
+                asyncio.run(repository.index_missing_image_embeddings(con))
+                with patch.object(repository, "OLLAMA_VISION_MODEL", "corrected-vision-model"):
+                    self.assertEqual(repository.embedding_coverage(con)["ocr_only_searchable_image_count"], 1)
+                    found = asyncio.run(repository.search_image_evidence(MultimodalSearchRequest(query="stone beater"), query_embedding=[1., 0.]))
+                    self.assertEqual([item["image_id"] for item in found["image_results"]], ["image"])
+                    self.assertEqual(found["image_results"][0]["description_status"], "failed")
+                    con.execute("UPDATE image_evidence SET ocr_text = 'corrected transcription'")
+                    con.commit()
+                    self.assertEqual(repository.embedding_coverage(con)["ocr_only_searchable_image_count"], 0)
+                    con.execute("UPDATE image_evidence SET ocr_text = 'stone beater OCR'")
+                    con.commit()
+                    self.image_path.write_bytes(b"replaced image bytes")
+                    self.assertEqual(repository.embedding_coverage(con)["ocr_only_searchable_image_count"], 0)
+            self.assertEqual(embed.await_count, 1)
+
     def test_caption_failure_preserves_old_caption_but_does_not_search_it(self):
         self.image("stone beater")
         with repository.get_connection() as con:

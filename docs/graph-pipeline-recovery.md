@@ -20,6 +20,8 @@ Derived retries may reuse a parent's completed primary response only when docume
 
 If a later repair returns malformed candidate JSON, the last strictly parsed and independently validated response remains selected, including all its rejections. `selected_attempt`, `fallback_reason`, response hashes and provider token/timing metadata identify that exact attempt; all later failures remain in the audit. A batch whose completed HTTP-200 responses all contain malformed candidate JSON is explicitly rejected, permitting later independent source batches to proceed. Two consecutive such batches stop the pass with `provider_format_budget_reached`; untouched batches remain pending. Authentication, transport and incomplete provider-envelope failures still raise. This does not turn an empty failed extraction into a completed graph.
 
+Two scheduler consumers permit at most two active runs per API process. The advisory `.job.lock` remains exclusive for each run across consumers and API processes; queued work and interrupted runs remain durable. This reduces head-of-line waiting for small documents but is not a distributed provider quota manager. Each run retains the per-batch attempt/token/time limits above.
+
 - `POST /api/v1/research-runs` accepts the existing config plus:
   ```json
   {"augmentation":{"enabled":true,"discovery":"crossref","max_pages":15,"window_size":5,"min_successful_pages":10,"low_yield_windows":2,"min_avg_novel_entities":1.0,"duplicate_ceiling":0.9}}

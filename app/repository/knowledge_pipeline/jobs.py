@@ -4,6 +4,7 @@ No Progress database or external worker is required. Each API process may run a
 scheduler: an advisory execution lock prevents duplicate work on shared storage.
 Queued jobs and jobs interrupted by a process restart are picked up on startup.
 Completed stage checkpoints are preserved by ResearchPipeline.
+Two bounded consumers let a short document proceed beside a long corpus run.
 """
 
 from __future__ import annotations
@@ -156,6 +157,16 @@ class GraphScheduler:
             return True
 
     async def _work(self):
+        workers = [asyncio.create_task(self._consume(), name=f"document-graph-consumer-{index}")
+                   for index in range(2)]
+        try:
+            await asyncio.gather(*workers)
+        finally:
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+
+    async def _consume(self):
         while True:
             self._wakeup.clear()
             for run_id in await asyncio.to_thread(self.pending):

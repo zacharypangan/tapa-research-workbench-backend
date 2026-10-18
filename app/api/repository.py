@@ -1422,7 +1422,13 @@ def _image_ocr_index_current(con, row) -> bool:
     if not isinstance(doc, dict) or (doc.get("description_status") != "failed" and row["visual_caption"]):
         return False
     try:
-        inputs = image_descriptions.description_input(row["image_path"], get_image_context_text(con, row), OLLAMA_VISION_MODEL)
+        # The vector contains OCR/observations only. A vision-model correction
+        # must not hide unchanged text while its description is being retried.
+        # Recompute the old key against CURRENT image bytes/context to retain
+        # source invalidation rather than trusting the historical key alone.
+        old_model = doc.get("description_model")
+        inputs = image_descriptions.description_input(row["image_path"], get_image_context_text(con, row),
+            old_model if isinstance(old_model, str) and old_model.strip() else OLLAMA_VISION_MODEL)
     except OSError:
         return False
     return (doc.get("description_key") == inputs["key"]
