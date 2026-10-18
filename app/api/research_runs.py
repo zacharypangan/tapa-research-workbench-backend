@@ -93,7 +93,8 @@ def resolve_documents(refs: list[DocumentRef]) -> list[dict]:
             path = Path(row["stored_path"]).resolve()
             if not path.is_relative_to(root):
                 raise ValueError("Document must be in Workbench managed file storage")
-            documents.append({"path": path, "title": row["title"] or row["original_filename"],
+            count = connection.execute("SELECT COUNT(*) FROM files WHERE material_id=?", (ref.material_id,)).fetchone()[0]
+            documents.append({"path": path, "title": row["original_filename"] if count > 1 else row["title"] or row["original_filename"],
                               "locator": f"workbench:material/{ref.material_id}/file/{ref.file_id}",
                               "filename": row["original_filename"], "ocr_languages": row["language"]})
     return documents
