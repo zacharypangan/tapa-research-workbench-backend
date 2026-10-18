@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi import HTTPException
 
 from app.api import repository
-from app.repository import embedding_index, lexical_search
+from app.repository import embedding_index, image_descriptions, lexical_search
 from app.repository.schemas import AskCorpusRequest, MultimodalSearchRequest, SemanticSearchRequest
 
 
@@ -273,6 +273,135 @@ class RepositoryIndexingTests(unittest.TestCase):
                 result = asyncio.run(repository.index_missing_image_embeddings(con))
                 self.assertEqual(result["outcomes"][0]["status"], "stale")
                 self.assertEqual(con.execute("SELECT visual_caption FROM image_evidence").fetchone()[0], "Human correction")
+
+    def test_empty_caption_keeps_ocr_searchable_and_reuses_vector_on_bounded_retries(self):
+        self.image(text="")
+        with repository.get_connection() as con:
+            con.execute("UPDATE image_evidence SET visual_caption = ''")
+            con.commit()
+        with patch.object(repository, "is_informative_image", return_value=True), patch.object(repository, "ocr_image_file", return_value="stone beater OCR"), patch.object(repository, "request_image_caption", new=AsyncMock(return_value="")) as caption, patch.object(repository, "request_embedding", new=AsyncMock(return_value=[1., 0.])) as embed:
+            with repository.get_connection() as con:
+                for attempt in range(3):
+                    result = asyncio.run(repository.index_missing_image_embeddings(con, force=attempt > 0))
+                    self.assertEqual(result["failed_ids"], ["image"])
+                    self.assertEqual(result["failed_count"], 1)
+                    self.assertEqual(result["indexed_count"], 0)
+                    self.assertEqual(result["pending_count"], 1)
+                    self.assertTrue(result["outcomes"][0]["ocr_searchable"])
+                    self.assertEqual(result["outcomes"][0]["error_category"], "no_usable_observable_labels")
+                    self.assertEqual(embed.await_count, 1)
+                self.assertEqual(caption.await_count, 3)
+                self.assertEqual(con.execute("SELECT ocr_text FROM image_evidence").fetchone()[0], "stone beater OCR")
+                coverage = repository.embedding_coverage(con)
+                self.assertEqual(coverage["embedded_image_count"], 0)
+                self.assertEqual(coverage["missing_image_count"], 1)
+                self.assertEqual(coverage["ocr_only_searchable_image_count"], 1)
+                held = asyncio.run(repository.index_missing_image_embeddings(con, skip_ids={"image"}))
+                self.assertEqual(held["processed_image_count"], 0)
+                self.assertEqual(caption.await_count, 3)
+            found = asyncio.run(repository.search_image_evidence(MultimodalSearchRequest(query="stone beater"), query_embedding=[1., 0.]))
+            self.assertEqual([item["image_id"] for item in found["image_results"]], ["image"])
+            self.assertEqual(found["image_results"][0]["description_status"], "failed")
+            self.assertIn("OCR/observation text only", found["image_results"][0]["retrieval_basis"])
+
+    def test_existing_ocr_only_vector_does_not_reembed_on_failed_caption_and_recovers(self):
+        self.image("stone beater OCR")
+        with repository.get_connection() as con:
+            con.execute("UPDATE image_evidence SET visual_caption = ''")
+            con.commit()
+            row = repository._image_index_rows(con)[0]
+            with patch.object(repository, "request_embedding", new=AsyncMock(return_value=[1., 0.])):
+                doc = asyncio.run(repository._embed_span_document("stone beater OCR", {}, asyncio.Semaphore(1)))
+            inputs = image_descriptions.description_input(row["image_path"], repository.get_image_context_text(con, row), repository.OLLAMA_VISION_MODEL)
+            doc.update(description_key=inputs["key"], description_caption_sha256=embedding_index.content_hash(""))
+            con.execute("INSERT INTO image_embeddings VALUES ('image', 'one', ?, ?, ?, 'previous')",
+                        (repository.active_embedding_index_key(), repository.MULTIMODAL_METHOD_VERSION, json.dumps(doc)))
+            con.commit()
+        with patch.object(repository, "is_informative_image", return_value=True), patch.object(repository, "request_image_caption", new=AsyncMock(side_effect=["", "Recovered labels"])) as caption, patch.object(repository, "request_embedding", new=AsyncMock(return_value=[1., 0.])) as embed:
+            with repository.get_connection() as con:
+                first = asyncio.run(repository.index_missing_image_embeddings(con))
+                self.assertEqual(first["failed_ids"], ["image"])
+                self.assertTrue(first["outcomes"][0]["vector_reused"])
+                self.assertEqual(embed.await_count, 0)
+                recovered = asyncio.run(repository.index_missing_image_embeddings(con))
+                self.assertEqual(recovered["failed_count"], 0)
+                self.assertEqual(recovered["indexed_count"], 1)
+                self.assertEqual(recovered["pending_count"], 0)
+                self.assertEqual(recovered["coverage"]["embedded_image_count"], 1)
+                self.assertEqual(recovered["coverage"]["ocr_only_searchable_image_count"], 0)
+                self.assertEqual(embed.await_count, 1)
+                self.assertEqual(caption.await_count, 2)
+                replay = asyncio.run(repository.index_missing_image_embeddings(con))
+                self.assertEqual(replay["processed_image_count"], 0)
+                self.assertEqual(caption.await_count, 2)
+
+    def test_caption_failure_preserves_old_caption_but_does_not_search_it(self):
+        self.image("stone beater")
+        with repository.get_connection() as con:
+            con.execute("UPDATE image_evidence SET visual_caption = 'UNTRUSTED_OLD_CAPTION'")
+            con.commit()
+        with patch.object(repository, "is_informative_image", return_value=True), patch.object(repository, "request_image_caption", new=AsyncMock(return_value=" ")), patch.object(repository, "request_embedding", new=AsyncMock(return_value=[1., 0.])):
+            with repository.get_connection() as con:
+                result = asyncio.run(repository.index_missing_image_embeddings(con))
+                self.assertEqual(result["failed_count"], 1)
+                self.assertEqual(con.execute("SELECT visual_caption FROM image_evidence").fetchone()[0], "UNTRUSTED_OLD_CAPTION")
+            found = asyncio.run(repository.search_image_evidence(MultimodalSearchRequest(query="UNTRUSTED_OLD_CAPTION"), query_embedding=[0., 1.]))
+            self.assertEqual(found["image_results"], [])
+            found = asyncio.run(repository.search_image_evidence(MultimodalSearchRequest(query="stone"), query_embedding=[1., 0.]))
+            self.assertEqual(found["image_results"][0]["visual_caption"], "")
+            self.assertEqual(found["image_results"][0]["previous_visual_caption"], "UNTRUSTED_OLD_CAPTION")
+
+    def test_caption_failure_without_readable_ocr_is_explicit_and_does_not_embed(self):
+        self.image("")
+        with repository.get_connection() as con:
+            con.execute("UPDATE image_evidence SET visual_caption = ''")
+            con.commit()
+        with patch.object(repository, "is_informative_image", return_value=True), patch.object(repository, "ocr_image_file", return_value=""), patch.object(repository, "request_image_caption", new=AsyncMock(return_value="")), patch.object(repository, "request_embedding", new=AsyncMock()) as embed:
+            with repository.get_connection() as con:
+                result = asyncio.run(repository.index_missing_image_embeddings(con))
+                self.assertEqual(result["failed_ids"], ["image"])
+                self.assertFalse(result["outcomes"][0]["ocr_searchable"])
+                self.assertEqual(result["pending_count"], 1)
+                self.assertEqual(con.execute("SELECT COUNT(*) FROM image_embeddings").fetchone()[0], 0)
+                embed.assert_not_awaited()
+
+    def test_safe_http_failure_diagnostics_and_manifest_category_are_retained(self):
+        self.segment("provider fails")
+        with patch.object(repository, "request_embedding", new=AsyncMock(side_effect=HTTPException(status_code=401, detail="SECRET_TOKEN must not appear"))):
+            with repository.get_connection() as con:
+                result = asyncio.run(repository.index_missing_segment_embeddings(con))
+                outcome = result["outcomes"][0]
+                self.assertEqual(outcome["http_status"], 401)
+                self.assertEqual(outcome["error_category"], "authentication")
+                self.assertFalse(outcome["retryable"])
+                self.assertIn("HTTP 401", outcome["error"])
+                self.assertNotIn("SECRET_TOKEN", json.dumps(outcome))
+        self.image("stone beater")
+        with repository.get_connection() as con:
+            row = repository._image_index_rows(con)[0]
+            inputs = image_descriptions.description_input(row["image_path"], repository.get_image_context_text(con, row), repository.OLLAMA_VISION_MODEL)
+        image_descriptions.save_record(repository.STORAGE_ROOT, {**inputs, "status": "failed", "failure_category": "authentication", "attempts": [{"http_status": 403, "raw_response": "PRIVATE_PROVIDER_BODY"}]})
+        with patch.object(repository, "is_informative_image", return_value=True), patch.object(repository, "request_image_caption", new=AsyncMock(return_value="")), patch.object(repository, "request_embedding", new=AsyncMock(return_value=[1., 0.])):
+            with repository.get_connection() as con:
+                result = asyncio.run(repository.index_missing_image_embeddings(con))
+                outcome = result["outcomes"][0]
+                self.assertEqual(outcome["http_status"], 403)
+                self.assertEqual(outcome["error_category"], "authentication")
+                self.assertFalse(outcome["retryable"])
+                self.assertNotIn("PRIVATE_PROVIDER_BODY", json.dumps(outcome))
+
+    def test_provider_caption_exception_keeps_useful_ocr_with_safe_status(self):
+        self.image("stone beater OCR")
+        with patch.object(repository, "is_informative_image", return_value=True), patch.object(repository, "request_image_caption", new=AsyncMock(side_effect=HTTPException(status_code=429, detail="SECRET_PROVIDER_DETAIL"))), patch.object(repository, "request_embedding", new=AsyncMock(return_value=[1., 0.])):
+            with repository.get_connection() as con:
+                result = asyncio.run(repository.index_missing_image_embeddings(con))
+                outcome = result["outcomes"][0]
+                self.assertEqual(result["failed_ids"], ["image"])
+                self.assertTrue(outcome["ocr_searchable"])
+                self.assertEqual(outcome["http_status"], 429)
+                self.assertEqual(outcome["error_category"], "rate_limit")
+                self.assertTrue(outcome["retryable"])
+                self.assertNotIn("SECRET_PROVIDER_DETAIL", json.dumps(outcome))
 
     def test_caption_recipe_refreshes_once_and_reuses_unchanged_vectors(self):
         self.image()

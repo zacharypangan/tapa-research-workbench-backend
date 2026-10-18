@@ -14,6 +14,8 @@ Implemented 19 October 2026. This is an implementation contract; candidate valid
 
 ## Public API
 
+The `source-local-extraction-v4-grounded-repair` prompt checks that an original label appears in its own selected evidence span. Bounded repair feedback includes at most three lexically matching registered spans for each of at most twenty rejected entities. These are selection hints, not accepted facts or automatic corrections. Original responses, rejection reasons and later attempts remain in the audit; the exact-evidence validator is unchanged.
+
 - `POST /api/v1/research-runs` accepts the existing config plus:
   ```json
   {"augmentation":{"enabled":true,"discovery":"crossref","max_pages":15,"window_size":5,"min_successful_pages":10,"low_yield_windows":2,"min_avg_novel_entities":1.0,"duplicate_ceiling":0.9}}

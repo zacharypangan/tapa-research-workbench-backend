@@ -219,15 +219,18 @@ class ProcessingScheduler:
                 # A later upload supersedes this plan before any stage starts.
                 current = await asyncio.to_thread(material_inputs, job["material_id"])
                 if current != job["inputs"]:
-                    replacement = await asyncio.to_thread(self.enqueue, job["material_id"])
+                    replacement = await asyncio.to_thread(self.enqueue, job["material_id"], job["stages"])
                     self.update(job_id, status="superseded", replacement_job_id=replacement["job_id"])
                     return True
-                stage_errors = {}
+                # Retry only unfinished stages, retaining their last errors until each
+                # succeeds. Never leave a resolved failure in the readiness response.
+                stage_errors = {key: value for key, value in job.get("stage_errors", {}).items()
+                                if key not in completed}
                 for stage in job["stages"]:
                     if stage in completed:
                         continue
                     if await asyncio.to_thread(material_inputs, job["material_id"]) != job["inputs"]:
-                        replacement = await asyncio.to_thread(self.enqueue, job["material_id"])
+                        replacement = await asyncio.to_thread(self.enqueue, job["material_id"], job["stages"])
                         self.update(job_id, status="superseded", replacement_job_id=replacement["job_id"])
                         return True
                     self.update(job_id, stage=stage)
@@ -248,14 +251,18 @@ class ProcessingScheduler:
                             raise
                         continue
                     completed[stage] = {"finished_at": stamp(), "result": result}
-                    self.update(job_id, completed_stages=completed)
-                if stage_errors:
-                    raise RuntimeError("Stages need retry: " + ", ".join(stage_errors))
+                    stage_errors.pop(stage, None)
+                    self.update(job_id, completed_stages=completed, stage_errors=stage_errors)
+                # Source changes take precedence over errors from the obsolete input,
+                # including a failure in the final stage of the old plan.
                 if await asyncio.to_thread(material_inputs, job["material_id"]) != job["inputs"]:
-                    replacement = await asyncio.to_thread(self.enqueue, job["material_id"])
+                    replacement = await asyncio.to_thread(self.enqueue, job["material_id"], job["stages"])
                     self.update(job_id, status="superseded", replacement_job_id=replacement["job_id"])
+                elif stage_errors:
+                    raise RuntimeError("Stages need retry: " + ", ".join(stage_errors))
                 else:
-                    self.update(job_id, status="done", stage="complete", finished_at=stamp(), error=None)
+                    self.update(job_id, status="done", stage="complete", finished_at=stamp(),
+                                error=None, detail=None, stage_errors={})
             except asyncio.CancelledError:
                 self.update(job_id, status="queued", detail="Restart interrupted preparation; completed stages are saved")
                 raise

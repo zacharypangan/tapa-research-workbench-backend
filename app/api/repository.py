@@ -1293,9 +1293,10 @@ def _image_index_rows(con: sqlite3.Connection, material_id: Optional[str] = None
     ).fetchall()
 
 
-def _image_index_text(row) -> str:
+def _image_index_text(row, include_caption: bool = True) -> str:
     return clean_extracted_text("\n\n".join(part for part in [
-        row["ocr_text"] or "", row["visual_caption"] or "", row["observation_labels"] or ""
+        row["ocr_text"] or "", (row["visual_caption"] or "") if include_caption else "",
+        row["observation_labels"] or ""
     ] if part))
 
 
@@ -1319,7 +1320,7 @@ def _image_skip_current(row, text: str) -> bool:
 
 def _image_description_current(con, row) -> bool:
     doc = embedding_index.read_document(row["embedding_json"])
-    if not isinstance(doc, dict) or not row["visual_caption"]:
+    if not isinstance(doc, dict) or not (row["visual_caption"] or "").strip() or doc.get("description_status") == "failed":
         return False
     try:
         inputs = image_descriptions.description_input(row["image_path"], get_image_context_text(con, row), OLLAMA_VISION_MODEL)
@@ -1327,6 +1328,19 @@ def _image_description_current(con, row) -> bool:
         return False
     return (doc.get("description_key") == inputs["key"]
             and doc.get("description_caption_sha256") == embedding_index.content_hash(row["visual_caption"]))
+
+
+def _image_ocr_index_current(con, row) -> bool:
+    """An OCR-only vector can be useful while description readiness is failed."""
+    doc = embedding_index.read_document(row["embedding_json"])
+    if not isinstance(doc, dict) or (doc.get("description_status") != "failed" and row["visual_caption"]):
+        return False
+    try:
+        inputs = image_descriptions.description_input(row["image_path"], get_image_context_text(con, row), OLLAMA_VISION_MODEL)
+    except OSError:
+        return False
+    return (doc.get("description_key") == inputs["key"]
+            and embedding_index.document_is_current(doc, _image_index_text(row, include_caption=False), active_embedding_model_name()))
 
 def embedding_coverage(con: sqlite3.Connection, material_id: Optional[str] = None) -> dict:
     where = "WHERE es.source_kind NOT GLOB 'historical_*'" + (" AND es.material_id = ?" if material_id else "")
@@ -1338,7 +1352,7 @@ def embedding_coverage(con: sqlite3.Connection, material_id: Optional[str] = Non
         r["embedding_json"], r["content_text"], active_embedding_model_name()) for r in eligible)
     stale = sum(bool(r["embedding_json"]) for r in eligible) - ready
     images = _image_index_rows(con, material_id)
-    image_ready = image_skipped = image_stale = 0
+    image_ready = image_skipped = image_stale = ocr_searchable = 0
     for row in images:
         text = _image_index_text(row)
         if _image_skip_current(row, text):
@@ -1348,6 +1362,8 @@ def embedding_coverage(con: sqlite3.Connection, material_id: Optional[str] = Non
             image_ready += 1
         elif row["embedding_json"]:
             image_stale += 1
+            if row["stored_model"] == active_embedding_index_key() and row["stored_method"] == MULTIMODAL_METHOD_VERSION and _image_ocr_index_current(con, row):
+                ocr_searchable += 1
     return {
         "segment_count": len(segments), "eligible_segment_count": len(eligible),
         "embedded_segment_count": ready, "missing_segment_count": len(eligible) - ready,
@@ -1355,6 +1371,7 @@ def embedding_coverage(con: sqlite3.Connection, material_id: Optional[str] = Non
         "image_evidence_count": len(images), "eligible_image_count": len(images) - image_skipped,
         "embedded_image_count": image_ready, "missing_image_count": len(images) - image_ready - image_skipped,
         "stale_image_count": image_stale, "skipped_image_count": image_skipped,
+        "ocr_only_searchable_image_count": ocr_searchable,
         "embedding_index_key": active_embedding_index_key(),
     }
 
@@ -1387,9 +1404,62 @@ async def _embed_span_document(text: str, cache: dict, semaphore: asyncio.Semaph
             "overlap": embedding_index.SPAN_OVERLAP, "complete": True, "spans": vectors}
 
 
+def _index_error_metadata(exc: Exception) -> dict:
+    """Only allowlisted categories/statuses; never copy provider bodies or URLs."""
+    status = exc.status_code if isinstance(exc, HTTPException) else None
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+    if status in {401, 403}:
+        category, retryable = "authentication", False
+    elif status == 429:
+        category, retryable = "rate_limit", True
+    elif status is not None:
+        category, retryable = "provider_http_error", status >= 500 or status in {408, 425}
+    elif isinstance(exc, httpx.TimeoutException):
+        category, retryable = "provider_timeout", True
+    elif isinstance(exc, httpx.RequestError):
+        category, retryable = "provider_network_error", True
+    elif isinstance(exc, FileNotFoundError):
+        category, retryable = "source_unavailable", False
+    elif isinstance(exc, sqlite3.OperationalError):
+        retryable = "locked" in str(exc).lower() or "busy" in str(exc).lower()
+        category = "database_busy" if retryable else "database_error"
+    elif isinstance(exc, ValueError):
+        category, retryable = "invalid_representation", False
+    else:
+        category, retryable = "processing_error", False
+    return {"error_category": category, "http_status": status, "retryable": retryable}
+
+
 def _index_error(exc: Exception) -> str:
-    # Keep provider bodies/credentials out of per-item job metadata.
-    return f"{type(exc).__name__}: embedding or representation preparation failed; retry this item."
+    metadata = _index_error_metadata(exc)
+    status = f" HTTP {metadata['http_status']}" if metadata["http_status"] is not None else ""
+    retry = "retryable" if metadata["retryable"] else "requires inspection"
+    return f"{type(exc).__name__}: {metadata['error_category']}{status} ({retry}); representation preparation failed."
+
+
+def _index_failure(exc: Exception) -> dict:
+    return {"error": _index_error(exc), **_index_error_metadata(exc)}
+
+
+def _caption_failure(inputs: dict) -> dict:
+    record = image_descriptions.read_record(STORAGE_ROOT, inputs["key"])
+    category = record.get("failure_category")
+    allowed = {"authentication", "rate_limit", "provider_http_error", "network_error", "malformed_response",
+               "no_usable_observable_labels", "vision_model_not_configured"}
+    if category not in allowed:
+        category = "no_usable_observable_labels"
+    attempts = record.get("attempts", [])
+    latest = attempts[-1] if isinstance(attempts, list) and attempts and isinstance(attempts[-1], dict) else {}
+    status = latest.get("http_status")
+    status = status if isinstance(status, int) and 100 <= status <= 599 else None
+    retryable = category not in {"authentication", "vision_model_not_configured"}
+    if category == "provider_http_error" and status is not None:
+        retryable = status >= 500 or status in {408, 425, 429}
+    return {"error": "Image description returned no usable labels; previous caption was retained for inspection.",
+            "error_category": category, "http_status": status,
+            "retryable": retryable,
+            "description_status": "failed"}
 
 
 async def index_missing_segment_embeddings(
@@ -1414,14 +1484,14 @@ async def index_missing_segment_embeddings(
         try:
             return row, await _embed_span_document(row["content_text"], cache, semaphore), None
         except Exception as exc:
-            return row, None, _index_error(exc)
+            return row, None, _index_failure(exc)
     outcomes, indexed = [], 0
     # Each batch is bounded and writes only after provider awaits (no long DB transaction).
     for offset in range(0, len(rows), 12):
         prepared = await asyncio.gather(*(prepare(row) for row in rows[offset:offset + 12]))
         for row, doc, error in prepared:
             if error:
-                outcomes.append({"id": row["id"], "status": "failed", "error": error})
+                outcomes.append({"id": row["id"], "status": "failed", **error})
                 continue
             # A concurrent re-extraction cannot receive a vector for old text.
             changed = con.execute("SELECT content_text FROM extracted_segments WHERE id = ?", (row["id"],)).fetchone()
@@ -1606,44 +1676,56 @@ async def index_missing_image_embeddings(
             and _image_description_current(con, row))))][:limit]
     counters = {"indexed_count": 0, "processed_image_count": 0, "captioned_count": 0,
                 "caption_attempted_count": 0, "caption_failed_count": 0, "removed_blank_count": 0,
-                "skipped_count": 0, "failed_count": 0}
+                "skipped_count": 0, "failed_count": 0, "partial_indexed_count": 0}
     outcomes, cache, semaphore = [], {}, asyncio.Semaphore(3)
     async def prepare(row):
         try:
             if not await asyncio.to_thread(is_informative_image, row["image_path"]):
                 if not os.path.isfile(row["image_path"]):
-                    return row, "failed", "Image source file is unavailable; restore the source and retry."
+                    return row, "failed", _index_failure(FileNotFoundError())
                 return row, "skipped", "Image is blank, decorative or below the informative-image threshold."
             ocr_text = row["ocr_text"] or await asyncio.to_thread(ocr_image_file, row["image_path"])
             context_text = get_image_context_text(con, row)
             caption = row["visual_caption"] or ""
             inputs = image_descriptions.description_input(row["image_path"], context_text, OLLAMA_VISION_MODEL)
+            caption_failure = None
             if force or not _image_description_current(con, row):
                 counters["caption_attempted_count"] += 1
-                async with semaphore:
-                    caption = await request_image_caption(row["image_path"], context_text)
+                try:
+                    async with semaphore:
+                        caption = (await request_image_caption(row["image_path"], context_text) or "").strip()
+                except (HTTPException, httpx.RequestError) as exc:
+                    caption = ""
+                    caption_failure = {**_index_failure(exc), "description_status": "failed"}
                 counters["captioned_count" if caption else "caption_failed_count"] += 1
-                if not caption:
-                    return row, "failed", "Image description returned no usable labels; previous caption was retained for inspection."
+                if not caption and caption_failure is None:
+                    caption_failure = _caption_failure(inputs)
+            # Fresh OCR survives a description failure; preserve the previous caption
+            # for inspection but never include it in the partial vector.
+            stored_caption = (row["visual_caption"] or "") if caption_failure else caption
             updated = con.execute("""UPDATE image_evidence SET ocr_text = ?, visual_caption = ?
                 WHERE id = ? AND COALESCE(ocr_text, '') = ? AND COALESCE(visual_caption, '') = ?""",
-                (ocr_text, caption, row["id"], row["ocr_text"] or "", row["visual_caption"] or ""))
+                (ocr_text, stored_caption, row["id"], row["ocr_text"] or "", row["visual_caption"] or ""))
             con.commit()
             if updated.rowcount == 0:
                 return row, "stale", "Image representation changed during preparation; retry the current source."
-            text = clean_extracted_text("\n\n".join(v for v in (ocr_text, caption, row["observation_labels"] or "") if v))
+            text = clean_extracted_text("\n\n".join(v for v in (ocr_text, "" if caption_failure else caption, row["observation_labels"] or "") if v))
             if not text:
-                raise ValueError("No readable OCR text or usable description")
-            if (not force and row["stored_model"] == active_embedding_index_key()
-                    and embedding_index.document_is_current(row["embedding_json"], text, active_embedding_model_name())):
+                return row, "failed", {**caption_failure, "ocr_searchable": False} if caption_failure else _index_failure(ValueError("No readable OCR text or usable description"))
+            vector_reused = ((not force or caption_failure is not None) and row["stored_model"] == active_embedding_index_key()
+                             and embedding_index.document_is_current(row["embedding_json"], text, active_embedding_model_name()))
+            if vector_reused:
                 doc = dict(embedding_index.read_document(row["embedding_json"]))
             else:
                 doc = await _embed_span_document(text, cache, semaphore)
             doc.update(description_key=inputs["key"], description_caption_sha256=embedding_index.content_hash(caption),
-                       description_model=OLLAMA_VISION_MODEL, description_prompt_version=image_descriptions.PROMPT_VERSION)
+                       description_model=OLLAMA_VISION_MODEL, description_prompt_version=image_descriptions.PROMPT_VERSION,
+                       description_status="failed" if caption_failure else "complete")
+            if caption_failure:
+                return row, "partial", {"document": doc, **caption_failure, "vector_reused": vector_reused}
             return row, "indexed", doc
         except Exception as exc:
-            return row, "failed", _index_error(exc)
+            return row, "failed", _index_failure(exc)
     for offset in range(0, len(rows), 6):
         prepared = await asyncio.gather(*(prepare(row) for row in rows[offset:offset + 6]))
         for row, status, detail in prepared:
@@ -1651,28 +1733,37 @@ async def index_missing_image_embeddings(
             if status in {"failed", "stale"}:
                 if status == "failed":
                     counters["failed_count"] += 1
-                outcomes.append({"id": row["id"], "status": status, "error": detail})
+                outcomes.append({"id": row["id"], "status": status,
+                                 **(detail if isinstance(detail, dict) else {"error": detail})})
                 continue
             if status == "skipped":
                 counters["skipped_count"] += 1
                 doc = {"format": embedding_index.FORMAT, "model": active_embedding_model_name(),
                        "skipped_reason": detail, "source_signature": _image_source_signature(row, _image_index_text(row))}
             else:
-                doc = detail
+                doc = detail["document"] if status == "partial" else detail
                 # Re-read annotations to avoid publishing a vector after a concurrent edit/deletion.
                 current = next(iter(_image_index_rows(con, row["material_id"], row["id"])), None)
-                if (current is None or embedding_index.content_hash(_image_index_text(current)) != doc["content_sha256"]
+                if (current is None or embedding_index.content_hash(_image_index_text(current, include_caption=status != "partial")) != doc["content_sha256"]
                         or image_descriptions.description_input(current["image_path"], get_image_context_text(con, current), OLLAMA_VISION_MODEL)["key"] != doc["description_key"]):
                     outcomes.append({"id": row["id"], "status": "stale", "error": "Image representation changed during indexing."})
                     continue
-                counters["indexed_count"] += 1
+                if status == "partial":
+                    counters["partial_indexed_count"] += 1
+                    counters["failed_count"] += 1
+                else:
+                    counters["indexed_count"] += 1
             con.execute("""INSERT OR REPLACE INTO image_embeddings
                 (image_id, material_id, model, method_version, embedding_json, embedded_at)
                 VALUES (?, ?, ?, ?, ?, ?)""", (row["id"], row["material_id"], active_embedding_index_key(),
                 MULTIMODAL_METHOD_VERSION, json.dumps(doc), now_iso()))
             con.commit()
-            outcomes.append({"id": row["id"], "status": status,
-                             **({"reason": detail} if status == "skipped" else {"span_count": len(doc["spans"]), "content_sha256": doc["content_sha256"]})})
+            if status == "partial":
+                outcomes.append({"id": row["id"], "status": "failed", "ocr_searchable": True,
+                                 **{key: value for key, value in detail.items() if key != "document"}})
+            else:
+                outcomes.append({"id": row["id"], "status": status,
+                                 **({"reason": detail} if status == "skipped" else {"span_count": len(doc["spans"]), "content_sha256": doc["content_sha256"]})})
     coverage = embedding_coverage(con, material_id)
     return {"provider_configured": True, **counters, "outcomes": outcomes,
             "failed_ids": [item["id"] for item in outcomes if item["status"] == "failed"],
@@ -1757,14 +1848,15 @@ async def search_image_evidence(payload: MultimodalSearchRequest, query_embeddin
 
         results = []
         for row in rows:
-            evidence_text = image_embedding_text(row)
-            matched_terms = matched_terms_for_text(evidence_text, terms)
-            index_text = _image_index_text(row)
+            ocr_only = row["index_key"] == active_embedding_index_key() and _image_ocr_index_current(con, row)
+            index_text = _image_index_text(row, include_caption=not ocr_only)
             if row["index_key"] == active_embedding_index_key() and not embedding_index.document_is_current(
                     row["embedding_json"], index_text, active_embedding_model_name()):
                 continue
-            if row["index_key"] == active_embedding_index_key() and not _image_description_current(con, row):
+            if row["index_key"] == active_embedding_index_key() and not ocr_only and not _image_description_current(con, row):
                 continue
+            evidence_text = index_text if ocr_only else image_embedding_text(row)
+            matched_terms = matched_terms_for_text(evidence_text, terms)
             semantic_score, matched_span = embedding_index.best_match(query_embedding, row["embedding_json"])
             if semantic_score < -0.99:
                 continue
@@ -1777,6 +1869,10 @@ async def search_image_evidence(payload: MultimodalSearchRequest, query_embeddin
             item["semantic_score"] = semantic_score
             item["matched_span"] = matched_span
             item["index_legacy"] = row["index_key"] != active_embedding_index_key()
+            item["description_status"] = "failed" if ocr_only else "legacy_unverified" if item["index_legacy"] else "complete"
+            if ocr_only:
+                item["previous_visual_caption"] = item.pop("visual_caption", "")
+                item["visual_caption"] = ""
             item["score"] = semantic_score
             item["matched_terms"] = matched_terms
             item["contains_exact_term"] = bool(matched_terms)
@@ -1785,6 +1881,8 @@ async def search_image_evidence(payload: MultimodalSearchRequest, query_embeddin
                 if matched_terms
                 else "Semantic image-text match from OCR/caption text; exact search token not found."
             )
+            if ocr_only:
+                item["retrieval_basis"] = "OCR/observation text only; visual description failed and remains pending."
             item["evidence_level"] = "direct_image_text_match" if matched_terms else "semantic_image_neighbor"
             results.append(item)
 

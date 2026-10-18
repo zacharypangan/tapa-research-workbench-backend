@@ -12,6 +12,7 @@ from app.repository.knowledge_pipeline.processing import (
     extraction_prompt,
     extraction_schema,
     evidence_spans,
+    repair_feedback,
     provider_capabilities,
     process_response,
 )
@@ -275,6 +276,36 @@ class AlignmentTests(unittest.TestCase):
 
 
 class OllamaTests(unittest.IsolatedAsyncioTestCase):
+    async def test_repair_hints_fix_wrong_span_without_bypassing_grounding(self):
+        units = [unit("A stone beater was found. A wooden paddle was nearby.")]
+        invalid = {"entities": [{"local_id": "x", "entity_type": "ToolForm", "label_original": "stone beater",
+                                 "evidence": [{"unit_id": "mistyped-unit", "span_id": "S2"}]}], "assertions": []}
+        rejected = process_response(invalid, units, ONTOLOGY)
+        self.assertTrue(rejected["rejections"])
+        hints = repair_feedback(invalid, rejected, units)
+        self.assertEqual(hints[0]["matching_source_spans"], [
+            {"unit_id": "u1", "span_id": "S1", "text": "A stone beater was found."}])
+        valid = copy.deepcopy(invalid)
+        valid["entities"][0]["evidence"] = [{"unit_id": "u1", "span_id": "S1"}]
+        requests = []
+        def transport(request):
+            requests.append(json.loads(request.content))
+            return httpx.Response(200, json={"done": True, "message": {"content": json.dumps(invalid if len(requests) == 1 else valid)}})
+        client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
+        with patch("app.repository.knowledge_pipeline.processing.httpx.AsyncClient", return_value=client), \
+                patch("app.repository.knowledge_pipeline.processing.RETRY_DELAYS", (0, 0)):
+            result = await call_ollama(units, ONTOLOGY, "https://ollama.com/api", "cloud-fixture")
+        self.assertEqual(len(requests), 2)
+        self.assertIn('"matching_source_spans"', requests[1]["messages"][-1]["content"])
+        self.assertEqual(result["rejections"], [])
+        self.assertEqual(result["evidence"][0]["text"], "A stone beater was found.")
+        self.assertTrue(result["provider_attempts"][0]["validation"]["rejections"])
+        # Hints never manufacture support for absent words or accept a bad span.
+        invalid["entities"][0]["label_original"] = "iron tool"
+        self.assertEqual(repair_feedback(invalid, process_response(invalid, units, ONTOLOGY), units)[0]["matching_source_spans"], [])
+        valid["entities"][0]["evidence"][0]["span_id"] = "S2"
+        self.assertTrue(process_response(valid, units, ONTOLOGY)["rejections"])
+
     async def test_provider_wrong_shape_remains_rejected_without_coercion(self):
         invalid = {"entities": [{"local_id": "E1", "label": "stone beater", "type": "ToolForm", "unit_id": "u1"}],
                    "features": [{"local_id": "F1", "label": "grooved surface", "type": "Feature"}],

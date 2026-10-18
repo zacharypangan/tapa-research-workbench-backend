@@ -4,7 +4,7 @@ import asyncio
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.repository.processing_jobs import ProcessingScheduler
 
@@ -52,7 +52,66 @@ class PreparationJobTests(unittest.TestCase):
         replacement = ProcessingScheduler(self.root, stage_runner=recovered)
         asyncio.run(replacement.process(job["job_id"]))
         self.assertEqual(calls, ["extract", "text_index", "text_index"])
-        self.assertEqual(replacement.get(job["job_id"])["status"], "done")
+        final = replacement.get(job["job_id"])
+        self.assertEqual(final["status"], "done")
+        self.assertEqual(final["stage_errors"], {})
+        self.assertIsNone(final["detail"])
+
+    def test_failed_text_index_does_not_block_image_index(self):
+        calls = []
+        async def runner(stage, job):
+            calls.append(stage)
+            if stage == "text_index":
+                raise RuntimeError("synthetic embedding outage")
+            return {"synthetic": True}
+        scheduler = ProcessingScheduler(self.root, stage_runner=runner)
+        job = scheduler.enqueue("fixture", ("text_index", "image_index"))
+        with patch("app.repository.processing_jobs.asyncio.sleep", return_value=None):
+            asyncio.run(scheduler.process(job["job_id"]))
+        final = scheduler.get(job["job_id"])
+        self.assertEqual(calls, ["text_index", "image_index"])
+        self.assertEqual(final["status"], "queued")
+        self.assertIn("image_index", final["completed_stages"])
+        self.assertEqual(set(final["stage_errors"]), {"text_index"})
+
+    def test_input_change_during_failed_final_stage_supersedes_plan(self):
+        changed = {**self.inputs, "source_url": "https://example.org/new"}
+        scheduler = ProcessingScheduler(self.root)
+        job = scheduler.enqueue("fixture", ("text_index",))
+        # Keep the mock handle so the runner can simulate a real upload mid-stage.
+        with patch("app.repository.processing_jobs.material_inputs", return_value=self.inputs) as inputs:
+            async def mutate(stage, job):
+                inputs.return_value = changed
+                raise RuntimeError("obsolete input failed")
+            scheduler.stage_runner = mutate
+            asyncio.run(scheduler.process(job["job_id"]))
+        final = scheduler.get(job["job_id"])
+        self.assertEqual(final["status"], "superseded")
+        replacement = scheduler.get(final["replacement_job_id"])
+        self.assertEqual(replacement["stages"], ["text_index"])
+        self.assertEqual(replacement["inputs"], changed)
+
+    def test_index_pass_processes_healthy_items_after_failed_items_once(self):
+        scheduler = ProcessingScheduler(self.root)
+        job = scheduler.enqueue("fixture", ("text_index",))
+        responses = [
+            {"indexed_count": 1, "pending_count": 2, "failed_count": 1,
+             "failed_ids": ["bad"], "outcomes": [{"segment_id": "bad", "status": "failed"}]},
+            {"indexed_count": 1, "pending_count": 1, "failed_count": 0,
+             "failed_ids": [], "outcomes": [{"segment_id": "healthy", "status": "indexed"}]},
+        ]
+        operation = AsyncMock(side_effect=responses)
+        connection = MagicMock()
+        with patch("app.api.repository.ai_embedding_configured", return_value=True), \
+                patch("app.api.repository.get_connection", return_value=connection), \
+                patch("app.api.repository.index_missing_segment_embeddings", operation):
+            with self.assertRaisesRegex(RuntimeError, "1 item.*need retry"):
+                asyncio.run(scheduler.run_stage("text_index", job))
+        self.assertEqual(operation.await_count, 2)
+        self.assertEqual(operation.await_args_list[1].kwargs["skip_ids"], {"bad"})
+        progress = scheduler.get(job["job_id"])["stage_progress"]["text_index"]
+        self.assertEqual(progress["indexed_count"], 2)
+        self.assertEqual(progress["failed_ids"], ["bad"])
 
     def test_three_failures_stop_and_retry_is_explicit(self):
         async def failure(stage, job):

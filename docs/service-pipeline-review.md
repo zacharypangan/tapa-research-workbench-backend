@@ -2,6 +2,8 @@
 
 Reviewed 18 October 2026 (Japan time). This document distinguishes verified current behavior, the small fixes in this change, and proposed work. The proposed unified pipeline is not implemented by this change.
 
+**Implementation follow-up, 19 October:** this is the original production audit, retained as a baseline. The isolated `codex/document-processing-poc` branch implements the shared representation and preparation worker. See [implementation and acceptance status](document-preparation-poc.md), [graph recovery](graph-pipeline-recovery.md), and [indexing/search](indexing-and-search.md). The staging POC includes all four Watanabe papers; the production inventory below is not a current staging result.
+
 ## Findings that determine the next work
 
 The hosted API and its configured generation/embedding providers respond, but the platform is not yet one automatic processing pipeline. Upload, extraction, image processing, text indexing and graph ingestion have different triggers and representations. Improving handoffs and coverage should come before adding another model or database.
