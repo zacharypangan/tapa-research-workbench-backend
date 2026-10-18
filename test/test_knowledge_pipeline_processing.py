@@ -11,6 +11,8 @@ from app.repository.knowledge_pipeline.processing import (
     call_ollama,
     extraction_prompt,
     extraction_schema,
+    evidence_spans,
+    provider_capabilities,
     process_response,
 )
 
@@ -186,6 +188,32 @@ class ProcessingTests(unittest.TestCase):
         self.assertEqual(set(json.loads(example)), {"entities", "assertions"})
 
 
+class SpanSelectionTests(unittest.TestCase):
+    def test_registered_spans_and_offsets_derive_exact_unicode_quotes(self):
+        source = unit("前文。石拍用于树皮布。石拍。", "zh")
+        spans = evidence_spans(source)
+        self.assertEqual("".join(span["text"] for span in spans), source["text"])
+        selections = [{"unit_id": "zh", "span_id": "S2"}, {"unit_id": "zh", "start_char": 3, "end_char": 5}]
+        for selection in selections:
+            value = {"entities": [{"local_id": "x", "entity_type": "ToolForm", "label_original": "石拍", "evidence": [selection]}], "assertions": []}
+            checked = process_response(value, [source], ONTOLOGY)
+            self.assertEqual(checked["rejections"], [])
+            quote = checked["evidence"][0]
+            self.assertIn("石拍", quote["text"])
+            self.assertFalse(quote["character_locator"]["ambiguous_occurrence"])
+            for span in quote["character_locator"]["spans"]:
+                self.assertEqual(source["text"][span["start"]:span["end"]], quote["text"])
+
+    def test_invalid_selection_cannot_supply_or_rewrite_evidence(self):
+        for evidence in ({"unit_id": "u1", "span_id": "S999"},
+                         {"unit_id": "u1", "start_char": -1, "end_char": 20},
+                         {"unit_id": "u1", "start_char": True, "end_char": 2},
+                         {"unit_id": "u1", "span_id": "S1", "quote": "fabricated"}):
+            checked = process_response({"entities": [{"local_id": "x", "entity_type": "ToolForm", "label_original": "stone beater", "evidence": [evidence]}], "assertions": []}, [unit()], ONTOLOGY)
+            self.assertEqual(checked["entities"], [])
+            self.assertTrue(checked["rejections"])
+
+
 class AlignmentTests(unittest.TestCase):
     def entity(self, entity_id, source_id, kind="ToolForm", label="Stone beater", scope=None):
         return {"entity_id": entity_id, "source_id": source_id, "entity_type": kind,
@@ -260,6 +288,38 @@ class OllamaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["entities"], [])
         self.assertEqual(result["assertions"], [])
         self.assertEqual(result["rejections"][0]["item_kind"], "batch")
+
+    async def test_cloud_repairs_bounded_validation_without_format_and_keeps_audit(self):
+        requests = []
+        invalid = {"entities": [{"local_id": "x", "entity_type": "ToolForm", "label_original": "wooden", "evidence": [{"unit_id": "u1", "quote": "invented quotation"}]}], "assertions": []}
+        valid = {"entities": [{"local_id": "x", "entity_type": "ToolForm", "label_original": "stone beater", "evidence": [{"unit_id": "u1", "span_id": "S1"}]}], "assertions": []}
+        def transport(request):
+            requests.append(json.loads(request.content))
+            return httpx.Response(200, json={"done": True, "message": {"content": json.dumps(invalid if len(requests) == 1 else valid)}})
+        client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
+        with patch("app.repository.knowledge_pipeline.processing.httpx.AsyncClient", return_value=client), patch("app.repository.knowledge_pipeline.processing.RETRY_DELAYS", (0, 0)):
+            checked = await call_ollama([unit()], ONTOLOGY, "https://ollama.com/api", "cloud-fixture")
+        self.assertEqual(checked["rejections"], [])
+        self.assertEqual(len(requests), 2)
+        self.assertNotIn("format", requests[0])
+        self.assertIn("Validation failures", requests[1]["messages"][-1]["content"])
+        self.assertTrue(checked["provider_attempts"][0]["validation"]["rejections"])
+        self.assertEqual(checked["provider_metadata"]["attempt_count"], 2)
+        self.assertEqual(provider_capabilities("https://ollama.com/api")["structured_output"], "best_effort_json")
+
+    async def test_transient_error_is_retried_but_authentication_is_not(self):
+        for code, expected in ((429, 3), (401, 1)):
+            requests = []
+            def transport(request):
+                requests.append(request)
+                return httpx.Response(code, json={"error": "SECRET"})
+            client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
+            with patch("app.repository.knowledge_pipeline.processing.httpx.AsyncClient", return_value=client), patch("app.repository.knowledge_pipeline.processing.RETRY_DELAYS", (0, 0)):
+                with self.assertRaises(RuntimeError) as raised:
+                    await call_ollama([unit()], ONTOLOGY, "https://ollama.com/api", "cloud-fixture")
+            self.assertEqual(len(requests), expected)
+            self.assertEqual(len(raised.exception.attempts), expected)
+            self.assertNotIn("SECRET", json.dumps(raised.exception.attempts))
 
     async def test_existing_api_suffix_is_not_duplicated(self):
         for base in ("http://localhost:11434", "http://localhost:11434/api", "http://localhost:11434/api/"):

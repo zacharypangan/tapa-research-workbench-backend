@@ -12,6 +12,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
     tesseract-ocr \
     tesseract-ocr-eng \
+    tesseract-ocr-chi-sim \
+    tesseract-ocr-chi-tra \
+    tesseract-ocr-jpn \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv for fast dependency management

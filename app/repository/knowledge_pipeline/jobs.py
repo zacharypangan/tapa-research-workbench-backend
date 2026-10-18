@@ -84,6 +84,7 @@ class GraphScheduler:
 
     def start(self):
         if self._task is None or self._task.done():
+            self._wakeup = asyncio.Event()
             self._task = asyncio.create_task(self._work(), name="workbench-document-graphs")
 
     async def stop(self):

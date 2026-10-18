@@ -77,11 +77,12 @@ class ObservationUpdate(BaseModel):
 
 
 class SemanticSearchRequest(BaseModel):
-    query: str = Field(..., min_length=2, max_length=500)
+    query: str = Field(..., min_length=2, max_length=1000)
     material_id: Optional[str] = None
     limit: int = Field(default=12, ge=1, le=50)
     include_observations: bool = True
     auto_index: bool = False
+    hybrid: bool = True
 
 
 class AskCorpusRequest(BaseModel):
@@ -97,7 +98,7 @@ class BuildSemanticIndexRequest(BaseModel):
 
 
 class MultimodalSearchRequest(BaseModel):
-    query: str = Field(..., min_length=2, max_length=500)
+    query: str = Field(..., min_length=2, max_length=1000)
     material_id: Optional[str] = None
     limit: int = Field(default=12, ge=1, le=50)
     include_observations: bool = True

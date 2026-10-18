@@ -2,6 +2,7 @@
 
 from importlib.util import find_spec
 from pathlib import Path
+import re
 from typing import Literal
 
 from fastapi import APIRouter, Header, HTTPException, Query
@@ -23,6 +24,11 @@ class DocumentRef(BaseModel):
 class RunCreate(BaseModel):
     documents: list[DocumentRef] = Field(min_length=1, max_length=20)
     config: dict = Field(default_factory=dict)
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class RetryRunRequest(BaseModel):
+    config: dict | None = None
     title: str | None = Field(default=None, min_length=1, max_length=200)
 
 
@@ -81,15 +87,34 @@ def resolve_documents(refs: list[DocumentRef]) -> list[dict]:
     root = Path(repository.FILES_ROOT).resolve()
     with repository.get_connection() as connection:
         for ref in refs:
-            row = connection.execute("SELECT f.stored_path, f.original_filename, m.title FROM files f JOIN materials m ON m.id=f.material_id WHERE f.id=? AND f.material_id=?", (ref.file_id, ref.material_id)).fetchone()
+            row = connection.execute("SELECT f.stored_path, f.original_filename, m.title, m.language FROM files f JOIN materials m ON m.id=f.material_id WHERE f.id=? AND f.material_id=?", (ref.file_id, ref.material_id)).fetchone()
             if row is None:
                 raise FileNotFoundError("Registered document not found")
             path = Path(row["stored_path"]).resolve()
             if not path.is_relative_to(root):
                 raise ValueError("Document must be in Workbench managed file storage")
             documents.append({"path": path, "title": row["title"] or row["original_filename"],
-                              "locator": f"workbench:material/{ref.material_id}/file/{ref.file_id}"})
+                              "locator": f"workbench:material/{ref.material_id}/file/{ref.file_id}",
+                              "filename": row["original_filename"], "ocr_languages": row["language"]})
     return documents
+
+
+def retry_source_metadata(store, run_id: str) -> dict:
+    """Restore registered language/filename for pre-representation legacy runs."""
+    from app.api import repository
+    from app.repository.knowledge_pipeline.store import read_json
+    descriptors = read_json(store.path(run_id) / "inputs.json")["documents"]
+    result = {}
+    with repository.get_connection() as connection:
+        for descriptor in descriptors:
+            locator = descriptor["original_locator"]
+            match = re.fullmatch(r"workbench:material/([^/]+)/file/([^/]+)", locator)
+            if not match:
+                continue
+            row = connection.execute("SELECT f.original_filename, m.language FROM files f JOIN materials m ON m.id=f.material_id WHERE m.id=? AND f.id=?", match.groups()).fetchone()
+            if row:
+                result[locator] = {"filename": row["original_filename"], "ocr_languages": row["language"]}
+    return result
 
 
 async def queue_run(run_id: str) -> dict:
@@ -129,22 +154,31 @@ def get_capabilities():
     from app.api import repository
     from app.repository.knowledge_pipeline.runtime import APPROVED_LOCAL_RUNTIME
     configured = repository.ai_chat_configured()
+    from app.repository.knowledge_pipeline.processing import provider_capabilities, PROMPT_VERSION
+    from app.repository.knowledge_pipeline.ontologies import ONTOLOGY_TEMPLATES
+    compatibility = provider_capabilities(repository.effective_ollama_base_url())
     collection_available = (find_spec("bs4") is not None and find_spec("httpx") is not None) or APPROVED_LOCAL_RUNTIME.is_file()
     return {
         "can_write": True,
         "can_review": True,
         "extraction": {
             "configured": configured,
+            "processing_version": PROMPT_VERSION,
             "default_mode": "ollama" if configured else "manual",
             "modes": [{"id": "ollama", "label": "Extract concepts automatically", "available": configured},
                       {"id": "manual", "label": "Add concepts from source text", "available": True}],
-            "detail": "Model availability is checked when extraction runs; configuration does not confirm a live connection.",
+            **compatibility,
+            "detail": compatibility["detail"] + " Configuration does not confirm live extraction quality.",
         },
         "collection": {"available": collection_available, "engine": "static",
+                       "discovery_methods": ["manual", "crossref"], "iterative_candidate_yield": True,
                        "label": "Collect from linked public web pages",
                        "detail": "Public web pages must be linked to concepts from your documents." if collection_available
                        else "Web collection needs the approved BeautifulSoup runtime in the worker environment."},
         "supported_formats": ["pdf", "txt", "md", "json", "docx"],
+        "retry": {"creates_derived_run": True, "preserves_original": True},
+        "ontology_templates": ONTOLOGY_TEMPLATES,
+        "evidence_selections": ["span_id", "character_offsets", "exact_quote"],
         "limits": {"max_documents": 20, "max_document_bytes": 50 * 1024 * 1024,
                    "max_input_bytes": 100 * 1024 * 1024, "max_pages": 25, "default_pages": 5},
         "statuses": {"created": "Ready to start", "queued": "Waiting to start", "running": "Processing",
@@ -152,6 +186,12 @@ def get_capabilities():
                      "awaiting_readable_documents": "Readable text needed", "awaiting_review": "Ready for review",
                      "released": "Published graph", "failed": "Needs attention", "queue_failed": "Queue unavailable"},
     }
+
+
+@router.get("/ontologies/{template_id}")
+def get_ontology(template_id: Literal["general", "tapa"]):
+    from app.repository.knowledge_pipeline.ontologies import ontology_template
+    return ontology_template(template_id)
 
 
 @router.get("/{run_id}")
@@ -182,6 +222,20 @@ async def resume_run(run_id: str):
     return {**run, **await queue_run(run_id)}
 
 
+@router.post("/{run_id}/retry", status_code=201)
+async def retry_run(run_id: str, body: RetryRunRequest,
+                    idempotency_key: str | None = Header(default=None, max_length=255)):
+    try:
+        pipeline = pipeline_for()
+        metadata = await run_in_threadpool(retry_source_metadata, pipeline.store, run_id)
+        run = await run_in_threadpool(pipeline.store.derive, run_id, ACTOR, body.config, body.title, idempotency_key, metadata)
+    except (ValueError, FileNotFoundError) as exc:
+        raise mapped_error(exc) from exc
+    if run["status"] != "created":
+        return run
+    return {**pipeline.store.describe(run["run_id"]), **await queue_run(run["run_id"])}
+
+
 @router.post("/{run_id}/annotations")
 def submit_annotations(run_id: str, body: AnnotationSubmission):
     try:
@@ -198,6 +252,15 @@ def submit_frontier(run_id: str, body: FrontierSubmission):
         return pipeline_for().submit_frontier(run_id, [item.model_dump() for item in body.frontier], ACTOR)
     except (ValueError, FileNotFoundError) as exc:
         raise mapped_error(exc) from exc
+
+
+@router.post("/{run_id}/discover", status_code=202)
+async def discover_run_sources(run_id: str):
+    try:
+        run = pipeline_for().request_discovery(run_id, ACTOR)
+    except (ValueError, FileNotFoundError) as exc:
+        raise mapped_error(exc) from exc
+    return {**run, **await queue_run(run_id)}
 
 
 @router.post("/{run_id}/skip-enrichment")

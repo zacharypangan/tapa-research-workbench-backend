@@ -74,7 +74,7 @@ class RunStore:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def create(self, documents: list[dict], config: dict, actor: str, idempotency_key: str | None = None,
-               title: str | None = None) -> dict:
+               title: str | None = None, parent_run_id: str | None = None) -> dict:
         if not 1 <= len(documents) <= 20:
             raise ValueError("Supply between 1 and 20 registered documents")
         if title is not None and (not isinstance(title, str) or not title.strip() or len(title) > 200):
@@ -95,11 +95,15 @@ class RunStore:
             descriptors.append({"source_id": f"DOC_{index:03d}", "title": document.get("title", path.name),
                                 "original_locator": document.get("locator", path.name),
                                 "input_path": f"inputs/DOC_{index:03d}{path.suffix.lower()}",
-                                "sha256": file_hash(path)})
+                                "sha256": file_hash(path), "original_filename": document.get("filename", path.name),
+                                "ocr_languages": document.get("ocr_languages")})
         implementation = {path.name: file_hash(path) for path in sorted(Path(__file__).parent.glob("*.py"))}
+        shared = Path(__file__).parent.parent / "document_representation.py"
+        if shared.is_file():
+            implementation["document_representation.py"] = file_hash(shared)
         fingerprint = digest({"documents": descriptors, "config": config, "title": title,
                               "pipeline_version": PIPELINE_VERSION,
-                              "implementation_sha256": implementation})
+                              "implementation_sha256": implementation, "parent_run_id": parent_run_id})
         # Serialize creation/idempotency lookup independently of per-run processing.
         with self.lock(self.root):
             index_path = self.root / "idempotency.json"
@@ -123,6 +127,7 @@ class RunStore:
                            "fingerprint": fingerprint, "ontology_sha256": digest(config["ontology"]),
                            "implementation_sha256": implementation,
                            "created_at": now(), "created_by": actor, "title": title.strip() if title else None,
+                           "parent_run_id": parent_run_id,
                            "documents": descriptors, "config": config})
                 write_json(path / "state.json", {"run_id": run_id, "status": "created", "stage": "ingest", "updated_at": now()})
             except Exception:
@@ -133,6 +138,31 @@ class RunStore:
                 write_json(index_path, index)
         return self.describe(run_id)
 
+    def derive(self, run_id: str, actor: str, config: dict | None = None,
+               title: str | None = None, idempotency_key: str | None = None,
+               source_metadata: dict | None = None) -> dict:
+        """Explicit current-code retry from immutable inputs; never rewrite old evidence."""
+        from .service import validate_config
+        path = self.path(run_id)
+        original = read_json(path / "inputs.json")
+        selected = validate_config(config if config is not None else original["config"])
+        documents = []
+        for document in original["documents"]:
+            snapshot = path / document["input_path"]
+            if file_hash(snapshot) != document["sha256"]:
+                raise ValueError("Original input snapshot was modified")
+            metadata = (source_metadata or {}).get(document["original_locator"], {})
+            documents.append({"path": snapshot, "title": document["title"], "locator": document["original_locator"],
+                              "filename": metadata.get("filename") or document.get("original_filename") or (document["title"] + snapshot.suffix),
+                              "ocr_languages": metadata.get("ocr_languages") or document.get("ocr_languages")})
+        version = {file.name: file_hash(file) for file in sorted(Path(__file__).parent.glob("*.py"))}
+        shared = Path(__file__).parent.parent / "document_representation.py"
+        if shared.is_file():
+            version["document_representation.py"] = file_hash(shared)
+        # Default retry replay is idempotent, including after a deployment/reload.
+        key = idempotency_key or "derived-" + digest([run_id, selected, title, version, [{key: item.get(key) for key in ("filename", "ocr_languages")} for item in documents]])
+        return self.create(documents, selected, actor, key, title or original.get("title"), parent_run_id=run_id)
+
     def summary(self, run_id: str) -> dict:
         path = self.path(run_id)
         state = read_json(path / "state.json")
@@ -142,6 +172,7 @@ class RunStore:
         title = inputs.get("title") or topic.strip() or documents[0]["title"]
         return {**state, "pipeline_version": inputs["pipeline_version"], "fingerprint": inputs["fingerprint"],
                 "ontology_sha256": inputs["ontology_sha256"], "created_at": inputs["created_at"],
+                "parent_run_id": inputs.get("parent_run_id"),
                 "title": title, "research_topic": topic, "document_count": len(documents),
                 "documents": [{"source_id": item["source_id"], "title": item["title"],
                                "locator": item["original_locator"]} for item in documents],

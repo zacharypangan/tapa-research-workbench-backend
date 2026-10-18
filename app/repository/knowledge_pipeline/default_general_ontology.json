@@ -1,0 +1,127 @@
+{
+  "ontology_id": "urn:research:ontology:general",
+  "version": "general-research/1.0",
+  "namespace": "urn:research:vocab:",
+  "design": "Source-local general research concepts and attributed evidence-bearing relations; no inferred identity or external knowledge.",
+  "entity_types": {
+    "Concept": "A source-reported concept, feature, topic or category.",
+    "Person": "A person explicitly named in the source; matching names do not establish cross-source identity.",
+    "Organization": "A source-reported institution, group or organization.",
+    "Place": "A source-reported place; coordinates require separately evidenced geometry.",
+    "TimeExpression": "An exact source date, period or temporal expression; uncertainty and calendar are retained.",
+    "Activity": "A bounded source-reported event or activity occurrence, distinguished from an activity category.",
+    "Artifact": "An identified physical object; matching names do not establish shared identity.",
+    "Material": "A source-reported material or substance category; matching names do not identify the same physical sample.",
+    "Language": "A named language or variety explicitly reported by the source; place names do not infer language.",
+    "Document": "A work, reference or document explicitly cited by the source; cited contents are not automatically consulted.",
+    "ActivityType": "A source-reported category of activities or processes; not a particular event.",
+    "ArtifactType": "A source-reported category or form of objects, distinguished from individual artifacts; classification does not establish function."
+  },
+  "predicates": {
+    "related_to": {
+      "definition": "An explicitly reported relationship; co-occurrence alone is insufficient.",
+      "requires_object": true
+    },
+    "part_of": {
+      "definition": "An explicitly reported part, member or component relationship.",
+      "requires_object": true
+    },
+    "located_in": {
+      "definition": "A source-reported location; storage, production and recovery contexts must remain in scope.",
+      "range": [
+        "Place"
+      ],
+      "requires_object": true
+    },
+    "occurred_at": {
+      "definition": "An activity's reported place.",
+      "domain": [
+        "Activity"
+      ],
+      "range": [
+        "Place"
+      ],
+      "requires_object": true
+    },
+    "dated_to": {
+      "definition": "An attributed date or period with uncertainty retained.",
+      "range": [
+        "TimeExpression"
+      ],
+      "requires_object": true
+    },
+    "uses": {
+      "definition": "A directly reported use; do not infer function from an object name.",
+      "domain": [
+        "Person",
+        "Organization",
+        "Activity",
+        "ActivityType"
+      ],
+      "range": [
+        "Artifact",
+        "Material",
+        "Concept",
+        "Language",
+        "ArtifactType"
+      ],
+      "requires_object": true
+    },
+    "produces": {
+      "definition": "An explicitly reported product of a person, organization or activity.",
+      "domain": [
+        "Person",
+        "Organization",
+        "Activity",
+        "ActivityType"
+      ],
+      "range": [
+        "Artifact",
+        "Material",
+        "Document",
+        "Concept",
+        "ArtifactType"
+      ],
+      "requires_object": true
+    },
+    "participates_in": {
+      "definition": "Reported participation, with role and case preserved in scope.",
+      "domain": [
+        "Person",
+        "Organization"
+      ],
+      "range": [
+        "Activity"
+      ],
+      "requires_object": true
+    },
+    "has_feature": {
+      "definition": "An explicitly described feature, quoted from the source.",
+      "range": [
+        "Concept"
+      ],
+      "requires_object": true
+    },
+    "documents": {
+      "definition": "A document explicitly reports or describes an entity; cited works remain unconsulted leads unless ingested.",
+      "domain": [
+        "Document"
+      ],
+      "requires_object": true
+    },
+    "has_definition": {
+      "definition": "An exact attributed definition or description; use a literal value when appropriate."
+    },
+    "aligns_reported_concept_with": {
+      "definition": "A reviewable comparison between source-local generic concepts; never accepted identity or fact transfer.",
+      "requires_object": true
+    }
+  },
+  "constraints": {
+    "every_assertion_has_evidence": true,
+    "source_scoped_identity_is_preserved": true,
+    "alignment_is_not_physical_identity_or_historical_transmission": true,
+    "unknown_is_not_absence": true,
+    "specialist_review_is_not_automatically_generated": true
+  }
+}

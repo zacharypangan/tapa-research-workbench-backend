@@ -85,6 +85,77 @@ class ResearchRunApiTests(unittest.TestCase):
         self.assertEqual(self.client.post(endpoint + "/resume").status_code, 422)
         self.assertEqual(self.client.get(endpoint + "/artifacts/.job.json").status_code, 404)
 
+    def test_explicit_current_processing_retry_preserves_original_and_is_idempotent(self):
+        _, original = self.create()
+        self.process(original["run_id"])
+        original_path = self.scheduler.store.path(original["run_id"])
+        prior = {name: (original_path / name).read_bytes() for name in ("inputs.json", "state.json", "primary_batches.json")}
+        # An old implementation is deliberately not resumed/overwritten in place.
+        old_inputs = read_json(original_path / "inputs.json")
+        old_inputs["implementation_sha256"]["processing.py"] = "old-version"
+        write_json(original_path / "inputs.json", old_inputs)
+        prior["inputs.json"] = (original_path / "inputs.json").read_bytes()
+        endpoint = f"/api/v1/research-runs/{original['run_id']}/retry"
+        fresh = self.client.post(endpoint, json={})
+        self.assertEqual(fresh.status_code, 201, fresh.text)
+        self.assertNotEqual(fresh.json()["run_id"], original["run_id"])
+        self.assertEqual(fresh.json()["parent_run_id"], original["run_id"])
+        duplicate = self.client.post(endpoint, json={})
+        self.assertEqual(duplicate.json()["run_id"], fresh.json()["run_id"])
+        for name, data in prior.items():
+            self.assertEqual((original_path / name).read_bytes(), data)
+        self.assertEqual(self.client.post(endpoint, json={"config": {"processing": {"mode": "unsafe"}}}).status_code, 422)
+
+    def test_versioned_ontology_templates_and_best_effort_capabilities(self):
+        capability = self.client.get("/api/v1/research-runs/capabilities").json()
+        self.assertTrue(capability["extraction"]["processing_version"])
+        self.assertEqual({row["id"] for row in capability["ontology_templates"]}, {"general", "tapa"})
+        general = self.client.get("/api/v1/research-runs/ontologies/general")
+        self.assertEqual(general.status_code, 200, general.text)
+        self.assertIn("Person", general.json()["entity_types"])
+        self.assertIn("related_to", general.json()["predicates"])
+        self.assertNotIn("ProductionCase", general.json()["entity_types"])
+        self.assertEqual(self.client.get("/api/v1/research-runs/ontologies/tapa").status_code, 200)
+        self.assertEqual(self.client.get("/api/v1/research-runs/ontologies/unknown").status_code, 422)
+        validate_config({"ontology": general.json()})
+
+    def test_discovery_request_is_a_queued_audited_action(self):
+        _, created = self.create()
+        run_id = created["run_id"]
+        self.process(run_id)
+        path = self.scheduler.store.path(run_id)
+        self.assertEqual(self.client.post(f"/api/v1/research-runs/{run_id}/discover").status_code, 422)
+        # Synthetic state transition; network discovery is tested with a mocked registry.
+        self.scheduler.store.state(path, "awaiting_frontier", "augmentation")
+        response = self.client.post(f"/api/v1/research-runs/{run_id}/discover")
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(response.json()["job_status"], "queued")
+        self.assertEqual(read_json(path / "discovery_request.json")["method"], "crossref")
+
+    def test_graph_ingest_uses_registered_filename_and_language_for_shared_ocr(self):
+        material = self.client.post("/api/v1/repository/materials", json={"title": "English catalogue title", "language": "ja"}).json()["id"]
+        upload = self.client.post(f"/api/v1/repository/materials/{material}/files", params={"filename": "日本語.pdf"}, content=b"synthetic PDF bytes")
+        run = self.client.post("/api/v1/research-runs", json={"documents": [{"material_id": material, "file_id": upload.json()["id"]}],
+            "config": {"augmentation": {"enabled": False}}}).json()
+        shared = {"representation_id": "japanese-page-v1", "method_version": "transcription-v1", "status": "text_ready", "warnings": [],
+                  "coverage": {"unreadable_locators": []}, "units": [{"page_index": 1, "locator": "page:1", "text": "樹皮布の道具。", "method": "tesseract_ocr", "language": "jpn", "confidence": .9}]}
+        with patch("app.repository.document_representation.extract_document", return_value=shared) as extract:
+            self.assertEqual(self.process(run["run_id"])["status"], "awaiting_annotations")
+        self.assertEqual(extract.call_args.args[1], "日本語.pdf")
+        self.assertEqual(extract.call_args.kwargs["languages"], "ja")
+        inputs = read_json(self.scheduler.store.path(run["run_id"]) / "inputs.json")
+        self.assertEqual(inputs["documents"][0]["original_filename"], "日本語.pdf")
+        self.assertEqual(inputs["documents"][0]["ocr_languages"], "ja")
+
+    def test_scheduler_restart_does_not_reuse_an_old_event_loop(self):
+        async def lifecycle():
+            self.scheduler.start()
+            await asyncio.sleep(.01)
+            self.assertFalse(self.scheduler._task.done())
+            await self.scheduler.stop()
+        asyncio.run(lifecycle())
+        asyncio.run(lifecycle())
+
     def test_input_validation_listing_and_protected_artifact_paths(self):
         _, first = self.create(key="one")
         _, second = self.create(key="two", title="Second graph")

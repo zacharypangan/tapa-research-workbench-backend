@@ -22,6 +22,9 @@ class RepositoryImageSearchTests(unittest.TestCase):
         repository.init_repository_db()
         self.stack.enter_context(patch.object(repository, "ai_configured", return_value=True))
         self.stack.enter_context(patch.object(repository, "is_informative_image", return_value=True))
+        self.stack.enter_context(patch.object(repository, "request_image_caption", new=AsyncMock(return_value="A wooden beater.")))
+        self.image_path = self.root / "synthetic.png"
+        self.image_path.write_bytes(b"synthetic image fixture")
         self.embedding = self.stack.enter_context(patch.object(
             repository, "request_embedding", new=AsyncMock(return_value=[1.0, 0.0])))
         with repository.get_connection() as con:
@@ -35,8 +38,8 @@ class RepositoryImageSearchTests(unittest.TestCase):
                      page_ref, page_index, image_path, extraction_method, ocr_text,
                      visual_caption, created_at)
                     VALUES (?, ?, 'document_image', 'file_pdf', 'synthetic.pdf',
-                            'page:1', 1, 'synthetic.png', 'test', 'wooden beater',
-                            'A wooden beater.', 'test')""", (material_id + "-image", material_id))
+                            'page:1', 1, ?, 'test', 'wooden beater',
+                            'A wooden beater.', 'test')""", (material_id + "-image", material_id, str(self.image_path)))
 
     def check_provider_roundtrip(self, provider, model):
         with patch.object(repository, "EMBEDDING_PROVIDER", provider), \

@@ -103,44 +103,42 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(result["source"]["status"], "unreadable_or_empty")
         self.assertIn("does not establish", result["source"]["warnings"][0])
 
-    def test_scanned_pdf_is_flagged_without_false_absence(self):
-        raw = b"pdf fixture bytes"
-        page = SimpleNamespace(get_text=lambda mode: "")
-        document = SimpleNamespace(page_count=1, load_page=lambda index: page, close=lambda: None)
-        calls = []
+    def test_scanned_pdf_uses_shared_ocr_transcription_with_page_provenance(self):
+        shared = {"representation_id": "shared-v1", "method_version": "transcription-v1",
+                  "units": [{"locator": "page:1", "page_index": 1, "text": "石拍用于树皮布。", "method": "tesseract_ocr", "language": "chi_sim", "confidence": .9}],
+                  "status": "text_ready", "warnings": [],
+                  "coverage": {"unreadable_locators": [], "readable_units": 1}}
+        with patch("app.repository.document_representation.extract_document", return_value=shared) as extract:
+            result = self.ingest(self.document("scanned.pdf", b"pdf fixture bytes"))
+        self.assertEqual(result["source"]["shared_representation_id"], "shared-v1")
+        self.assertEqual(result["source"]["transcription_methods"], ["tesseract_ocr"])
+        self.assertEqual(result["units"][0]["locator"]["pdf_page"], 1)
+        self.assertEqual(result["units"][0]["text"], "石拍用于树皮布。")
+        self.assertEqual(result["units"][0]["representation_method"], "tesseract_ocr")
+        self.assertTrue(extract.called)
 
-        def open_pdf(**kwargs):
-            calls.append(kwargs)
-            return document
-
-        with patch.object(adapters.importlib, "import_module", return_value=SimpleNamespace(open=open_pdf)):
-            result = self.ingest(self.document("scanned.pdf", raw))
-        self.assertEqual(calls, [{"stream": raw, "filetype": "pdf"}])
-        self.assertEqual(result["units"], [])
+    def test_scanned_pdf_without_ocr_still_reports_missing_pages(self):
+        shared = {"representation_id": "shared-empty", "method_version": "transcription-v1", "units": [],
+                  "status": "unreadable_or_empty", "warnings": ["OCR language data missing"],
+                  "coverage": {"unreadable_locators": ["page:1"], "readable_units": 0}}
+        with patch("app.repository.document_representation.extract_document", return_value=shared):
+            result = self.ingest(self.document("scanned.pdf", b"pdf fixture bytes"))
         self.assertEqual(result["source"]["unreadable_locators"], [{"kind": "pdf_page", "pdf_page": 1}])
         self.assertEqual(result["source"]["status"], "unreadable_or_empty")
-        self.assertIn("No absence claim", result["source"]["warnings"][0])
+        self.assertIn("No readable text", result["source"]["warnings"][-1])
 
-    def test_pdf_fallback_discards_partial_failed_parser_output(self):
+    def test_legacy_pdf_fallback_discards_partial_failed_parser_output(self):
         def load_page(index):
             if index:
                 raise RuntimeError("broken page")
             return SimpleNamespace(get_text=lambda mode: "discarded partial text")
-
         primary = SimpleNamespace(open=lambda **kwargs: SimpleNamespace(page_count=2, load_page=load_page, close=lambda: None))
         fallback = SimpleNamespace(PdfReader=lambda stream: SimpleNamespace(pages=[SimpleNamespace(extract_text=lambda: "Fallback page")]))
         with patch.object(adapters.importlib, "import_module", side_effect=lambda name: primary if name == "fitz" else fallback):
-            result = self.ingest(self.document("fallback.pdf", b"same bytes"))
-        self.assertEqual([u["text"] for u in result["units"]], ["Fallback page"])
-        self.assertEqual(result["units"][0]["locator"]["pdf_page"], 1)
-        self.assertEqual(result["source"]["extractor"], "pypdf")
-        self.assertIn("RuntimeError", result["source"]["warnings"][0])
-
-    def test_missing_pdf_runtime_is_explicit(self):
-        with patch.object(adapters.importlib, "import_module", side_effect=ImportError("not installed")):
-            with self.assertRaisesRegex(ImportError, "installed PyMuPDF"):
-                self.ingest(self.document("paper.pdf", b"pdf"))
-        self.assertFalse((self.base / "ingest").exists())
+            parts, extractor, warnings, empty = adapters._pdf_parts(b"same bytes")
+        self.assertEqual(parts[0][1], "Fallback page")
+        self.assertEqual(extractor, "pypdf")
+        self.assertIn("RuntimeError", warnings[0])
 
     def test_frontier_requires_explicit_seeds_and_operator_bounded_options(self):
         valid = [{"url": "https://example.org/item", "seed_ids": ["P1:e1"], "question": "Reported plant material?"}]

@@ -228,7 +228,7 @@ def _pdf_parts(data: bytes) -> tuple[list[tuple[dict, str]], str, list[str], lis
 
 
 def ingest_document(path: Path, source_id: str, title: str, output_dir: Path,
-                    origin: str = "primary") -> dict:
+                    origin: str = "primary", filename: str | None = None, languages=None) -> dict:
     """Copy and extract a local source, preserving exact bytes and real locators."""
     path = Path(path)
     _identifier(source_id, "source_id")
@@ -246,26 +246,36 @@ def ingest_document(path: Path, source_id: str, title: str, output_dir: Path,
     if len(data) > MAX_DOCUMENT_BYTES:
         raise ValueError("Document exceeds the 50 MiB ingestion limit")
     raw_hash = _sha(data)
-    warnings, empty = [], []
-    if suffix in {".txt", ".md"}:
-        parts, extractor, source_kind = _text_parts(_utf8(data, "Text document")), "stdlib_utf8_text_spans", "file_text"
-    elif suffix == ".json":
-        parts, extractor, source_kind = _json_parts(data), "stdlib_json_leaf_pointers", "file_json"
-    elif suffix == ".docx":
-        parts, warnings = _docx_parts(data)
-        extractor, source_kind = "stdlib_docx_xml_paragraphs_tables", "file_docx"
-    else:
-        parts, extractor, warnings, empty = _pdf_parts(data)
-        source_kind = "file_pdf"
+    from app.repository.document_representation import extract_document
+    shared = extract_document(path, filename or path.name, languages=languages)
+    warnings = list(shared["warnings"])
+    if suffix != ".pdf" and any(warning.startswith("Document transcription failed:") for warning in warnings):
+        raise ValueError(("Malformed DOCX: " if suffix == ".docx" else "") + " ".join(warnings))
+    empty = [{"kind": "pdf_page", "pdf_page": int(locator.split(":")[-1])}
+             for locator in shared["coverage"].get("unreadable_locators", []) if locator.startswith("page:")]
+    parts = []
+    for transcription in shared["units"]:
+        locator = transcription.get("source_locator")
+        if locator is None:
+            locator = {"kind": "pdf_page", "pdf_page": transcription["page_index"],
+                       "representation_id": shared["representation_id"], "method": transcription["method"],
+                       "language": transcription.get("language"), "confidence": transcription.get("confidence"),
+                       "text_basis": "source transcription; layout/table interpretation not established"}
+        parts.append((locator, transcription["text"]))
+    extractor = shared["method_version"]
+    source_kind = {".pdf": "file_pdf", ".docx": "file_docx", ".json": "file_json"}.get(suffix, "file_text")
     version = source_id + ":" + raw_hash
     units = [_unit(source_id, version, locator, text) for locator, text in parts]
+    if shared:
+        for unit, transcription in zip(units, shared["units"]):
+            unit["representation_method"] = transcription["method"]
     representation = _jsonl_bytes(units)
     directory = _fresh_directory(output_dir)
     snapshot = directory / ("snapshot" + suffix)
     representation_path = directory / "units.jsonl"
     _write(snapshot, data)
     _write(representation_path, representation)
-    status = "unreadable_or_empty" if not units else "partial_text" if empty else "extracted"
+    status = ("unreadable_or_empty" if not units else "partial_text" if empty or (shared and shared["status"] == "partial_text") else "extracted")
     if not units:
         warnings.append("No readable text was extracted; this does not establish that the source lacks relevant information.")
     source = {"source_id": source_id, "source_version_id": version, "title": title,
@@ -278,6 +288,11 @@ def ingest_document(path: Path, source_id: str, title: str, output_dir: Path,
               "python_version": platform.python_version(), "status": status,
               "unreadable_locators": empty, "warnings": warnings,
               "review_status": "needs_review", "seed_ids": []}
+    if shared:
+        source["shared_representation_id"] = shared["representation_id"]
+        source["transcription_coverage"] = shared["coverage"]
+        source["transcription_methods"] = sorted({unit["method"] for unit in shared["units"]})
+        _write(directory / "transcription.json", _json_bytes(shared))
     _write(directory / "source.json", _json_bytes(source))
     return {"source": source, "units": units}
 

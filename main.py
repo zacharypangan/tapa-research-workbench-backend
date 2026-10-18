@@ -2,8 +2,9 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.db import init_db
-from app.api import tiles, chat, data, repository, research_runs
+from app.api import tiles, chat, data, repository, research_runs, processing
 from app.repository.knowledge_pipeline.jobs import get_scheduler
+from app.repository.processing_jobs import get_processing_scheduler
 
 app = FastAPI(title="Tapa Research Workbench Backend")
 
@@ -36,6 +37,7 @@ app.include_router(chat.router, prefix="/api/v1")
 app.include_router(data.router, prefix="/api/v1")
 app.include_router(repository.router, prefix="/api/v1")
 app.include_router(research_runs.router, prefix="/api/v1")
+app.include_router(processing.router, prefix="/api/v1")
 
 
 @app.on_event("startup")
@@ -43,10 +45,12 @@ async def on_startup():
     init_db()
     repository.init_repository_db()
     get_scheduler().start()
+    get_processing_scheduler().start()
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    await get_processing_scheduler().stop()
     await get_scheduler().stop()
 
 
