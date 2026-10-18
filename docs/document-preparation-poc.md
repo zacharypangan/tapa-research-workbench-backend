@@ -115,3 +115,13 @@ Fixed real-paper comparison, same 69/69 readable pages:
 | v4 `d4eac48e…` | 8/15 | 7/15 | 29 | 114 | 41 | 99 |
 
 Both are partial/unreviewed drafts. Fewer candidates is not a recall metric; batch validation and error reduction measure extraction reliability only. Reports are saved as `baseline-verified.json` and `v4-verified.json` in the POC folder. v5 requires its own verification after processing; its model-address and retry changes are not included in these v4 results.
+
+## Continued staging acceptance
+
+Backend code `30ddc6b` is deployed to Railway staging as `170f6f24-7854-4b78-a470-20701beb6d60`. The combined focused suite passed 191 tests, with one existing local language check skipped. This includes real spawned PDF work, worker crash recovery, validated-response fallback, permanent error handling, OCR search invalidation and two-consumer scheduling/cancellation.
+
+The existing five-paper material completed preparation again: all 69 pages readable, no omitted pages, 70/70 current text vectors and **82/82 fully described/current image vectors**, with no remaining preparation errors. Text vectors were reused. A live multimodal query returned five prepared image hits. One Taiwan-paper page and its generated observable labels were visually inspected; all-caption accuracy and retrieval relevance have not been benchmarked. Generated labels remain separate from quoted source text.
+
+The new full-paper graph run is `46688e67-f38e-4a44-a5e5-2431b93f3ca7`; graph validation/review is separate from document preparation completion. Two runs active during the scheduler deployment refused the changed immutable `jobs.py` hash as designed; derived runs preserve original histories and revalidate eligible parent checkpoints. Do not edit pinned hashes to resume a previous implementation.
+
+Live collection acceptance uses bounded, explicitly labelled Sulawesi excerpts with parent-unit hashes and Unicode offsets. The ANU attempt recorded `robots_unavailable` and collected no web evidence; it does not count as augmentation success. A separate museum attempt uses an actual validated material seed and one selected public paragraph. Its saved metrics, entity relevance records and two-sided link checks are in `SampleReports/platform_service_fixes_2026-10-19/poc/augmentation-museum/`. These small tests do not establish full-corpus augmentation or scientific acceptance.
