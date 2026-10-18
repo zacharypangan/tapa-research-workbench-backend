@@ -145,7 +145,9 @@ def _parse_pdf(path: Path, runtime: dict, page_cache: Path | None = None) -> tup
             text = (page.get_text("text") or "").strip()
             method, confidence, language = "native_pdf", None, None
             # Native text wins unless a text-poor page yields a richer transcription.
-            needs_ocr = len(text) < 80 and bool(page.get_images(full=True) or page.get_drawings())
+            corrupt_characters = sum((ord(char) < 32 and char not in "\n\r\t") or "\ue000" <= char <= "\uf8ff" for char in text)
+            bad_encoding = bool(text) and corrupt_characters / len(text) > 0.02
+            needs_ocr = bad_encoding or (len(text) < 80 and bool(page.get_images(full=True) or page.get_drawings()))
             if needs_ocr:
                 cached_page = page_cache / f"page-{index + 1}.json" if page_cache is not None else None
                 result = None
@@ -167,9 +169,11 @@ def _parse_pdf(path: Path, runtime: dict, page_cache: Path | None = None) -> tup
                 elif result is None:
                     result = {"text": "", "warnings": runtime["warnings"]}
                 warnings.extend(f"page:{index + 1}: {warning}" for warning in result["warnings"])
-                if len(result["text"]) > len(text):
+                if result["text"] and (bad_encoding or len(result["text"]) > len(text)):
                     text, method = result["text"], "tesseract_ocr"
                     confidence, language = result["confidence"], result["language"]
+                elif bad_encoding:
+                    warnings.append(f"page:{index + 1}: native text contains encoding artifacts; OCR could not replace it. Review this page before using its text.")
             if text:
                 units.append(_unit(f"page:{index + 1}", index + 1, text, method,
                                    language=language, confidence=confidence))
