@@ -97,6 +97,8 @@ class RunStore:
                                 "input_path": f"inputs/DOC_{index:03d}{path.suffix.lower()}",
                                 "sha256": file_hash(path), "original_filename": document.get("filename", path.name),
                                 "ocr_languages": document.get("ocr_languages")})
+            if document.get("representation_kind") == "registered_extraction":
+                descriptors[-1]["representation_kind"] = "registered_extraction"
         implementation = {path.name: file_hash(path) for path in sorted(Path(__file__).parent.glob("*.py"))}
         shared = Path(__file__).parent.parent / "document_representation.py"
         if shared.is_file():
@@ -155,6 +157,8 @@ class RunStore:
             documents.append({"path": snapshot, "title": document["title"], "locator": document["original_locator"],
                               "filename": metadata.get("filename") or document.get("original_filename") or (document["title"] + snapshot.suffix),
                               "ocr_languages": metadata.get("ocr_languages") or document.get("ocr_languages")})
+            if document.get("representation_kind") == "registered_extraction":
+                documents[-1]["representation_kind"] = "registered_extraction"
         version = {file.name: file_hash(file) for file in sorted(Path(__file__).parent.glob("*.py"))}
         shared = Path(__file__).parent.parent / "document_representation.py"
         if shared.is_file():
@@ -177,8 +181,28 @@ class RunStore:
                 "documents": [{"source_id": item["source_id"], "title": item["title"],
                                "locator": item["original_locator"]} for item in documents],
                 "processing_mode": inputs["config"].get("processing", {}).get("mode", "manual"),
+                "max_auto_batches": inputs["config"].get("processing", {}).get("max_auto_batches"),
+                "has_saved_candidates": self.has_saved_candidates(path, state),
                 "augmentation_enabled": inputs["config"].get("augmentation", {}).get("enabled", False),
                 "max_pages": inputs["config"].get("augmentation", {}).get("max_pages", 5)}
+
+    @staticmethod
+    def has_saved_candidates(path: Path, state: dict) -> bool:
+        """Small listing hint; a saved candidate is still explicitly unreviewed."""
+        preferred = ([path / state["release_path"] / "graph.json"]
+                     if state.get("status") == "released" and state.get("release_path") else [])
+        preferred += [path / "graph_input.json", path / "validated_preview.json"]
+        try:
+            for artifact in preferred:
+                if artifact.is_file():
+                    return bool(read_json(artifact, {}).get("entities"))
+            for directory in ("processed", "validated_candidates"):
+                for artifact in sorted((path / directory).glob("*.json"))[:20]:
+                    if read_json(artifact, {}).get("entities"):
+                        return True
+        except (OSError, ValueError, AttributeError):
+            return False
+        return False
 
     def list_runs(self, limit: int = 20, offset: int = 0, material_id: str | None = None) -> dict:
         if not 1 <= limit <= 100 or not 0 <= offset <= 100000:

@@ -32,6 +32,13 @@ class RetryRunRequest(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=200)
 
 
+class ExtractionRunCreate(BaseModel):
+    material_id: str = Field(min_length=1, max_length=255)
+    file_ids: list[str] | None = Field(default=None, min_length=1, max_length=20)
+    config: dict = Field(default_factory=dict)
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+
+
 class AnnotationSubmission(BaseModel):
     responses: dict[str, dict]
 
@@ -150,6 +157,22 @@ def list_runs(limit: int = Query(default=20, ge=1, le=100), offset: int = Query(
     return pipeline_for().store.list_runs(limit, offset, material_id=material_id)
 
 
+@router.post("/from-extraction", status_code=201)
+async def create_extraction_run(body: ExtractionRunCreate, idempotency_key: str | None = Header(default=None, max_length=255)):
+    """Use registered text for any extracted format; preserve its original file attribution."""
+    from app.repository.knowledge_pipeline.registered_extraction import registered_documents
+    try:
+        config = validate_config(body.config)
+        documents = await run_in_threadpool(registered_documents, body.material_id, body.file_ids)
+        pipeline = pipeline_for()
+        run = await run_in_threadpool(pipeline.store.create, documents, config, ACTOR, idempotency_key, body.title)
+    except (ValueError, FileNotFoundError) as exc:
+        raise mapped_error(exc) from exc
+    if run["status"] != "created":
+        return run
+    return {**pipeline.store.describe(run["run_id"]), **await queue_run(run["run_id"])}
+
+
 @router.get("/capabilities")
 def get_capabilities():
     from app.api import repository
@@ -178,6 +201,9 @@ def get_capabilities():
                        else "Web collection needs the approved BeautifulSoup runtime in the worker environment."},
         "image_description": repository.image_description_diagnostics(),
         "supported_formats": ["pdf", "txt", "md", "json", "docx"],
+        "registered_extraction": {"available": True, "endpoint": "/research-runs/from-extraction",
+                                  "preserves_original_files": True, "supports_any_registered_extracted_format": True},
+        "automatic_batch_budget": {"available": True, "per_pass": True, "maximum": 100, "default": None},
         "retry": {"creates_derived_run": True, "preserves_original": True},
         "ontology_templates": ONTOLOGY_TEMPLATES,
         "evidence_selections": ["span_id", "character_offsets", "exact_quote"],

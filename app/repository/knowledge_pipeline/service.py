@@ -9,10 +9,14 @@ import json
 import ipaddress
 import math
 import uuid
+from contextvars import ContextVar
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .store import RunStore, digest, file_hash, now, read_json, write_json
+
+
+_AUTO_BATCH_BUDGET = ContextVar("graph_auto_batch_budget", default=None)
 
 
 def default_config() -> dict:
@@ -46,6 +50,9 @@ def validate_config(config: dict) -> dict:
         raise ValueError("Processing mode must be manual or ollama")
     if type(result["processing"]["batch_chars"]) is not int or not 1000 <= result["processing"]["batch_chars"] <= 24000:
         raise ValueError("batch_chars must be between 1000 and 24000")
+    limit = result["processing"].get("max_auto_batches")
+    if limit is not None and (type(limit) is not int or not 1 <= limit <= 100):
+        raise ValueError("max_auto_batches must be null or an integer between 1 and 100")
     augmentation = result["augmentation"]
     if type(augmentation["enabled"]) is not bool:
         raise ValueError("augmentation.enabled must be a boolean")
@@ -66,7 +73,7 @@ def validate_config(config: dict) -> dict:
     for key, low, high in (("min_avg_novel_entities", 0, 100), ("duplicate_ceiling", 0, 1)):
         if type(augmentation[key]) not in {int, float} or not math.isfinite(augmentation[key]) or not low <= augmentation[key] <= high:
             raise ValueError(f"augmentation.{key} must be between {low} and {high}")
-    if set(augmentation) - permitted or set(result["processing"]) - {"mode", "batch_chars"}:
+    if set(augmentation) - permitted or set(result["processing"]) - {"mode", "batch_chars", "max_auto_batches"}:
         raise ValueError("Unsupported pipeline option")
     if not isinstance(result["research_topic"], str) or len(result["research_topic"]) > 500:
         raise ValueError("research_topic must contain at most 500 characters")
@@ -203,6 +210,11 @@ class ResearchPipeline:
         missing, outputs = [], []
         format_failure_streak = 0
         format_budget_reached = False
+        budget = _AUTO_BATCH_BUDGET.get()
+        if budget is None:
+            budget = {"limit": config["processing"].get("max_auto_batches"), "used": 0}
+        budget_reached = False
+        deferred_ids = []
         for batch_index, batch in enumerate(batches):
             identifier = batch["batch_id"]
             checkpoint = path / "processed" / f"{identifier}.json"
@@ -227,6 +239,12 @@ class ResearchPipeline:
                 output, response, metadata = reused
                 write_json(path / "provider_responses" / f"{identifier}.json", response)
             elif config["processing"]["mode"] == "ollama" and self.provider:
+                if budget["limit"] is not None and budget["used"] >= budget["limit"]:
+                    budget_reached = True
+                    deferred_ids.append(identifier)
+                    missing.append(identifier)
+                    continue
+                budget["used"] += 1
                 response = None
                 try:
                     output = await self.provider(batch["units"], config["ontology"])
@@ -279,14 +297,20 @@ class ResearchPipeline:
                 safe = merge_outputs(partial)
                 write_json(path / "validated_preview.json", {**safe,
                     "sources": read_json(path / "ingest.json", {}).get("sources", []), "alignments": [],
-                    "partial_extraction": True, "pending_batch_count": len(missing)})
+                    "partial_extraction": True, "pending_batch_count": len(missing),
+                    "automatic_batch_budget_reached": budget_reached})
             rejected_ids = [identifier for identifier in missing
                             if (path / "rejected_batches" / f"{identifier}.json").exists()]
             self.store.state(path, "awaiting_annotations", stage, missing_batch_ids=missing,
                              rejected_batch_ids=rejected_ids,
+                             automatic_batch_budget_reached=budget_reached,
+                             deferred_batch_ids=deferred_ids, automatic_batches_this_pass=budget["used"],
+                             entity_count=len(safe["entities"]) if name == "primary" else None,
+                             assertion_count=len(safe["assertions"]) if name == "primary" else None,
                              provider_format_budget_reached=format_budget_reached,
                              detail="Two consecutive batches returned malformed candidate JSON; provider work stopped for this pass. Correct rejected batches or retry with corrected provider settings; remaining batches are preserved."
-                             if format_budget_reached else "Extraction could not be validated. Add source-grounded annotations; original responses and rejection reasons are saved under rejected_batches/."
+                             if format_budget_reached else f"Saved a partial graph after {budget['used']} automatic batches this pass. All source passages remain registered. Resume to process the next passages; rejected batches still require correction."
+                             if budget_reached else "Extraction could not be validated. Add source-grounded annotations; original responses and rejection reasons are saved under rejected_batches/."
                              if rejected_ids else "Submit source-grounded annotations or configure the existing Ollama runtime")
             return None
         result = merge_outputs(outputs)
@@ -369,6 +393,14 @@ class ResearchPipeline:
 
     async def run(self, run_id: str) -> dict:
         path = self.store.path(run_id)
+        config = read_json(path / "inputs.json")["config"]
+        token = _AUTO_BATCH_BUDGET.set({"limit": config["processing"].get("max_auto_batches"), "used": 0})
+        try:
+            return await self._run_with_budget(run_id, path)
+        finally:
+            _AUTO_BATCH_BUDGET.reset(token)
+
+    async def _run_with_budget(self, run_id: str, path: Path) -> dict:
         with self.store.lock(path):
             try:
                 await self._advance(path)
@@ -406,8 +438,12 @@ class ResearchPipeline:
                 if destination.exists():
                     import shutil
                     shutil.rmtree(destination)
-                result = await blocking_stage(ingest_document, raw, document["source_id"], document["title"], destination,
-                                              "primary", document.get("original_filename") or (document["title"] + raw.suffix), document.get("ocr_languages"))
+                if document.get("representation_kind") == "registered_extraction":
+                    from .registered_extraction import ingest_registered_extraction
+                    result = await blocking_stage(ingest_registered_extraction, raw, document["source_id"], document["title"], destination)
+                else:
+                    result = await blocking_stage(ingest_document, raw, document["source_id"], document["title"], destination,
+                                                  "primary", document.get("original_filename") or (document["title"] + raw.suffix), document.get("ocr_languages"))
                 result["source"]["source_locator"] = document["original_locator"]
                 sources.append(result["source"])
                 units.extend(result["units"])

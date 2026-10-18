@@ -1,6 +1,7 @@
 """Hosted MVP graph API checks use temporary repository storage, no live model/network."""
 
 import asyncio
+import hashlib
 from contextlib import ExitStack
 from pathlib import Path
 import tempfile
@@ -64,6 +65,8 @@ class ResearchRunApiTests(unittest.TestCase):
         self.assertEqual(self.client.post(endpoint + "/resume").status_code, 202)
         self.assertEqual(self.process(run_id)["status"], "awaiting_review")
         graph = self.client.get(endpoint + "/artifacts/graph_input.json").json()
+        self.assertTrue(self.client.get(endpoint).json()["has_saved_candidates"])
+        self.assertTrue(self.client.get("/api/v1/research-runs").json()["items"][0]["has_saved_candidates"])
         self.assertEqual(len(graph["entities"]), 2)
         self.assertEqual(len(graph["assertions"]), 1)
         self.assertEqual(graph["sources"][0]["source_locator"],
@@ -118,6 +121,56 @@ class ResearchRunApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/v1/research-runs/ontologies/tapa").status_code, 200)
         self.assertEqual(self.client.get("/api/v1/research-runs/ontologies/unknown").status_code, 422)
         validate_config({"ontology": general.json()})
+
+    def test_registered_extraction_preserves_csv_original_and_segment_attribution(self):
+        material = self.client.post("/api/v1/repository/materials", json={"title": "CSV source"}).json()["id"]
+        original_bytes = b"term,meaning\nbeater,barkcloth tool\n"
+        uploaded = self.client.post(f"/api/v1/repository/materials/{material}/files", params={"filename": "original.csv"}, content=original_bytes).json()
+        with repository.get_connection() as connection:
+            connection.execute("INSERT INTO extracted_segments (material_id,file_id,source_kind,source_locator,page_ref,page_index,content_text,char_count,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (material, uploaded["id"], "file_csv", "original.csv", "row:2", 2, "A stone beater processes barkcloth.", 34, "2026-10-19T00:00:00Z"))
+            connection.commit()
+        body = {"material_id": material, "file_ids": [uploaded["id"]], "title": "Demo saved draft — CSV source",
+                "config": {"ontology": ONTOLOGY, "processing": {"mode": "manual", "max_auto_batches": 2}, "augmentation": {"enabled": False}}}
+        endpoint = "/api/v1/research-runs/from-extraction"
+        created = self.client.post(endpoint, json=body, headers={"Idempotency-Key": "csv-demo"})
+        self.assertEqual(created.status_code, 201, created.text)
+        run_id = created.json()["run_id"]
+        self.assertEqual(self.client.post(endpoint, json=body, headers={"Idempotency-Key": "csv-demo"}).json()["run_id"], run_id)
+        self.assertEqual(self.process(run_id)["status"], "awaiting_annotations")
+        path = self.scheduler.store.path(run_id)
+        ingest = read_json(path / "ingest.json")
+        self.assertEqual(len(ingest["units"]), 1)
+        self.assertEqual(ingest["units"][0]["text"], "A stone beater processes barkcloth.")
+        locator = ingest["units"][0]["locator"]
+        self.assertEqual(locator["page_ref"], "row:2")
+        self.assertEqual(locator["original_file_sha256"], hashlib.sha256(original_bytes).hexdigest())
+        self.assertEqual(ingest["sources"][0]["source_kind"], "registered_extraction")
+        self.assertEqual(ingest["sources"][0]["derived_from"]["original_filename"], "original.csv")
+        self.assertNotEqual(ingest["sources"][0]["raw_sha256"], locator["original_file_sha256"])
+        material_after = self.client.get(f"/api/v1/repository/materials/{material}").json()
+        self.assertEqual(len(material_after["files"]), 1)
+        self.assertEqual(self.client.get(f"/api/v1/repository/materials/{material}/files/{uploaded['id']}").content, original_bytes)
+        fresh = self.client.post(f"/api/v1/research-runs/{run_id}/retry", json={}).json()
+        self.assertEqual(read_json(self.scheduler.store.path(fresh["run_id"]) / "inputs.json")["documents"][0]["representation_kind"], "registered_extraction")
+        self.assertEqual(self.process(fresh["run_id"])["status"], "awaiting_annotations")
+        self.assertEqual(self.client.post(endpoint, json={**body, "file_ids": ["foreign-file"]}).status_code, 422)
+
+    def test_registered_extraction_requires_readable_registered_text(self):
+        material = self.client.post("/api/v1/repository/materials", json={"title": "Unextracted"}).json()["id"]
+        self.client.post(f"/api/v1/repository/materials/{material}/files", params={"filename": "source.rtf"}, content=b"original RTF bytes")
+        response = self.client.post("/api/v1/research-runs/from-extraction", json={"material_id": material})
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("extract this file first", response.text)
+
+    def test_empty_candidate_artifact_is_not_a_saved_demo(self):
+        _, created = self.create()
+        run_id = created["run_id"]
+        path = self.scheduler.store.path(run_id)
+        write_json(path / "validated_candidates" / "empty.json", {"entities": [], "assertions": [], "evidence": []})
+        self.assertFalse(self.client.get(f"/api/v1/research-runs/{run_id}").json()["has_saved_candidates"])
+        write_json(path / "processed" / "one.json", {"entities": [{"entity_id": "fixture-only"}]})
+        self.assertTrue(self.client.get(f"/api/v1/research-runs/{run_id}").json()["has_saved_candidates"])
 
     def test_discovery_request_is_a_queued_audited_action(self):
         _, created = self.create()

@@ -248,9 +248,77 @@ class PipelineTests(unittest.TestCase):
 
     def test_malformed_options_fail_validation(self):
         for config in ({"processing": None}, {"processing": {"mode": []}}, {"augmentation": {"enabled": "false"}},
-                       {"augmentation": {"max_pages": "5"}}, {"processing": {"batch_chars": True}}):
+                       {"augmentation": {"max_pages": "5"}}, {"processing": {"batch_chars": True}},
+                       *({"processing": {"max_auto_batches": value}} for value in (0, 101, True, "2", 1.5))):
             with self.assertRaises(ValueError):
                 validate_config(config)
+
+    def test_bounded_automatic_pass_keeps_all_passages_and_resumes_without_repeating(self):
+        self.document.write_text("\n\n".join("A stone beater processes barkcloth. " + str(index) + " x" * 400 for index in range(3)))
+        config = validate_config({"ontology": ONTOLOGY, "processing": {"mode": "ollama", "batch_chars": 1000, "max_auto_batches": 2},
+                                  "augmentation": {"enabled": False}})
+        run_id = self.store.create([{"path": self.document}], config, "researcher")["run_id"]
+        state = self.advance(run_id)
+        path = self.store.path(run_id)
+        self.assertEqual(self.calls["model"], 2)
+        self.assertTrue(state["automatic_batch_budget_reached"])
+        self.assertEqual(len(read_json(path / "primary_batches.json")), 3)
+        self.assertEqual(len(read_json(path / "ingest.json")["units"]), 3)
+        preview = read_json(path / "validated_preview.json")
+        self.assertTrue(preview["partial_extraction"])
+        self.assertEqual(preview["pending_batch_count"], 1)
+        self.assertEqual(len(preview["entities"]), 4)
+        self.assertFalse((path / "primary.json").exists())
+        self.assertIn("Resume", state["detail"])
+        self.assertEqual(self.advance(run_id)["status"], "awaiting_review")
+        self.assertEqual(self.calls["model"], 3)
+        self.assertEqual(len(read_json(path / "graph_input.json")["entities"]), 6)
+        self.advance(run_id)
+        self.assertEqual(self.calls["model"], 3)
+
+    def test_budget_resumes_other_passages_without_hiding_rejected_batch(self):
+        self.document.write_text("\n\n".join("A stone beater processes barkcloth. " + str(index) + " x" * 400 for index in range(3)))
+        original = self.pipeline.provider
+        calls = []
+        async def provider(units, ontology):
+            calls.append(units[0]["unit_id"])
+            if len(calls) == 1:
+                return {"entities": [], "assertions": [], "evidence": [],
+                        "rejections": [{"reason": "synthetic source validation rejection"}]}
+            return await original(units, ontology)
+        self.pipeline.provider = provider
+        config = validate_config({"ontology": ONTOLOGY, "processing": {"mode": "ollama", "batch_chars": 1000, "max_auto_batches": 1},
+                                  "augmentation": {"enabled": False}})
+        run_id = self.store.create([{"path": self.document}], config, "researcher")["run_id"]
+        for expected in (1, 2, 3):
+            state = self.advance(run_id)
+            self.assertEqual(len(calls), expected)
+            self.assertEqual(state["status"], "awaiting_annotations")
+            self.assertEqual(len(state["rejected_batch_ids"]), 1)
+        self.assertFalse(state["automatic_batch_budget_reached"])
+        self.assertEqual(len(state["missing_batch_ids"]), 1)
+        self.assertEqual(len(read_json(self.store.path(run_id) / "validated_preview.json")["entities"]), 4)
+        self.advance(run_id)
+        self.assertEqual(len(calls), 3)
+
+    def test_budget_is_shared_by_primary_and_augmentation_within_one_invocation(self):
+        config = validate_config({"ontology": ONTOLOGY, "processing": {"mode": "ollama", "max_auto_batches": 1},
+                                  "augmentation": {"enabled": True}})
+        run_id = self.store.create([{"path": self.document}], config, "researcher")["run_id"]
+        # Supply the frontier after primary extraction; a resumed invocation has a fresh budget.
+        self.advance(run_id)
+        path = self.store.path(run_id)
+        seed = read_json(path / "seeds.json")[0]["seed_id"]
+        self.pipeline.submit_frontier(run_id, [{"url": "https://example.org/tapa", "seed_ids": [seed]}], "researcher")
+        # Rebuild primary in this invocation using the same source so both stages consume one shared budget.
+        (path / "primary.json").unlink()
+        for checkpoint in (path / "processed").glob("*.json"):
+            checkpoint.unlink()
+        state = self.advance(run_id)
+        self.assertTrue(state["automatic_batch_budget_reached"])
+        self.assertEqual(self.calls["model"], 2)
+        self.assertEqual(self.advance(run_id)["status"], "awaiting_review")
+        self.assertEqual(self.calls["model"], 3)
 
     def test_no_primary_candidates_does_not_deadlock_frontier(self):
         async def empty_provider(units, ontology):

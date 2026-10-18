@@ -353,7 +353,8 @@ class ProcessingScheduler:
             documents = await asyncio.to_thread(resolve_documents, refs)
             config = validate_config({"ontology": ontology_template("general"),
                                       "research_topic": material.get("collection") or "documented research evidence",
-                                      "processing": {"mode": "ollama" if repo.ai_chat_configured() else "manual"},
+                                      "processing": {"mode": "ollama" if repo.ai_chat_configured() else "manual",
+                                                     "max_auto_batches": 2},
                                       "augmentation": {"enabled": False}})
             scheduler = get_scheduler()
             run = await asyncio.to_thread(scheduler.store.create, documents, config, "workbench-researcher",

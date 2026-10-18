@@ -33,6 +33,7 @@ _SOURCE_FIELDS = {
     "original_filename", "byte_count", "unit_count", "representation_kind",
     "requested_url", "questions", "collection_path", "shared_representation_id",
     "transcription_coverage", "transcription_methods",
+    "derived_from", "extraction_run",
 }
 _SCOPE_TYPES = {"place_id": {"Place", "FindContext"},
                 "time_id": {"TimeExpression", "DatingAssessment"},
