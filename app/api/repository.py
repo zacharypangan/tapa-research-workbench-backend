@@ -1534,7 +1534,7 @@ async def search_image_evidence(payload: MultimodalSearchRequest) -> dict:
         )
 
         where = "WHERE im.model = ? AND im.method_version = ?"
-        params: list[object] = [OLLAMA_EMBEDDING_MODEL, MULTIMODAL_METHOD_VERSION]
+        params: list[object] = [active_embedding_model_name(), MULTIMODAL_METHOD_VERSION]
         if payload.material_id:
             where += " AND im.material_id = ?"
             params.append(payload.material_id)
