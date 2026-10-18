@@ -88,3 +88,24 @@ Before production promotion: paired staging acceptance; extraction acceptance on
 - Derived retries reuse only a parent's completed primary batch with identical inputs, ontology and batch units, after fresh validation returns exactly the same candidates/evidence. Rejected batches and web evidence are never reused through this path. Original model/prompt metadata remain intact alongside parent hashes and current-validation provenance.
 
 Staging diagnosis: sampled image failures are HTTP 404/non-retryable; this alone does not distinguish an unavailable model from a bad endpoint. Generation through the same provider works. `vision-model-proposal.json` in the saved POC folder proposes `gemma4:31b` for **Railway staging only**, using existing credentials, pending explicit environment-setting approval. The public Ollama catalog and `/api/show` confirmed vision input and default thinking disabled; this establishes availability metadata, not quality on these papers. [Ollama cloud model names](https://docs.ollama.com/cloud), [Gemma model information](https://ollama.com/library/gemma4).
+
+Staged v5 diagnostics confirmed the configured model is `llava`, absent from the public cloud catalog at verification time. No environment setting was changed by the code rollout.
+
+### Read-only audit for any saved document graph
+
+```sh
+.venv/bin/python scripts/verify_document_graph_run.py \
+  --api https://tapa-research-workbench-backend-graph-staging.up.railway.app/api/v1 \
+  --run-id YOUR_RUN_UUID --output /absolute/path/to/verification.json
+```
+
+The verifier uses GET requests only. It checks source ownership, canonical units, text/unit hashes, exact Unicode-offset slices, relationship endpoints and evidence-unit overlap. It reports per-source candidate/page counts, batch acceptance and rejection reasons. It does not generate, scrape, retry, curate or release anything; structural integrity is not scientific acceptance.
+
+Fixed real-paper comparison, same 69/69 readable pages:
+
+| Run | Validated batches | Rejected batches | Rejected items | Candidate entities | Relationships | Checked quotations |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline `3fc86c35…` | 3/15 | 12/15 | 89 | 124 | 30 | 100 |
+| v4 `d4eac48e…` | 8/15 | 7/15 | 29 | 114 | 41 | 99 |
+
+Both are partial/unreviewed drafts. Fewer candidates is not a recall metric; batch validation and error reduction measure extraction reliability only. Reports are saved as `baseline-verified.json` and `v4-verified.json` in the POC folder. v5 requires its own verification after processing; its model-address and retry changes are not included in these v4 results.
