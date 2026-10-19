@@ -14,7 +14,7 @@ import uuid
 from app.repository.knowledge_pipeline.store import digest, file_hash, now, read_json
 from app.repository.processing_jobs import lock, save
 
-VERSION = "graph-network/1"
+VERSION = "graph-network/2"
 FIELDS = {"sources": "source_id", "entities": "entity_id", "evidence": "evidence_id",
           "assertions": "assertion_id", "alignments": "alignment_id"}
 LOCATOR = re.compile(r"^workbench:material/([^/]+)/file/([^/]+)$")
@@ -269,6 +269,11 @@ class NetworkStore:
     def get(self, network_id: str) -> dict:
         return self._read_snapshot(self.path(network_id))
 
+    def refresh(self, network_id: str) -> dict:
+        previous = self.get(network_id)['network']
+        return self.create(previous['title'], previous['run_ids'] if previous['scope'] == 'selected' else [],
+                           previous['scope'], previous.get('inference_report', {}).get('enabled', True))
+
     @staticmethod
     def _read_snapshot(path: Path) -> dict:
         try:
@@ -313,7 +318,13 @@ class NetworkStore:
                     issues.append({"run_id": run["run_id"], "reason": str(exc)})
                     continue
                 for material_id, _ in sorted(_graph_files(graph)):
-                    rank = (len(graph["entities"]), len(graph["assertions"]), not graph["partial_extraction"], origin["created_at"], run["run_id"])
+                    batches = origin["batch_coverage"]
+                    coverage_fraction = (batches["accepted"] / batches["total"]
+                                         if batches["total"] else int(not graph["partial_extraction"]))
+                    rank = (not graph["partial_extraction"], coverage_fraction,
+                            batches["partially_validated"] / batches["total"] if batches["total"] else 0,
+                            sum(bool(row.get("object_id")) for row in graph["assertions"]),
+                            len(graph["entities"]), origin["created_at"], run["run_id"])
                     current = candidates.get(material_id)
                     if current is None or rank > current[0]:
                         candidates[material_id] = (rank, run["run_id"], graph, origin)
@@ -363,29 +374,34 @@ class NetworkStore:
                     "files_with_extraction": sum(file["extracted_segment_count"] > 0 for row in documents for file in row["files"]),
                     "covered_file_count": sum(row["covered_file_count"] for row in documents), "materials": documents,
                     "excluded_runs": sorted(issues, key=lambda row: (row["run_id"], row["reason"])),
-                    "selection_policy": "Select the most populated current saved run per material. A selected multi-document run can bring additional independent accounts; those accounts retain separate IDs and provenance.",
+                    "selection_policy": "Prefer completed current graphs, then validated passage coverage, reported concept relationships and concept count. A selected multi-document run can bring additional independent accounts; those accounts retain separate IDs and provenance.",
                     "interpretation": "A saved snapshot of current graph candidates and the document register. Missing files, pending extraction and unprocessed passages remain explicit; this is not a completed scientific database."}
         combined.update(partial_extraction=any(graph["partial_extraction"] for graph, _ in loaded.values()) or coverage["covered_file_count"] < coverage["file_count"] or bool(coverage["materials_without_graph"]),
                         pending_batch_count=sum(graph["pending_batch_count"] for graph, _ in loaded.values()), decisions=[], release_kind="derived_candidate_snapshot")
         combined["inferences"] = []
+        combined["supported_relationships"] = []
         inference_report = {"enabled": False, "added_connections": 0}
         if infer_connections:
             from app.repository.graph_inferences import infer_connections as infer
             inferred = infer(combined)
             combined["inferences"] = inferred["inferences"]
+            combined["supported_relationships"] = inferred.get("supported_relationships", [])
             inference_report = inferred["report"]
+        from app.repository.graph_quality import connectivity_report
+        quality_report = connectivity_report(combined)
         counts = {field: len(combined[field]) for field in FIELDS}
         counts["inferences"] = len(combined["inferences"])
         counts["inferred_connections"] = len(combined["inferences"])
+        counts["supported_relationships"] = len(combined["supported_relationships"])
         fingerprint = digest({"version": VERSION, "title": title.strip(), "scope": scope,
                               "graph": combined, "coverage": coverage, "infer_connections": infer_connections})
         network_id = str(uuid.uuid5(uuid.NAMESPACE_URL, VERSION + ":" + fingerprint))
         target = self.root / (network_id + ".json")
         network = {"network_id": network_id, "title": title.strip(), "scope": scope, "created_at": now(),
                    "status": "derived_draft", "version": VERSION, "run_ids": sorted(loaded), "counts": counts,
-                   "coverage": coverage, "inference_report": inference_report, "fingerprint": fingerprint,
+                   "coverage": coverage, "inference_report": inference_report, "quality_report": quality_report, "fingerprint": fingerprint,
                    "partial_extraction": combined["partial_extraction"]}
-        combined.update(network_id=network_id, read_only=True, coverage=coverage, inference_report=inference_report,
+        combined.update(network_id=network_id, read_only=True, coverage=coverage, inference_report=inference_report, quality_report=quality_report,
                         provenance={"origin_runs": origins, "id_policy": "Full run UUID namespace; original repository locators, quotation strings, hashes and Unicode offsets retained", "review_policy": "Origin decisions are audit metadata only. Combined candidates and new analytical connections require review."})
         with lock(target.with_suffix(".lock")):
             if target.exists():

@@ -50,6 +50,15 @@ def get_network(network_id: str):
         raise mapped_error(exc) from exc
 
 
+@router.post("/{network_id}/refresh", status_code=201)
+async def refresh_network(network_id: str):
+    """Build a new snapshot with current saved candidates and connection methods."""
+    try:
+        return await run_in_threadpool(shared_network_store().refresh, network_id)
+    except (ValueError, OSError) as exc:
+        raise mapped_error(exc) from exc
+
+
 @router.get("/{network_id}/graph")
 def network_graph(network_id: str):
     try:

@@ -307,6 +307,35 @@ class GraphNetworkTests(unittest.TestCase):
         self.assertEqual(library_forward["run_ids"], [max(first, second)])
         self.assertEqual(library_forward["network_id"], library_reverse["network_id"])
 
+    def test_refresh_preserves_snapshot_and_records_structural_connectivity(self):
+        run_id, _, _, _, _ = self.create_run()
+        original = self.networks.create('Saved network', [run_id], infer_connections=False)
+        path = self.networks.path(original['network_id'])
+        before = path.read_bytes()
+        response = self.client.post(f"/api/v1/graph-networks/{original['network_id']}/refresh")
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.json()['network_id'], original['network_id'])
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(response.json()['quality_report']['reported']['concepts_with_edges'], 2)
+        self.assertEqual(response.json()['quality_report']['literal_claims'], 1)
+
+    def test_library_prefers_more_read_passages_over_extra_unconnected_concepts(self):
+        first, material, file, original, graph = self.create_run(partial=True)
+        second = self.runs.create([{'path': original, 'title': 'More source passages', 'locator': f'workbench:material/{material}/file/{file}'}],
+                                  {'ontology': {'version': 'test'}}, 'test')['run_id']
+        write_json(self.runs.path(second) / 'graph_input.json', graph)
+        self.runs.state(self.runs.path(second), 'awaiting_annotations', 'primary')
+        old_graph = copy.deepcopy(graph)
+        old_graph['entities'].append({**graph['entities'][0], 'entity_id': 'EXTRA'})
+        write_json(self.runs.path(first) / 'graph_input.json', old_graph)
+        for run_id, accepted in [(first, 1), (second, 2)]:
+            path = self.runs.path(run_id)
+            write_json(path / 'primary_batches.json', [{'batch_id': f'b{index}'} for index in range(4)])
+            for index in range(accepted):
+                write_json(path / 'processed' / f'b{index}.json', {'entities': [], 'assertions': [], 'evidence': []})
+        result = self.networks.create('Better passage coverage', [], 'library', False)
+        self.assertEqual(result['run_ids'], [second])
+
 
 if __name__ == "__main__":
     unittest.main()

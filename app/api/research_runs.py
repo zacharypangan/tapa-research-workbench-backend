@@ -11,7 +11,8 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from app.repository.knowledge_pipeline.jobs import get_scheduler
-from app.repository.knowledge_pipeline.service import ResearchPipeline, validate_config
+from app.repository.knowledge_pipeline.service import ResearchPipeline
+from app.repository.graph_generation_profiles import prepare_generation_config, generation_ontology, GENERATION_PROFILE_VERSION
 
 router = APIRouter(prefix="/research-runs", tags=["research-knowledge-graphs"])
 
@@ -30,6 +31,10 @@ class RunCreate(BaseModel):
 class RetryRunRequest(BaseModel):
     config: dict | None = None
     title: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class ImproveRunRequest(BaseModel):
+    max_auto_batches: int = Field(default=4, ge=1, le=20)
 
 
 class ExtractionRunCreate(BaseModel):
@@ -138,7 +143,7 @@ async def queue_run(run_id: str) -> dict:
 @router.post("", status_code=201)
 async def create_run(body: RunCreate, idempotency_key: str | None = Header(default=None, max_length=255)):
     try:
-        config = validate_config(body.config)
+        config = prepare_generation_config(body.config)
         documents = await run_in_threadpool(resolve_documents, body.documents)
         pipeline = pipeline_for()
         run = await run_in_threadpool(pipeline.store.create, documents, config, ACTOR, idempotency_key, body.title)
@@ -162,7 +167,7 @@ async def create_extraction_run(body: ExtractionRunCreate, idempotency_key: str 
     """Use registered text for any extracted format; preserve its original file attribution."""
     from app.repository.knowledge_pipeline.registered_extraction import registered_documents
     try:
-        config = validate_config(body.config)
+        config = prepare_generation_config(body.config)
         documents = await run_in_threadpool(registered_documents, body.material_id, body.file_ids)
         pipeline = pipeline_for()
         run = await run_in_threadpool(pipeline.store.create, documents, config, ACTOR, idempotency_key, body.title)
@@ -205,6 +210,8 @@ def get_capabilities():
                                   "preserves_original_files": True, "supports_any_registered_extracted_format": True},
         "automatic_batch_budget": {"available": True, "per_pass": True, "maximum": 100, "default": None},
         "retry": {"creates_derived_run": True, "preserves_original": True},
+        "relationship_generation": {"version": GENERATION_PROFILE_VERSION, "preserves_original": True,
+                                    "endpoint": "/research-runs/{run_id}/improve", "default_batch_budget": 4},
         "ontology_templates": ONTOLOGY_TEMPLATES,
         "evidence_selections": ["span_id", "character_offsets", "exact_quote"],
         "limits": {"max_documents": 20, "max_document_bytes": 50 * 1024 * 1024,
@@ -219,7 +226,7 @@ def get_capabilities():
 @router.get("/ontologies/{template_id}")
 def get_ontology(template_id: Literal["general", "tapa"]):
     from app.repository.knowledge_pipeline.ontologies import ontology_template
-    return ontology_template(template_id)
+    return generation_ontology(ontology_template(template_id))
 
 
 @router.get("/{run_id}")
@@ -256,7 +263,35 @@ async def retry_run(run_id: str, body: RetryRunRequest,
     try:
         pipeline = pipeline_for()
         metadata = await run_in_threadpool(retry_source_metadata, pipeline.store, run_id)
-        run = await run_in_threadpool(pipeline.store.derive, run_id, ACTOR, body.config, body.title, idempotency_key, metadata)
+        from app.repository.knowledge_pipeline.store import read_json
+        selected = body.config if body.config is not None else read_json(pipeline.store.path(run_id) / "inputs.json")["config"]
+        config = prepare_generation_config(selected)
+        run = await run_in_threadpool(pipeline.store.derive, run_id, ACTOR, config, body.title, idempotency_key, metadata)
+    except (ValueError, FileNotFoundError) as exc:
+        raise mapped_error(exc) from exc
+    if run["status"] != "created":
+        return run
+    return {**pipeline.store.describe(run["run_id"]), **await queue_run(run["run_id"])}
+
+
+@router.post("/{run_id}/improve", status_code=201)
+async def improve_run(run_id: str, body: ImproveRunRequest,
+                      idempotency_key: str | None = Header(default=None, max_length=255)):
+    """Generate a fresh, bounded source-relationship draft without editing its parent."""
+    from app.api import repository
+    from app.repository.knowledge_pipeline.store import read_json
+    if not repository.ai_chat_configured():
+        raise HTTPException(422, "Assisted graph generation is not configured in this workspace.")
+    try:
+        pipeline = pipeline_for()
+        inputs = read_json(pipeline.store.path(run_id) / "inputs.json")
+        config = prepare_generation_config({**inputs["config"], "processing": {
+            **inputs["config"].get("processing", {}), "mode": "ollama",
+            "batch_chars": min(inputs["config"].get("processing", {}).get("batch_chars", 6000), 6000),
+            "max_auto_batches": body.max_auto_batches}})
+        metadata = await run_in_threadpool(retry_source_metadata, pipeline.store, run_id)
+        title = (inputs.get("title") or "Document graph")[:165] + " — relationship-focused draft"
+        run = await run_in_threadpool(pipeline.store.derive, run_id, ACTOR, config, title, idempotency_key, metadata)
     except (ValueError, FileNotFoundError) as exc:
         raise mapped_error(exc) from exc
     if run["status"] != "created":

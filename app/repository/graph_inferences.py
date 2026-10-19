@@ -4,6 +4,7 @@ Kept outside the pinned extraction implementation. Original records and approval
 are never rewritten; generated connections are an explicitly separate layer.
 """
 from collections import Counter, defaultdict
+import copy
 from datetime import datetime, timezone
 import hashlib
 import itertools
@@ -11,10 +12,31 @@ import json
 import re
 import unicodedata
 
-METHOD_VERSION = "evidence-connections-v1"
+METHOD_VERSION = "evidence-connections-v2"
+MAX_RECOVERY_COMPARISONS = 100000
 _STOP = set("a an and article concept document figure introduction material method paper research source study table the this that these those thing things tool type unknown unspecified".split())
 _REJECTED = {"reject", "rejected", "exclude", "excluded"}
 _CONTEXT = ("language", "place", "time", "scheme", "language_id", "place_id", "time_id", "scheme_id", "typology_scheme_id", "production_case_id", "case_id", "namespace", "taxonomy_namespace", "taxon_rank", "rank")
+# A shared name is never enough to align distinguishable objects or events.
+_CONCEPT_TYPES = {"Concept", "ActivityType", "ArtifactType", "Material", "MaterialKind", "ToolForm", "PlantTaxon", "Feature", "DesignConcept", "Role", "EnvironmentContext", "TypeCategory", "Language", "LanguageVariety"}
+_NAME_TYPES = {"Place", "TimeExpression"}
+_SOURCE_REPORTS = {"source_report", "source_reported", "documented_source_report", "secondary_ethnographic_report"}
+_RECOVERY_RULES = {
+    "has_material": (None, {"Material", "MaterialKind"}),
+    "made_of": (None, {"Material", "MaterialKind"}),
+    "has_feature": (None, {"Concept", "Feature"}),
+    "has_definition": (None, _CONCEPT_TYPES - {"TypeCategory"}),
+    "located_in": (None, {"Place"}),
+    "occurred_at": ({"Activity"}, {"Place"}),
+    "dated_to": (None, {"TimeExpression"}),
+    "uses": ({"Person", "Organization", "Activity", "ActivityType", "ReportedStage"}, {"Artifact", "ArtifactType", "ToolInstance", "Material", "MaterialKind", "MaterialBatch", "Concept", "Language"}),
+    "produces": ({"Person", "Organization", "Activity", "ActivityType", "ReportedStage"}, {"Artifact", "ArtifactType", "Material", "MaterialKind", "MaterialBatch", "Document", "Concept"}),
+    "assigned_type_by_source": (None, {"TypeCategory", "ToolForm", "ArtifactType"}),
+    "source_classifies_as_tool_form": ({"ArchaeologicalObject", "ToolInstance", "Artifact"}, {"ToolForm", "ArtifactType"}),
+    "category_describes_tool_form": ({"TypeCategory"}, {"ToolForm"}),
+    "has_activity": ({"ProductionCase"}, {"ReportedStage", "ActivityType"}),
+    "has_activity_type": ({"ReportedStage"}, {"ActivityType"}),
+}
 
 
 def _normal(value):
@@ -33,7 +55,7 @@ def _labels(entity):
             if not isinstance(value, str):
                 continue
             normalized = _normal(value)
-            if len(normalized) >= 2 and normalized not in _STOP:
+            if 2 <= len(normalized) <= 200 and normalized not in _STOP and not normalized.isnumeric():
                 fields[normalized].add(key)
     return fields
 
@@ -79,12 +101,62 @@ def _bounds(evidence):
     return (min(span["start"] for span in spans), max(span["end"] for span in spans)) if spans else None
 
 
-def infer_connections(graph, *, max_connections=2000, max_per_entity=12):
-    """Return unreviewed hypotheses with premises; never mutate graph or merge IDs."""
+def _quoted_name(label, text):
+    """Match original spelling with word boundaries; never invent a translation."""
+    label, text = _normal(label), _normal(text)
+    if not label:
+        return False
+    left = r"(?<!\w)" if re.match(r"[^\W\d_]", label[0], re.UNICODE) and not re.match(r"[\u3400-\u9fff\u3040-\u30ff]", label[0]) else ""
+    right = r"(?!\w)" if re.match(r"[^\W\d_]", label[-1], re.UNICODE) and not re.match(r"[\u3400-\u9fff\u3040-\u30ff]", label[-1]) else ""
+    return bool(re.search(left + re.escape(label) + right, text))
+
+
+def _overlapping_evidence(first_refs, second_refs, evidence):
+    for first_ref, second_ref in itertools.product(first_refs, second_refs):
+        if first_ref == second_ref:
+            return True
+        first, second = evidence[first_ref], evidence[second_ref]
+        if first.get("source_id") != second.get("source_id") or not first.get("unit_id") or first.get("unit_id") != second.get("unit_id"):
+            continue
+        first_bounds, second_bounds = _bounds(first), _bounds(second)
+        if first_bounds and second_bounds and max(first_bounds[0], second_bounds[0]) < min(first_bounds[1], second_bounds[1]):
+            return True
+    return False
+
+
+def _provenance(records, evidence_ids, entities, evidence, sources):
+    records = [*records, *(evidence[ref] for ref in evidence_ids)]
+    source_ids = sorted({row.get("source_id") for row in records if row.get("source_id") in sources})
+    source_rows = [sources[key] for key in source_ids]
+    records += source_rows
+
+    def ids(field):
+        return sorted({value for row in records for value in (row.get(field, []) if isinstance(row.get(field, []), list) else []) if isinstance(value, str) and value})
+
+    families = sorted({value for row in records for value in (row.get("source_family_id"), _scope(row).get("source_family_id")) if isinstance(value, str) and value})
+    origins = {key: sources[key].get("origin") if isinstance(sources[key].get("origin"), str) else "unspecified" for key in source_ids}
+    return {"source_ids": source_ids, "source_family_ids": families,
+            "source_independence": "same_declared_family" if len(source_ids) > 1 and len(families) == 1 and all(row.get("source_family_id") == families[0] for row in source_rows) else "not_established",
+            "source_origins": origins, "cross_source": len(source_ids) > 1,
+            "seed_ids": ids("seed_ids"), "root_seed_ids": ids("root_seed_ids"),
+            "primary_entity_ids": sorted({row["entity_id"] for row in records if row.get("entity_id") in entities and sources[entities[row["entity_id"]]["source_id"]].get("origin") == "primary"}),
+            "connects_primary_to_augmented": "primary" in origins.values() and any(
+                row.get("origin") == "web" or row.get("source_kind") in {"web", "html", "web_page", "web_snapshot"}
+                for row in source_rows)}
+
+
+def infer_connections(graph, *, max_connections=2000, max_per_entity=12, max_supported_relationships=1000):
+    """Recover exact literal links and propose scoped correspondences, without merging IDs.
+
+    ``supported_relationships`` restates retained source assertions in traversable
+    form. ``inferences`` remains a separate, uncertain layer; neither is approved.
+    """
     if type(max_connections) is not int or not 1 <= max_connections <= 5000:
         raise ValueError("max_connections must be an integer from 1 to 5000")
     if type(max_per_entity) is not int or not 1 <= max_per_entity <= 50:
         raise ValueError("max_per_entity must be an integer from 1 to 50")
+    if type(max_supported_relationships) is not int or not 1 <= max_supported_relationships <= 5000:
+        raise ValueError("max_supported_relationships must be an integer from 1 to 5000")
     entities = _index(graph, "entities", "entity_id")
     evidence = _index(graph, "evidence", "evidence_id")
     sources = _index(graph, "sources", "source_id")
@@ -103,6 +175,8 @@ def infer_connections(graph, *, max_connections=2000, max_per_entity=12):
             raise ValueError("Unknown statement endpoint")
         if not statement.get("evidence_ids") or any(ref not in evidence for ref in statement["evidence_ids"]):
             raise ValueError("Unknown statement evidence")
+        if statement.get("source_id") not in sources or any(evidence[ref]["source_id"] != statement["source_id"] for ref in statement["evidence_ids"]):
+            raise ValueError("Statement evidence belongs to another source")
 
     def decision_time(decision):
         try:
@@ -125,11 +199,17 @@ def infer_connections(graph, *, max_connections=2000, max_per_entity=12):
 
     eligible = {key: entity for key, entity in entities.items() if not excluded(entity, key)}
     existing = {tuple(sorted((statement["subject_id"], statement["object_id"]))) for statement in assertions.values() if statement.get("object_id")}
-    for statement in [*graph.get("alignments", []), *graph.get("inferences", [])]:
+    def source_key(statement, object_id):
+        return (statement["subject_id"], statement["predicate"], object_id, statement.get("polarity", "uncertain"), json.dumps(statement.get("scope", {}), sort_keys=True, ensure_ascii=False))
+
+    existing_source_keys = {source_key(statement, statement["object_id"]) for statement in [*assertions.values(), *graph.get("supported_relationships", [])] if statement.get("object_id")}
+    for statement in [*graph.get("alignments", []), *graph.get("inferences", []), *graph.get("supported_relationships", [])]:
         if statement.get("subject_id") in entities and statement.get("object_id") in entities:
             existing.add(tuple(sorted((statement["subject_id"], statement["object_id"]))))
-    connections, degrees, counters, seen = [], Counter(), Counter(), set()
+    connections, recovered, degrees, counters, seen = [], [], Counter(), Counter(), set()
     truncated = False
+    recovery_truncated = False
+    recovery_considered = 0
     considered = 0
     pair_budget = 100000
 
@@ -141,7 +221,73 @@ def infer_connections(graph, *, max_connections=2000, max_per_entity=12):
         considered += 1
         return True
 
-    def propose(left_id, right_id, rule, predicate, refs, rationale, *, premise_ids=(), via=(), metadata=None):
+    # Reify only an exact, source-original literal value that uniquely resolves
+    # to a type-appropriate entity grounded in the very same quoted passage.
+    # Descriptive prose, generated English labels and mere word mentions do not
+    # become uses/material/location assertions through this adapter.
+    literal_candidates = defaultdict(list)
+    for entity_id, entity in sorted(eligible.items()):
+        label = entity.get("label_original")
+        if isinstance(label, str) and 2 <= len(_normal(label)) <= 200:
+            literal_candidates[(entity["source_id"], _normal(label))].append(entity_id)
+    for statement_id, statement in sorted(assertions.items()):
+        if statement.get("object_id") or not isinstance(statement.get("value"), str) or excluded(statement, statement_id):
+            continue
+        rule = _RECOVERY_RULES.get(statement.get("predicate"))
+        subject_id = statement["subject_id"]
+        if not rule or subject_id not in eligible or statement.get("epistemic_kind") not in _SOURCE_REPORTS:
+            continue
+        subject = eligible[subject_id]
+        source_id = statement.get("source_id")
+        refs = statement["evidence_ids"]
+        if source_id != subject["source_id"] or any(evidence[ref]["source_id"] != source_id for ref in refs):
+            continue
+        subject_types, object_types = rule
+        if subject_types and subject["entity_type"] not in subject_types:
+            continue
+        matches = []
+        for object_id in literal_candidates.get((source_id, _normal(statement["value"])), []):
+            if recovery_considered >= MAX_RECOVERY_COMPARISONS:
+                recovery_truncated = True
+                break
+            recovery_considered += 1
+            target = eligible[object_id]
+            if object_id == subject_id or target["entity_type"] not in object_types or not _compatible(subject, target, statement):
+                continue
+            quoted = [ref for ref in refs if _quoted_name(target["label_original"], evidence[ref].get("text", ""))]
+            if quoted and _overlapping_evidence(quoted, target["evidence_ids"], evidence):
+                matches.append(object_id)
+        if recovery_truncated:
+            break  # A partial candidate scan must not masquerade as unique resolution.
+        if len(matches) != 1:
+            counters["ambiguous_literal_target" if matches else "unresolved_literal_target"] += 1
+            continue
+        object_id = matches[0]
+        if source_key(statement, object_id) in existing_source_keys:
+            continue
+        if len(recovered) >= max_supported_relationships:
+            recovery_truncated = True
+            break
+        target = eligible[object_id]
+        recovered_refs = sorted(set(refs + subject["evidence_ids"] + target["evidence_ids"]))
+        seed = [METHOD_VERSION, "literal_relation_recovery", statement_id, object_id, recovered_refs]
+        identity = hashlib.sha256(json.dumps(seed, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()[:24]
+        recovered.append({"assertion_id": "REC_" + identity, "source_id": source_id,
+            "subject_id": subject_id, "object_id": object_id, "predicate": statement["predicate"],
+            "polarity": statement.get("polarity", "uncertain"), "epistemic_kind": "source_report",
+            "origin_epistemic_kind": statement["epistemic_kind"],
+            "scope": copy.deepcopy(statement.get("scope", {})), "evidence_ids": recovered_refs,
+            "premise_ids": [statement_id], "derived_from_assertion_id": statement_id,
+            "origin": "literal_relation_recovery", "rule": "exact_literal_entity_recovery",
+            "literal_value": statement["value"], "review_status": "needs_review",
+            "scientific_status": "source_claim_reexpression", "fact_transfer": False,
+            "method_version": METHOD_VERSION,
+            "rationale": "The original source assertion's entire literal value matches one type-appropriate, source-local concept whose original label is explicitly quoted in the same passage. This traversable representation preserves the original claim, polarity and scope; it is not independent evidence or specialist approval.",
+            **_provenance([subject, target, statement], recovered_refs, entities, evidence, sources)})
+        existing.add(tuple(sorted((subject_id, object_id))))
+        existing_source_keys.add(source_key(statement, object_id))
+
+    def propose(left_id, right_id, rule, predicate, refs, rationale, *, premise_ids=(), via=(), metadata=None, layer="context_association"):
         nonlocal truncated
         pair = tuple(sorted((left_id, right_id)))
         if left_id == right_id or left_id not in eligible or right_id not in eligible or pair in seen or pair in existing:
@@ -161,8 +307,11 @@ def infer_connections(graph, *, max_connections=2000, max_per_entity=12):
                 "predicate": predicate, "epistemic_kind": "inference", "polarity": "uncertain", "scope": {},
                 "evidence_ids": refs, "rule": rule, "rationale": rationale,
                 "premise_ids": sorted(set(premise_ids)), "via_entity_ids": sorted(set(via)),
+                "layer": layer,
                 "review_status": "needs_review", "scientific_status": "unverified_proposal",
-                "fact_transfer": False, "method_version": METHOD_VERSION, **(metadata or {})}
+                "fact_transfer": False, "method_version": METHOD_VERSION,
+                **_provenance([eligible[left_id], eligible[right_id], *(eligible[key] for key in via), *(assertions[key] for key in premise_ids)], refs, entities, evidence, sources),
+                **(metadata or {})}
         connections.append(item)
         degrees.update(pair)
         counters[rule] += 1
@@ -171,6 +320,9 @@ def infer_connections(graph, *, max_connections=2000, max_per_entity=12):
     # Cross-record comparison, not entity resolution: aliases retain their origin.
     groups, label_fields = defaultdict(list), {}
     for key, entity in sorted(eligible.items()):
+        if entity.get("entity_type") not in _CONCEPT_TYPES | _NAME_TYPES or entity.get("is_instance") is True:
+            counters["nonalignable_entities"] += 1
+            continue
         fields = _labels(entity)
         label_fields[key] = fields
         for value in fields:
@@ -180,13 +332,50 @@ def infer_connections(graph, *, max_connections=2000, max_per_entity=12):
             if not tick():
                 break
             translated = not (label_fields[left][value] - {"label_en"} and label_fields[right][value] - {"label_en"})
-            propose(left, right, "typed_label_match", "possibly_same_concept",
+            name_only = eligible[left].get("entity_type") in _NAME_TYPES
+            propose(left, right, "typed_label_match", "has_related_concept_context" if name_only else "aligns_reported_concept_with",
                     eligible[left]["evidence_ids"] + eligible[right]["evidence_ids"],
-                    "The labels and recorded concept types match. These remain separate source accounts; identity, chronology and historical transmission are not established. " +
+                    ("The reported names and recorded types match; this is a name correspondence, not proof of the same geographic extent or temporal interval. " if name_only else "The labels and recorded generic concept types match. ") +
+                    "These remain separate source accounts; identity, chronology and historical transmission are not established. " +
                     ("The match uses a proposed English translation that also needs review." if translated else "Missing context does not establish equivalence."),
-                    metadata={"matched_label": value, "translation_involved": translated})
+                    metadata={"matched_label": value, "translation_involved": translated,
+                              "mapping_kind": "reported_name_correspondence" if name_only else "typed_concept_correspondence"},
+                    layer="concept_alignment")
             if considered >= pair_budget:
                 break
+        if considered >= pair_budget:
+            break
+
+    # A retained short definition can provide a source-attributed bridge between
+    # otherwise different names, without treating the definition as an identity
+    # assertion or transferring the properties of the described category.
+    original_names = defaultdict(list)
+    for key, entity in sorted(eligible.items()):
+        if entity.get("entity_type") in _CONCEPT_TYPES and entity.get("is_instance") is not True and isinstance(entity.get("label_original"), str):
+            value = _normal(entity["label_original"])
+            if 2 <= len(value) <= 120 and value not in _STOP and not value.isnumeric():
+                original_names[value].append(key)
+    for key, statement in sorted(assertions.items()):
+        value = statement.get("value")
+        left = statement["subject_id"]
+        if statement.get("predicate") not in {"has_definition", "attested_term_for"} or not isinstance(value, str) or left not in eligible or excluded(statement, key):
+            continue
+        if eligible[left].get("entity_type") not in _CONCEPT_TYPES or eligible[left].get("is_instance") is True or statement.get("polarity", "positive") != "positive" or statement.get("epistemic_kind") not in _SOURCE_REPORTS:
+            continue
+        if not any(evidence[ref].get("source_id") == eligible[left]["source_id"] and _quoted_name(value, evidence[ref].get("text", "")) for ref in statement["evidence_ids"]):
+            continue
+        for right in original_names.get(_normal(value), []):
+            if eligible[right]["source_id"] == eligible[left]["source_id"]:
+                continue
+            if not tick():
+                break
+            if not _compatible(eligible[left], eligible[right], statement):
+                continue
+            propose(left, right, "source_definition_name_match", "has_related_concept_context",
+                    statement["evidence_ids"] + eligible[left]["evidence_ids"] + eligible[right]["evidence_ids"],
+                    "A retained source assertion defines one term with an exact quoted name also reported by the other source. This is a source-qualified term correspondence, not accepted equivalence, identity, independent corroboration or transfer of properties between the accounts.",
+                    premise_ids=(key,), metadata={"matched_label": _normal(value), "translation_involved": False,
+                                                  "mapping_kind": "definition_to_reported_name"}, layer="concept_alignment")
         if considered >= pair_budget:
             break
 
@@ -196,7 +385,7 @@ def infer_connections(graph, *, max_connections=2000, max_per_entity=12):
         left, right = statement["subject_id"], statement.get("object_id")
         if not right or left not in eligible or right not in eligible or excluded(statement, key):
             continue
-        if statement.get("polarity", "positive") != "positive" or statement.get("epistemic_kind") not in (None, "source_report", "source_reported", "documented_source_report"):
+        if statement.get("polarity", "positive") != "positive" or statement.get("epistemic_kind") not in (None, *_SOURCE_REPORTS):
             continue
         neighbors[left].append((right, key))
         neighbors[right].append((left, key))
@@ -247,10 +436,15 @@ def infer_connections(graph, *, max_connections=2000, max_per_entity=12):
                 break
         if considered >= pair_budget:
             break
-    return {"inferences": connections, "report": {"method_version": METHOD_VERSION,
-            "generated": len(connections), "by_rule": {key: counters[key] for key in ("typed_label_match", "shared_reported_endpoint", "shared_quotation_context")},
+    return {"inferences": connections, "supported_relationships": recovered, "report": {"method_version": METHOD_VERSION,
+            "generated": len(connections), "by_rule": {key: counters[key] for key in ("typed_label_match", "source_definition_name_match", "shared_reported_endpoint", "shared_quotation_context")},
+            "supported_relationships": len(recovered), "supported_relationship_rule": "exact_literal_entity_recovery",
+            "supported_relationships_truncated": recovery_truncated,
+            "recovery_considered_candidates": recovery_considered, "recovery_candidate_budget": MAX_RECOVERY_COMPARISONS,
+            "ambiguous_literal_targets": counters["ambiguous_literal_target"], "unresolved_literal_targets": counters["unresolved_literal_target"],
             "considered_pairs": min(considered, pair_budget), "skipped_incompatible_context": counters["incompatible_context"],
-            "excluded_entities": len(entities) - len(eligible), "truncated": truncated,
+            "excluded_entities": len(entities) - len(eligible), "nonalignable_entities": counters["nonalignable_entities"], "truncated": truncated,
             "max_connections": max_connections, "max_per_entity": max_per_entity,
+            "max_supported_relationships": max_supported_relationships,
             "review_required": True, "facts_inferred": False,
-            "note": "Deterministic, bounded navigation proposals from saved evidence. No concepts are merged and no new historical, causal, geographic or chronological facts are asserted."}}
+            "note": "Deterministic, bounded source-claim reexpressions, typed concept/name correspondences and contextual navigation proposals from saved evidence. Source relationships retain their original premise and polarity; proposals never transfer facts or merge entities. Source-family independence is not established by a label match."}}

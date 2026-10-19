@@ -122,6 +122,34 @@ class ResearchRunApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/v1/research-runs/ontologies/unknown").status_code, 422)
         validate_config({"ontology": general.json()})
 
+    def test_relationship_focused_generation_creates_bounded_pinned_draft_without_editing_parent(self):
+        _, original = self.create()
+        self.process(original['run_id'])
+        path = self.scheduler.store.path(original['run_id'])
+        before = {name: (path / name).read_bytes() for name in ['inputs.json', 'state.json', 'primary_batches.json']}
+        endpoint = f"/api/v1/research-runs/{original['run_id']}/improve"
+        with patch.object(repository, 'ai_chat_configured', return_value=True):
+            response = self.client.post(endpoint, json={'max_auto_batches': 3})
+            self.assertEqual(response.status_code, 201, response.text)
+            draft = response.json()
+            duplicate = self.client.post(endpoint, json={'max_auto_batches': 3})
+        self.assertEqual(duplicate.json()['run_id'], draft['run_id'])
+        self.assertEqual(draft['parent_run_id'], original['run_id'])
+        config = read_json(self.scheduler.store.path(draft['run_id']) / 'inputs.json')['config']
+        self.assertEqual(config['processing']['max_auto_batches'], 3)
+        self.assertEqual(config['processing']['mode'], 'ollama')
+        self.assertEqual(config['ontology']['extraction_guidance']['profile_version'], 'source-relationships/1')
+        for name, data in before.items():
+            self.assertEqual((path / name).read_bytes(), data)
+
+    def test_relationship_generation_validates_budget_and_configuration(self):
+        _, original = self.create()
+        endpoint = f"/api/v1/research-runs/{original['run_id']}/improve"
+        for budget in [0, 21]:
+            self.assertEqual(self.client.post(endpoint, json={'max_auto_batches': budget}).status_code, 422)
+        with patch.object(repository, 'ai_chat_configured', return_value=False):
+            self.assertEqual(self.client.post(endpoint, json={}).status_code, 422)
+
     def test_registered_extraction_preserves_csv_original_and_segment_attribution(self):
         material = self.client.post("/api/v1/repository/materials", json={"title": "CSV source"}).json()["id"]
         original_bytes = b"term,meaning\nbeater,barkcloth tool\n"

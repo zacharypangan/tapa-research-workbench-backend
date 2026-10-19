@@ -10,7 +10,8 @@ Use the same API base as the Workbench (paths below are relative to `/api/v1`).
 2. `POST /graph-networks` with `{"title":"Paper comparison","run_ids":["RUN_UUID_1","RUN_UUID_2"],"scope":"selected","infer_connections":true}`. One run is also valid: this creates an enriched draft of that run.
 3. `GET /graph-networks/{network_id}/graph` returns the standard graph plus separate `inferences`, original-run provenance and original review decisions. Reported assertions, analytical alignments and derived inferences remain separate.
 4. `GET /graph-networks/{network_id}/export` downloads the network metadata, coverage register and graph as JSON.
-5. For an entire-library document database snapshot, `POST /graph-networks` with `{"title":"Document database","scope":"library","infer_connections":true}`. Library scope rejects manually supplied run IDs. It reads all material records, all run pages and every safe candidate checkpoint, selects the most populated current graph per document and includes documents lacking a graph in the register.
+5. For an entire-library document database snapshot, `POST /graph-networks` with `{"title":"Document database","scope":"library","infer_connections":true}`. Library scope rejects manually supplied run IDs. It reads all material records, all run pages and every safe candidate checkpoint, prioritizes completed graphs and validated passage coverage, and includes documents lacking a graph in the register.
+6. `POST /graph-networks/{network_id}/refresh` builds a current successor snapshot. [Pilot methods](pilot-graph-methods.md) describes relationship-focused generation, source-relationship recovery and source-cluster visualization.
 
 `GET /graph-networks?limit=20&offset=0` lists snapshots. Repeating the same semantic inputs creates the same stable network ID; processing more source passages or changing selection produces a new snapshot. Snapshots do not update automatically.
 
@@ -40,7 +41,7 @@ The database register includes every current material and its attached files, ex
 
 Selected composition accepts 1–200 unique run IDs. Library scope has no 200-document truncation. Lists paginate; graph loading does not use the 20-checkpoint listing hint as a completeness boundary. Inference has its own explicit connection limits and report; a capped proposal list does not imply every possible connection was considered.
 
-Library selection chooses the most populated current saved run per document. If a chosen run contains several documents, its full source-preserving graph can bring an additional saved account for another document. Those source-local accounts keep distinct IDs; the register reports `saved_account_count` and explains this case rather than silently merging them.
+Library selection prioritizes completed graphs, accepted-passage coverage, partially validated coverage, reported connections and concept count. If a chosen run contains several documents, its full source-preserving graph can bring an additional saved account for another document. Those source-local accounts keep distinct IDs; the register reports `saved_account_count` and explains this case rather than silently merging them.
 
 New snapshots use the existing storage reserve, atomic checkpoint save and a per-network lock. Concurrent identical requests reuse one snapshot. A failed write cleans up its temporary file and returns a sanitized HTTP 503; unreadable cached networks are excluded from listings with `unavailable_count`, and direct reads/exports return 503 without filesystem details.
 

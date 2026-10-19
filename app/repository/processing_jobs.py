@@ -351,7 +351,7 @@ class ProcessingScheduler:
                                max_link_pages=1, max_segments=5000), force=True)
         if stage == "graph":
             from .knowledge_pipeline.jobs import get_scheduler
-            from .knowledge_pipeline.service import validate_config
+            from .graph_generation_profiles import prepare_generation_config, GENERATION_PROFILE_VERSION
             from .knowledge_pipeline.ontologies import ontology_template
             from app.api.research_runs import DocumentRef, resolve_documents
             with repo.get_connection() as connection:
@@ -364,14 +364,14 @@ class ProcessingScheduler:
             if len(refs) > 20:
                 return {"status": "blocked", "reason": "Select up to 20 files for a graph"}
             documents = await asyncio.to_thread(resolve_documents, refs)
-            config = validate_config({"ontology": ontology_template("general"),
+            config = prepare_generation_config({"ontology": ontology_template("general"),
                                       "research_topic": material.get("collection") or "documented research evidence",
                                       "processing": {"mode": "ollama" if repo.ai_chat_configured() else "manual",
                                                      "max_auto_batches": 2},
                                       "augmentation": {"enabled": False}})
             scheduler = get_scheduler()
             run = await asyncio.to_thread(scheduler.store.create, documents, config, "workbench-researcher",
-                                          "auto-prepare:" + job["input_hash"], material["title"])
+                                          "auto-prepare:" + job["input_hash"] + ":" + GENERATION_PROFILE_VERSION, material["title"])
             if run["status"] == "created":
                 await asyncio.to_thread(scheduler.enqueue, run["run_id"])
                 scheduler.wake()
