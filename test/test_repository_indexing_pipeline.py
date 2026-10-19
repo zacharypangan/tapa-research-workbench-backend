@@ -474,5 +474,59 @@ class RepositoryIndexingTests(unittest.TestCase):
             asyncio.run(repository.request_embedding("x" * 2001))
 
 
+    def test_keyword_review_survives_embedding_outage_with_exact_source_citations(self):
+        hit = self.segment("Stone barkcloth beaters were found in Taiwan.")
+        self.segment("石拍用于制作树皮布。", "two")
+        with repository.get_connection() as con:
+            con.execute("INSERT INTO extracted_segments (material_id,source_kind,source_locator,page_ref,page_index,content_text,char_count,created_at) VALUES ('one','historical_file_pdf','old.pdf','page:9',9,'stone barkcloth historical',25,'test')")
+        with patch.object(repository, "check_embedding_readiness", new=AsyncMock(return_value=(False, "quota exceeded"))), patch.object(repository, "request_embedding", new=AsyncMock(side_effect=AssertionError("must not call exhausted provider"))):
+            result, images = asyncio.run(repository.review_retrieval(SemanticSearchRequest(query="What were barkcloth beaters?", material_id="one")))
+            self.assertEqual([item["segment_id"] for item in result["results"]], [hit])
+            self.assertEqual(result["mode"], "keyword_evidence_search")
+            self.assertIsNone(result["embedding_model"])
+            self.assertNotIn("semantic_score", result["results"][0])
+            item = result["results"][0]
+            self.assertEqual(item["matched_text"], item["content_text"][item["matched_span"]["start"]:item["matched_span"]["end"]])
+            self.assertEqual(item["citation"]["page_ref"], "page:1")
+            self.assertEqual(images["image_results"], [])
+            cjk, _ = asyncio.run(repository.review_retrieval(SemanticSearchRequest(query="石拍", material_id="two")))
+            self.assertEqual(len(cjk["results"]), 1)
+
+    def test_review_falls_back_when_provider_fails_after_readiness_probe(self):
+        self.segment("barkcloth beaters")
+        with patch.object(repository, "check_embedding_readiness", new=AsyncMock(return_value=(True, "ready"))), patch.object(repository, "query_embedding_for_search", new=AsyncMock(side_effect=HTTPException(502, "quota"))):
+            result, _ = asyncio.run(repository.review_retrieval(SemanticSearchRequest(query="barkcloth")))
+            self.assertEqual(len(result["results"]), 1)
+            self.assertEqual(result["ranking_method"], "keyword_rank_fusion")
+
+    def test_assisted_review_routes_work_without_embeddings_and_no_hit_is_not_generated(self):
+        self.segment("Stone barkcloth beaters were found in Taiwan.")
+        with patch.object(repository, "check_embedding_readiness", new=AsyncMock(return_value=(False, "quota exceeded"))), patch.object(repository, "check_ollama_generation_readiness", new=AsyncMock(return_value=(True, "ready"))), patch.object(repository, "request_evidence_answer", new=AsyncMock(return_value="Beaters were found in Taiwan [1].")) as answer:
+            result = asyncio.run(repository.ask_corpus(AskCorpusRequest(question="barkcloth beaters")))
+            self.assertEqual(result["answer_origin"], "model_generated")
+            self.assertEqual(len(result["citations"]), 1)
+            self.assertIn("keyword matching", result["evidence_note"])
+            nohit = asyncio.run(repository.ask_corpus(AskCorpusRequest(question="unmatched_zebra")))
+            self.assertEqual(nohit["citations"], [])
+            self.assertEqual(answer.await_count, 1)
+            report = asyncio.run(repository.generate_ai_evidence_report(SemanticSearchRequest(query="barkcloth")))
+            self.assertEqual(len(report["themes"]), 1)
+            self.assertIsNotNone(report["themes"][0]["passages"][0]["keyword_rank_score"])
+            multimodal = asyncio.run(repository.multimodal_search(MultimodalSearchRequest(query="barkcloth")))
+            self.assertEqual(len(multimodal["results"]), 1)
+            self.assertEqual(multimodal["mode"], "keyword_evidence_search")
+            self.assertEqual(multimodal["image_results"], [])
+            self.assertIn("image similarity is unavailable", multimodal["evidence_note"])
+            semantic = asyncio.run(repository.semantic_search(SemanticSearchRequest(query="barkcloth")))
+            self.assertEqual(semantic["mode"], "keyword_evidence_search")
+
+
+    def test_generation_outage_returns_a_clear_multimodal_status(self):
+        with patch.object(repository, "check_ollama_generation_readiness", new=AsyncMock(return_value=(False, "offline"))):
+            result = asyncio.run(repository.multimodal_search(MultimodalSearchRequest(query="barkcloth")))
+            self.assertFalse(result["provider_configured"])
+            self.assertEqual(result["results"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

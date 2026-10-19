@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
+import errno
+import shutil
 import logging
 from pathlib import Path
 import uuid
@@ -35,9 +37,20 @@ def digest(value):
 
 
 def save(path, value):
+    # Fail before another provider pass when its checkpoint cannot be persisted.
+    if shutil.disk_usage(path.parent).free < 8 * 1024 * 1024:
+        raise OSError(errno.ENOSPC, "Storage is low; checkpoint processing is paused until space is available")
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    try:
+        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        # A failed write/replace must preserve the last complete checkpoint and
+        # must not accumulate orphan files while a full volume is being repaired.
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            LOG.warning("Processing checkpoint temporary file cleanup failed")
 
 
 @contextmanager

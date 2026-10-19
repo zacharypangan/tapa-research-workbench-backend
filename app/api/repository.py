@@ -1604,6 +1604,57 @@ async def index_missing_segment_embeddings(
             "pending_count": coverage["missing_segment_count"], "coverage": coverage}
 
 
+def keyword_review_segments(payload: SemanticSearchRequest) -> dict:
+    """Read-only fallback; scores are keyword ranks, never vector similarity."""
+    stopwords = set("a an and are as at be by can do does for from how in is it of on or that the their this to was were what when where which who why with".split())
+    terms = [term for term in embedding_index.literal_terms(payload.query)
+             if len(term) >= 2 and term.lower() not in stopwords][:8]
+    queries = list(dict.fromkeys([payload.query, *terms]))
+    with get_connection() as con:
+        if payload.material_id:
+            ensure_material(con, payload.material_id)
+        ranked = {}
+        for query in queries:
+            for rank, row in enumerate(lexical_search.search_rows(con, query, payload.material_id, min(50, payload.limit * 4)), 1):
+                item = ranked.setdefault(row["id"], {**row, "keyword_rank_score": 0.0})
+                item["keyword_rank_score"] += 1 / (60 + rank)
+        ordered = sorted(ranked.values(), key=lambda row: (-row["keyword_rank_score"], row["id"]))[:payload.limit]
+        results = []
+        for row in ordered:
+            item = {key: value for key, value in row.items() if key != "id"}
+            text = row["content_text"]
+            positions = [text.lower().find(term.lower()) for term in terms]
+            start = max(0, min((position for position in positions if position >= 0), default=0) - 400)
+            end = min(len(text), start + embedding_index.SPAN_CHARS)
+            item.update(segment_id=row["id"], score=row["keyword_rank_score"], evidence_type="text_passage",
+                        matched_span={"start": start, "end": end}, matched_text=text[start:end],
+                        retrieval_basis="Keyword matching in the existing source-text index; no semantic similarity.")
+            item["citation"] = citation_from_segment(item)
+            results.append(item)
+        observations = get_related_observations_for_segments(con,
+            segment_ids=[int(item["segment_id"]) for item in results],
+            material_ids=list({item["material_id"] for item in results})) if payload.include_observations else []
+    return {"query": payload.query, "mode": "keyword_evidence_search", "provider_configured": True,
+            "embedding_model": None, "ranking_method": "keyword_rank_fusion", "results": results,
+            "related_observations": observations, "index_result": {"indexed_count": 0},
+            "evidence_note": "Embeddings are unavailable. Results use keyword matching in existing source text; image similarity is unavailable. Try exact source terms, including the original language."}
+
+
+async def review_retrieval(payload: SemanticSearchRequest, image_payload=None):
+    ready, _ = await check_embedding_readiness()
+    if ready:
+        try:
+            vector = await query_embedding_for_search(payload.query)
+            text = await semantic_search_segments(payload, query_embedding=vector)
+            images = await search_image_evidence(image_payload, query_embedding=vector) if image_payload and image_payload.include_images else {"image_results": [], "index_result": None}
+            return text, images
+        except HTTPException as exc:
+            if exc.status_code not in {429, 502, 503, 504}:
+                raise
+    text = await asyncio.to_thread(keyword_review_segments, payload)
+    return text, {"image_results": [], "index_result": None}
+
+
 async def semantic_search_segments(payload: SemanticSearchRequest, query_embedding: Optional[list[float]] = None) -> dict:
     if query_embedding is None:
         query_embedding = await query_embedding_for_search(payload.query)
@@ -3665,6 +3716,7 @@ async def get_ai_status():
         "provider_configured": is_chat_available,
         "chat_configured": is_chat_available,
         "embedding_configured": is_embedding_available,
+        "keyword_review_available": True,
         "provider": ollama_provider_name(),
         "chat_provider": ollama_provider_name(),
         "embedding_provider": active_embedding_provider(),
@@ -3680,7 +3732,7 @@ async def get_ai_status():
         "status_message": (
             "Ollama Cloud generation and embeddings are ready."
             if is_chat_available and is_embedding_available
-            else "Ollama Cloud generation is ready. Embeddings are not ready, so related-reference/vector search may be limited."
+            else "Ollama Cloud generation is ready. Assisted review can use keyword matching; semantic and image similarity are unavailable."
             if is_chat_available
             else "Ollama Cloud generation is not ready. Exact search and observations still work."
         ),
@@ -3759,7 +3811,7 @@ async def get_image_index_job(job_id: str):
 
 @router.post("/ai/semantic-search")
 async def semantic_search(payload: SemanticSearchRequest):
-    if not await ollama_available():
+    if not (await check_ollama_generation_readiness())[0]:
         return {
             "query": payload.query,
             "mode": "semantic_evidence_search",
@@ -3771,12 +3823,12 @@ async def semantic_search(payload: SemanticSearchRequest):
             ),
         }
 
-    return await semantic_search_segments(payload)
+    return (await review_retrieval(payload))[0]
 
 
 @router.post("/ai/multimodal-search")
 async def multimodal_search(payload: MultimodalSearchRequest):
-    if not await ollama_available():
+    if not (await check_ollama_generation_readiness())[0]:
         return {
             "query": payload.query,
             "mode": "multimodal_evidence_search",
@@ -3795,17 +3847,11 @@ async def multimodal_search(payload: MultimodalSearchRequest):
         limit=payload.limit,
         include_observations=payload.include_observations,
     )
-    query_embedding = await query_embedding_for_search(payload.query)
-    text_results = await semantic_search_segments(text_payload, query_embedding=query_embedding)
-    image_results = (
-        await search_image_evidence(payload, query_embedding=query_embedding)
-        if payload.include_images
-        else {"image_results": [], "index_result": None}
-    )
+    text_results, image_results = await review_retrieval(text_payload, payload)
 
     return {
         "query": payload.query,
-        "mode": "multimodal_evidence_search",
+        "mode": text_results.get("mode", "multimodal_evidence_search"),
         "provider_configured": True,
         "embedding_model": active_embedding_model_name(),
         "vision_model": OLLAMA_VISION_MODEL,
@@ -3816,7 +3862,7 @@ async def multimodal_search(payload: MultimodalSearchRequest):
         "image_results": image_results["image_results"],
         "related_observations": text_results["related_observations"],
         "evidence_note": (
-            "Text passages and document images are searched separately, then shown as citable evidence. "
+            text_results.get("evidence_note", "") + " Text passages and available document images are shown as citable evidence. "
             "Image captions are observable descriptions, not interpretations."
         ),
     }
@@ -3824,38 +3870,23 @@ async def multimodal_search(payload: MultimodalSearchRequest):
 
 @router.post("/ai/ask")
 async def ask_corpus(payload: AskCorpusRequest):
-    (embedding_ready, embedding_detail), (generation_ready, generation_detail) = await asyncio.gather(
-        check_embedding_readiness(), check_ollama_generation_readiness())
+    generation_ready, generation_detail = await check_ollama_generation_readiness()
     if not generation_ready:
         raise HTTPException(status_code=503, detail="Answer generation is unavailable. Exact search remains available. " + generation_detail)
-    if not embedding_ready:
-        return {
-            "question": payload.question,
-            "provider_configured": False,
-            "answer": (
-                "Process References is available when Ollama Cloud is configured and reachable."
-            ),
-            "citations": [],
-            "related_observations": [],
-            "evidence_note": embedding_detail,
-        }
-
     semantic_payload = SemanticSearchRequest(
         query=payload.question,
         material_id=payload.material_id,
         limit=payload.max_results,
         include_observations=True,
     )
-    query_embedding = await query_embedding_for_search(payload.question)
-    retrieval = await semantic_search_segments(semantic_payload, query_embedding=query_embedding)
-    image_retrieval = await search_image_evidence(
+    retrieval, image_retrieval = await review_retrieval(semantic_payload,
         MultimodalSearchRequest(
             query=payload.question,
             material_id=payload.material_id,
             limit=min(payload.max_results, 6),
             include_observations=True,
             include_images=True,
-        ), query_embedding=query_embedding,
+        ),
     )
     evidence = retrieval["results"]
 
@@ -3889,7 +3920,7 @@ async def ask_corpus(payload: AskCorpusRequest):
         "image_results": image_retrieval["image_results"],
         "related_observations": retrieval["related_observations"],
         "evidence_note": (
-            "Generated draft answer from retrieved passages. Citation bounds are checked; factual entailment is not automatically verified. "
+            retrieval.get("evidence_note", "") + " Generated draft answer from retrieved passages. Citation bounds are checked; factual entailment is not automatically verified. "
             "Verify claims against the source quotations."
         ),
     }
@@ -3897,7 +3928,7 @@ async def ask_corpus(payload: AskCorpusRequest):
 
 @router.post("/ai/evidence-report")
 async def generate_ai_evidence_report(payload: SemanticSearchRequest):
-    if not await ollama_available():
+    if not (await check_ollama_generation_readiness())[0]:
         return {
             "query": payload.query,
             "provider_configured": False,
@@ -3908,16 +3939,14 @@ async def generate_ai_evidence_report(payload: SemanticSearchRequest):
             ),
         }
 
-    query_embedding = await query_embedding_for_search(payload.query)
-    retrieval = await semantic_search_segments(payload, query_embedding=query_embedding)
-    image_retrieval = await search_image_evidence(
+    retrieval, image_retrieval = await review_retrieval(payload,
         MultimodalSearchRequest(
             query=payload.query,
             material_id=payload.material_id,
             limit=payload.limit,
             include_observations=payload.include_observations,
             include_images=True,
-        ), query_embedding=query_embedding,
+        ),
     )
     grouped: dict[str, dict] = {}
     terms = parse_report_terms(payload.query)
@@ -3939,6 +3968,7 @@ async def generate_ai_evidence_report(payload: SemanticSearchRequest):
                 "segment_id": item["segment_id"],
                 "page_ref": item["page_ref"],
                 "score": item["score"],
+                "keyword_rank_score": item.get("keyword_rank_score"),
                 "content_text": item["content_text"],
             },
             item["content_text"],
@@ -4049,7 +4079,7 @@ async def generate_ai_evidence_report(payload: SemanticSearchRequest):
         ],
         "related_observations": retrieval["related_observations"],
         "evidence_note": (
-            "Grouped by source title for review. This report surfaces evidence candidates "
+            retrieval.get("evidence_note", "") + " Grouped by source title for review. This report surfaces evidence candidates "
             "and does not assign cultural meaning."
         ),
     }
