@@ -312,12 +312,13 @@ class NetworkStore:
                 except (ValueError, FileNotFoundError, KeyError, TypeError) as exc:
                     issues.append({"run_id": run["run_id"], "reason": str(exc)})
                     continue
-                for material_id, _ in _graph_files(graph):
-                    rank = (len(graph["entities"]), len(graph["assertions"]), not graph["partial_extraction"], origin["created_at"])
+                for material_id, _ in sorted(_graph_files(graph)):
+                    rank = (len(graph["entities"]), len(graph["assertions"]), not graph["partial_extraction"], origin["created_at"], run["run_id"])
                     current = candidates.get(material_id)
                     if current is None or rank > current[0]:
                         candidates[material_id] = (rank, run["run_id"], graph, origin)
-            for _, run_id, graph, origin in candidates.values():
+            for material_id in sorted(candidates):
+                _, run_id, graph, origin = candidates[material_id]
                 loaded[run_id] = (graph, origin)
         else:
             for run_id in run_ids:
@@ -343,7 +344,7 @@ class NetworkStore:
             for file in document["files"]:
                 file["included_in_graph"] = (material_id, file["file_id"]) in included_files
             document["covered_file_count"] = sum(file["included_in_graph"] for file in document["files"])
-            document["run_ids"] = [run_id for run_id, (graph, _) in loaded.items() if any(mid == material_id for mid, _ in _graph_files(graph))]
+            document["run_ids"] = sorted(run_id for run_id, (graph, _) in loaded.items() if any(mid == material_id for mid, _ in _graph_files(graph)))
             document["run_id"] = document["run_ids"][0] if document["run_ids"] else None
             document["saved_account_count"] = len(document["run_ids"])
             document["status"] = "included" if document["run_ids"] else "no_extracted_text" if not document["extracted_segment_count"] else "no_saved_graph"
@@ -361,7 +362,7 @@ class NetworkStore:
                     "file_count": sum(row["file_count"] for row in documents),
                     "files_with_extraction": sum(file["extracted_segment_count"] > 0 for row in documents for file in row["files"]),
                     "covered_file_count": sum(row["covered_file_count"] for row in documents), "materials": documents,
-                    "excluded_runs": issues,
+                    "excluded_runs": sorted(issues, key=lambda row: (row["run_id"], row["reason"])),
                     "selection_policy": "Select the most populated current saved run per material. A selected multi-document run can bring additional independent accounts; those accounts retain separate IDs and provenance.",
                     "interpretation": "A saved snapshot of current graph candidates and the document register. Missing files, pending extraction and unprocessed passages remain explicit; this is not a completed scientific database."}
         combined.update(partial_extraction=any(graph["partial_extraction"] for graph, _ in loaded.values()) or coverage["covered_file_count"] < coverage["file_count"] or bool(coverage["materials_without_graph"]),

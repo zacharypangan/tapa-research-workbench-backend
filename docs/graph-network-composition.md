@@ -24,6 +24,16 @@ A published run contributes its authoritative release only. Draft checkpoints ca
 
 Origin review history is retained only as provenance. Active combined decisions are empty; upstream approvals do not certify this new draft or inferred edges. The latest valid original rejection is retained for inference eligibility. No physical entity identity merge, accepted historical transmission, semantic fact transfer or scientific publication occurs.
 
+## Inference rules
+
+The optional inference layer uses three deterministic rules over saved evidence:
+
+1. **Typed label match:** normalized original labels, recorded aliases or proposed English labels match and concept types agree. A translation-based match is labelled as such. Source-local IDs remain separate; the proposal is a possible concept comparison.
+2. **Shared reported endpoint:** two concepts have positive source-reported links to the same concept. The proposal cites both original assertions and their evidence. It describes a navigation path, not a direct, causal, geographic, chronological or historical claim.
+3. **Shared quotation context:** concepts cite an identical quotation record, or quotations no more than 400 Unicode code points apart within the same source text unit. The proposal is contextual association and does not become a reported relationship.
+
+Conflicting recorded contexts and upstream rejections suppress proposals. Existing reported/analytical connections are not duplicated. Every proposal retains its rule, rationale, evidence, available premise IDs and `needs_review` status. Defaults cap output at 2,000 connections, 12 per entity and 100,000 considered pairs; the service reports `truncated`, `considered_pairs` and per-rule counts. The internal inference helper permits explicit output limits of 1–5,000 connections and 1–50 per entity. This API currently uses the defaults. No provider requests occur.
+
 ## Coverage and limits
 
 The database register includes every current material and its attached files, extraction segment counts, graph participation and pending batch counts. A file contributes graph coverage only when it has at least one actual concept, not merely because it was attached to a multi-file run. Missing text, missing graphs, unprocessed passages and partial file coverage remain visible. The database is a combined saved graph and document register, not a promise of exhaustive extraction or validated scientific content.

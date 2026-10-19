@@ -286,6 +286,27 @@ class GraphNetworkTests(unittest.TestCase):
             self.assertEqual(response.status_code, 503, response.text)
             self.assertNotIn(str(self.root), response.text)
 
+    def test_same_material_selection_and_library_ties_are_order_independent(self):
+        first, material, file, original, graph = self.create_run()
+        second = self.runs.create([{"path": original, "title": "Second saved account", "locator": f"workbench:material/{material}/file/{file}"}],
+                                  {"ontology": {"version": "test"}}, "test")["run_id"]
+        write_json(self.runs.path(second) / "graph_input.json", graph)
+        self.runs.state(self.runs.path(second), "awaiting_review", "release")
+        for run_id in (first, second):
+            inputs = read_json(self.runs.path(run_id) / "inputs.json")
+            inputs["created_at"] = "2026-10-19T00:00:00Z"
+            write_json(self.runs.path(run_id) / "inputs.json", inputs)
+        forward = self.networks.create("Two accounts", [first, second], infer_connections=False)
+        reverse = self.networks.create("Two accounts", [second, first], infer_connections=False)
+        self.assertEqual(forward["network_id"], reverse["network_id"])
+        self.assertEqual(forward["coverage"]["materials"][0]["run_ids"], sorted([first, second]))
+        with patch.object(network_storage, "_all_runs", return_value=[{"run_id": first}, {"run_id": second}]):
+            library_forward = self.networks.create("Stable library", [], "library", False)
+        with patch.object(network_storage, "_all_runs", return_value=[{"run_id": second}, {"run_id": first}]):
+            library_reverse = self.networks.create("Stable library", [], "library", False)
+        self.assertEqual(library_forward["run_ids"], [max(first, second)])
+        self.assertEqual(library_forward["network_id"], library_reverse["network_id"])
+
 
 if __name__ == "__main__":
     unittest.main()
