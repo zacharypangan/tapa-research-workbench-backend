@@ -448,7 +448,7 @@ class RepositoryIndexingTests(unittest.TestCase):
 
     def test_generated_answer_flags_and_citation_bounds(self):
         evidence = [{"content_text": "Source evidence", "material_title": "one", "citation": {"material_id": "one"}}]
-        for generated, expected_valid in (("Supported [1].", True), ("Bad source [99].", False), ("No numbered citation.", True)):
+        for generated, expected_valid in (("Supported [1].", True), ("Bad source [99].", False), ("No numbered citation.", False), ("Unsupported 【1†L1-L4】.", False)):
             with self.subTest(generated=generated), ExitStack() as stack:
                 stack.enter_context(patch.object(repository, "check_embedding_readiness", new=AsyncMock(return_value=(True, "ready"))))
                 stack.enter_context(patch.object(repository, "check_ollama_generation_readiness", new=AsyncMock(return_value=(True, "ready"))))
