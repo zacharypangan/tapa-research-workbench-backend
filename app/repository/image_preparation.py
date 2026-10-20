@@ -5,20 +5,44 @@ OCR and generated descriptions stay separate; vectors are a subsequent stage.
 """
 
 import asyncio
+import hashlib
+import json
 from pathlib import Path
+import uuid
 
 from . import image_descriptions
 
 
-def _read_ocr(image_path, language):
+def _read_ocr(image_path, language, storage_root=None):
     from PIL import Image
-    from .document_representation import ocr_image, ocr_runtime
+    from .document_representation import ocr_image, ocr_runtime, representation_signature
     runtime = ocr_runtime(language)
     if not runtime["selected"]:
         return {"text": "", "state": "unavailable", "error_category": "ocr_not_available", "retryable": False}
+    # Remember a successful empty transcription separately from a timeout. This
+    # prevents every job retry from OCRing the same text-free figures again.
+    inputs = {"image_sha256": image_descriptions.description_input(image_path, "", "")["image_sha256"],
+              "runtime": runtime, "method": representation_signature(), "version": "image-ocr-empty/1"}
+    key = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+    path = Path(storage_root) / "derived" / "image_ocr" / key[:2] / (key + ".json") if storage_root else None
+    if path and path.is_file():
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if record.get("inputs") == inputs and record.get("state") == "no_text":
+                return {"text": "", "state": "no_text", "cache_reused": True, "language": "+".join(runtime["selected"])}
+        except (OSError, ValueError):
+            pass
     with Image.open(image_path) as image:
         result = ocr_image(image, runtime)
     failed = any(warning.startswith("OCR failed or timed out:") for warning in result.get("warnings", []))
+    if path and not failed and not result["text"] and image_descriptions.description_input(image_path, "", "")["image_sha256"] == inputs["image_sha256"]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+        try:
+            temporary.write_text(json.dumps({"inputs": inputs, "state": "no_text"}), encoding="utf-8")
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
     return {"text": result["text"], "state": "failed" if failed else "readable" if result["text"] else "no_text",
             "confidence": result.get("confidence"), "language": result.get("language"),
             **({"error_category": "ocr_failed_or_timed_out", "retryable": True} if failed else {})}
@@ -34,7 +58,7 @@ def _description_current(repo, row, context):
                 and record["normalized_caption"] == (row["visual_caption"] or ""))
 
 
-async def prepare_images(con, material_id, limit=200, skip_ids=None):
+async def prepare_images(con, material_id, limit=200, skip_ids=None, progress_callback=None):
     from app.api import repository as repo
 
     if not 1 <= limit <= 200:
@@ -61,7 +85,7 @@ async def prepare_images(con, material_id, limit=200, skip_ids=None):
                 continue
             old_ocr, old_caption = row["ocr_text"] or "", row["visual_caption"] or ""
             inputs = image_descriptions.description_input(row["image_path"], context, repo.OLLAMA_VISION_MODEL)
-            ocr_result = {"text": old_ocr, "state": "existing"} if old_ocr else await asyncio.to_thread(_read_ocr, row["image_path"], material["language"])
+            ocr_result = {"text": old_ocr, "state": "existing"} if old_ocr else await asyncio.to_thread(_read_ocr, row["image_path"], material["language"], repo.STORAGE_ROOT)
             ocr = ocr_result["text"]
             ocr_detail = {key: value for key, value in ocr_result.items() if key != "text"}
             if image_descriptions.description_input(row["image_path"], context, repo.OLLAMA_VISION_MODEL)["key"] != inputs["key"]:
@@ -116,6 +140,10 @@ async def prepare_images(con, material_id, limit=200, skip_ids=None):
         except Exception as exc:
             counters["failed_count"] += 1
             outcomes.append({"id": row["id"], "status": "failed", **repo._index_failure(exc)})
+        finally:
+            if progress_callback is not None:
+                await progress_callback({**counters, "last_outcome": outcomes[-1],
+                                         "pending_count": len(candidates) - len(outcomes)})
     return {**counters, "outcomes": outcomes, "pending_count": max(0, len(candidates) - limit),
             "vision_model": repo.OLLAMA_VISION_MODEL, "embedding_required": False,
             "evidence_origin": "machine_visual_description", "vision_diagnostics": repo.image_description_diagnostics()}

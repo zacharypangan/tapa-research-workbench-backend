@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 from app.api import repository as repo
 from app.repository import image_descriptions
-from app.repository.image_preparation import prepare_images
+from app.repository.image_preparation import prepare_images, _read_ocr
 
 
 class ImagePreparationTests(unittest.TestCase):
@@ -101,3 +101,30 @@ class ImagePreparationTests(unittest.TestCase):
         for value in (0, 201):
             with self.assertRaises(ValueError):
                 self.run_batch(limit=value)
+
+    def test_per_image_progress_is_available_before_batch_returns(self):
+        snapshots = []
+        async def checkpoint(snapshot):
+            snapshots.append(snapshot)
+            with repo.get_connection() as con:
+                self.assertEqual(con.execute("SELECT ocr_text FROM image_evidence").fetchone()[0], "石拍")
+        self.run_batch(progress_callback=checkpoint)
+        self.assertEqual(snapshots[0]["processed_image_count"], 1)
+        self.assertEqual(snapshots[0]["last_outcome"]["id"], "image")
+        self.assertEqual(snapshots[0]["pending_count"], 0)
+
+    def test_empty_ocr_cache_is_content_and_runtime_addressed_but_timeouts_are_not_cached(self):
+        from PIL import Image
+        Image.new("RGB", (16, 16), "white").save(self.image)
+        runtime = {"selected": ["eng"], "engine_version": "fixture", "warnings": []}
+        empty = {"text": "", "confidence": None, "language": "eng", "warnings": ["OCR completed but detected no text."]}
+        with patch("app.repository.document_representation.ocr_runtime", return_value=runtime), \
+                patch("app.repository.document_representation.ocr_image", return_value=empty) as operation:
+            self.assertEqual(_read_ocr(str(self.image), "en", self.root)["state"], "no_text")
+            self.assertTrue(_read_ocr(str(self.image), "en", self.root)["cache_reused"])
+            self.assertEqual(operation.call_count, 1)
+            Image.new("RGB", (16, 16), "black").save(self.image)
+            operation.return_value = {**empty, "warnings": ["OCR failed or timed out: RuntimeError"]}
+            self.assertEqual(_read_ocr(str(self.image), "en", self.root)["state"], "failed")
+            self.assertEqual(_read_ocr(str(self.image), "en", self.root)["state"], "failed")
+            self.assertEqual(operation.call_count, 3)

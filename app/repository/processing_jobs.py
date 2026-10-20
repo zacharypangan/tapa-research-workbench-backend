@@ -448,8 +448,24 @@ class ProcessingScheduler:
         totals = {name: previous.get(name, 0) for name in counter_names}
         seen, failures = set(), {}
         for batch in range(100):
+            batch_failures = {}
+
+            async def checkpoint(snapshot):
+                outcome = snapshot["last_outcome"]
+                if outcome.get("status") == "failed":
+                    batch_failures[outcome["id"]] = outcome
+                progress = self.get(job["job_id"]).get("stage_progress", {})
+                progress[stage] = {**progress.get(stage, {}),
+                    **{name: totals[name] + snapshot.get(name, 0) for name in counter_names},
+                    "failed_count": len(set(failures) | set(batch_failures)),
+                    "failed_ids": sorted(set(failures) | set(batch_failures), key=str),
+                    "pending_count": snapshot["pending_count"], "batch": batch + 1,
+                    "last_outcomes": [outcome]}
+                await asyncio.to_thread(self.update, job["job_id"], stage_progress=progress)
+
             with repo.get_connection() as connection:
-                result = await prepare_images(connection, material_id=job["material_id"], limit=200, skip_ids=set(seen))
+                result = await prepare_images(connection, material_id=job["material_id"], limit=200,
+                                              skip_ids=set(seen), progress_callback=checkpoint)
             outcomes = result.get("outcomes", [])
             selected = {outcome["id"] for outcome in outcomes if outcome.get("id") is not None}
             fresh = selected - seen

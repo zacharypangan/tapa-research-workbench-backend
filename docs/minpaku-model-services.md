@@ -68,6 +68,9 @@ from production. No automatic production model-setting change is included here.
   Model-generated labels remain derived evidence, not quotations from papers.
 * Per-image outcomes, bounded batches, progress and retry classifications are
   durable. A startup discovery error no longer kills processing of queued jobs.
+  Progress checkpoints update after each image. Successful empty OCR assessments
+  are cached by image bytes, OCR implementation and runtime; timeouts are not
+  cached as blank text.
 * Provider caches include endpoint identity. Existing persisted vector identity
   is unchanged; changing an embedding model still requires a deliberate rebuild.
 * `scripts/check_local_model_services.py` supplies bounded, synthetic tests for
@@ -77,6 +80,20 @@ from production. No automatic production model-setting change is included here.
 No dependencies, database schema, credentials, environment files or deployment
 configuration are changed. Hash-pinned graph/translation/representation modules
 remain unchanged, so existing evidence and completed translations are preserved.
+
+### Staging proof and remaining document failures
+
+The deployed staging status response returned all seven capability records.
+Local OCR/language packs, generation and embeddings passed their operational
+checks; graph/translation/vision task verification remained explicitly separate.
+The new image stage ran on the Watanabe five-paper material (82 image records).
+Its first pass examined 29 images needing empty-text reassessment, retained 29
+usable descriptions, added no new OCR text and reported three OCR timeouts.
+These counts include reused descriptions; they are not 29 new model inferences.
+Existing current image vectors and source files were retained. Automatic retries
+are bounded and successful outputs survive. The three difficult images still
+need a successful OCR retry or researcher inspection; the test does not establish
+complete transcription or a working Minpaku deployment.
 
 ## Target service boundaries
 
