@@ -796,6 +796,10 @@ def ai_configured() -> bool:
 async def _probe_ollama_generation_readiness() -> tuple[bool, str]:
     if not ai_chat_configured():
         return False, ollama_status_message()
+    from app.repository.model_worker_readiness import bridge_readiness
+    bridge = await bridge_readiness(effective_ollama_base_url(), ollama_headers(), OLLAMA_RETRIEVAL_MODEL)
+    if bridge is not None:
+        return bridge
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.post(
@@ -821,6 +825,11 @@ async def _probe_ollama_generation_readiness() -> tuple[bool, str]:
 async def _probe_embedding_readiness() -> tuple[bool, str]:
     if not ai_embedding_configured():
         return False, embedding_status_message()
+    if active_embedding_provider() == "ollama":
+        from app.repository.model_worker_readiness import bridge_readiness
+        bridge = await bridge_readiness(effective_ollama_base_url(), ollama_headers(), OLLAMA_EMBEDDING_MODEL)
+        if bridge is not None:
+            return bridge
     try:
         embedding = await request_embedding("health check", task_type="RETRIEVAL_QUERY")
         if embedding:
@@ -833,6 +842,9 @@ async def _probe_embedding_readiness() -> tuple[bool, str]:
 
 
 async def _cached_readiness(kind: str, key: tuple, probe) -> tuple[bool, str]:
+    from app.repository.model_worker_readiness import STAGING_GATEWAY
+    if effective_ollama_base_url().rstrip("/") in {STAGING_GATEWAY, STAGING_GATEWAY + "/api"}:
+        return await probe()  # Metadata only: do not cache a worker past lease freshness.
     cache_key = (kind, key)
     cached = _READINESS_CACHE.get(cache_key)
     if cached and time.monotonic() - cached[0] < (60 if cached[1][0] else 10):

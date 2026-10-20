@@ -243,7 +243,9 @@ source spacing/glyphs; English names belong in derived labels.
 
 Only bounded transient task envelopes occupy the existing Railway storage: 32
 pending requests, 64 MiB total, 8 MiB per request/result, 20-second leases, three
-attempts, deadlines <=80 seconds. Terminal inputs are erased immediately and
+attempts, deadlines <=80 seconds (55 seconds for embeddings, within the existing
+60-second caller limit). Earlier deadlines are served first to prevent long text
+batches from starving interactive embedding requests. Terminal inputs are erased immediately and
 terminal envelopes expire after five minutes. Original documents and released
 graphs are outside this cleanup. Archive effective-policy/model audits with
 research evaluation artifacts before transient cleanup; the existing pinned
@@ -262,3 +264,11 @@ worker allocation. It does not delete source files, graph releases or model
 caches. The allocation ends after two hours; continuous service requires an
 administrator-approved recurring reservation and worker supervision. A laptop
 SSH forward is evaluation-only and is not the hosted service transport.
+
+The authenticated `/model-gateway/health` endpoint submits no synthetic inference.
+It requires a worker heartbeat <=35 seconds old AND a successful matching model
+operation on that same worker <=300 seconds old. Queue counts distinguish a busy
+GPU from disconnected/unverified execution. Replayed results and heartbeats do
+not renew success proof. On a new cold worker, run the gateway conformance checks
+to establish per-model execution evidence; connection alone is not a success.
+This proof checks operation, model and output shape, not scientific entailment.

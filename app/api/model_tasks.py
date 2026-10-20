@@ -278,7 +278,7 @@ def prepare_gateway_request(operation, original):
         graph = _bound_graph_schema(body)
     if operation == "embed":
         body["truncate"] = False
-    timeout = 35 if model == EMBEDDING_MODEL else 50 if model == VISION_MODEL else 80
+    timeout = 55 if model == EMBEDDING_MODEL else 50 if model == VISION_MODEL else 80
     audit = {"policy_version": POLICY_VERSION, "requested_request_sha256": _digest(operation, original),
              "effective_request_sha256": _digest(operation, body), "effective_policy": {
                  "num_ctx": 16384, "keep_alive": 0, "stream": False,
@@ -458,3 +458,15 @@ async def fail_model_task(request: Request):
 async def model_worker_status(request: Request):
     _authorize(request, "MODEL_GATEWAY_TOKEN")
     return await _broker(get_model_task_store().status)
+
+
+@router.get("/model-gateway/health")
+async def model_gateway_health(request: Request):
+    """Operational proof from stored metadata; never enqueue a health inference."""
+    _authorize(request, "MODEL_GATEWAY_TOKEN")
+    response = await _broker(get_model_task_store().readiness, {
+        model: {"embed", "embeddings"} if model == EMBEDDING_MODEL else {"chat", "generate"}
+        for model in MODELS
+    })
+    from fastapi.responses import JSONResponse
+    return JSONResponse(response, headers={"Cache-Control": "no-store"})

@@ -100,6 +100,25 @@ class RepositoryReadinessTests(unittest.TestCase):
         repository._QUERY_EMBEDDINGS.clear()
         repository._READINESS_CACHE.clear()
 
+    def test_private_bridge_readiness_avoids_competing_inference_probes(self):
+        with patch.object(repository, "ai_chat_configured", return_value=True), \
+                patch.object(repository, "ai_embedding_configured", return_value=True), \
+                patch.object(repository, "EMBEDDING_PROVIDER", "ollama"), \
+                patch("app.repository.model_worker_readiness.bridge_readiness", new=AsyncMock(return_value=(True, "Recent GPU execution verified; queue busy"))) as probe, \
+                patch.object(repository, "request_embedding", new=AsyncMock(side_effect=AssertionError("no competing inference"))) as embed:
+            self.assertTrue(asyncio.run(repository._probe_ollama_generation_readiness())[0])
+            self.assertTrue(asyncio.run(repository._probe_embedding_readiness())[0])
+            self.assertEqual(probe.await_count, 2)
+            embed.assert_not_awaited()
+
+    def test_bridge_disconnect_is_not_hidden_by_positive_provider_cache(self):
+        from app.repository.model_worker_readiness import STAGING_GATEWAY
+        with patch.object(repository, "OLLAMA_REPOSITORY_BASE_URL", STAGING_GATEWAY), \
+                patch.object(repository, "_probe_ollama_generation_readiness", new=AsyncMock(side_effect=[(True, "ready"), (False, "disconnected")])) as probe:
+            self.assertTrue(asyncio.run(repository.check_ollama_generation_readiness())[0])
+            self.assertFalse(asyncio.run(repository.check_ollama_generation_readiness())[0])
+            self.assertEqual(probe.await_count, 2)
+
     def test_self_hosted_status_never_claims_cloud_provider(self):
         with patch.object(repository, "OLLAMA_REPOSITORY_BASE_URL", "http://local-model:11434"), \
                 patch.object(repository, "OLLAMA_RETRIEVAL_MODEL", "local-text"):

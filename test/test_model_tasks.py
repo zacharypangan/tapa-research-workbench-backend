@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from app.repository.model_tasks import (
     LEASE_SECONDS, MAX_ATTEMPTS, RETENTION_SECONDS,
+    SUCCESS_MAX_AGE_SECONDS, WORKER_MAX_AGE_SECONDS,
     ModelTaskCapacity, ModelTaskConflict, ModelTaskStore, task_request_hash,
 )
 
@@ -36,6 +37,76 @@ class ModelTaskStoreTests(unittest.TestCase):
 
     def enqueue(self, **kwargs):
         return self.store.enqueue("chat", request_body(), **kwargs)
+
+    def test_earliest_deadline_precedes_fifo_without_renewed_starvation(self):
+        old = self.enqueue(timeout_seconds=80)
+        self.now += 5
+        short = self.store.enqueue("embed", {"model": "qwen3-embedding:0.6b", "input": "fixture"}, timeout_seconds=35)
+        models = {"models": [MODEL, "qwen3-embedding:0.6b"]}
+        first = self.store.claim("worker", models)
+        self.assertEqual(first["id"], short["id"])
+        self.store.complete(first["id"], "worker", first["lease_token"], {"embeddings": [[1, 0]]})
+        self.now += 50
+        later = self.store.enqueue("embed", {"model": "qwen3-embedding:0.6b", "input": "later"}, timeout_seconds=35)
+        self.assertGreater(later["deadline_at"], old["deadline_at"])
+        self.assertEqual(self.store.claim("worker", models)["id"], old["id"])
+
+    def test_readiness_requires_recent_success_and_preserves_proof_on_polls(self):
+        operations = {MODEL: {"chat", "generate"}, "qwen3-embedding:0.6b": {"embed", "embeddings"}}
+        self.store.claim("worker", CAPABILITIES)
+        self.assertEqual(self.store.readiness(operations)["models"][MODEL]["state"], "execution_unverified")
+        self.enqueue()
+        task = self.store.claim("worker", CAPABILITIES)
+        self.now += 1
+        self.store.heartbeat(task["id"], "worker", task["lease_token"])
+        self.assertFalse(self.store.readiness(operations)["models"][MODEL]["ready"])
+        self.store.complete(task["id"], "worker", task["lease_token"], result_body())
+        succeeded_at = self.now
+        for _ in range(3):
+            self.now += 5
+            self.store.claim("worker", CAPABILITIES)
+        metadata = self.store.readiness(operations)
+        self.assertTrue(metadata["models"][MODEL]["ready"])
+        self.assertEqual(metadata["models"][MODEL]["last_success_at"], succeeded_at)
+        self.assertEqual(metadata["models"][MODEL]["last_success_operation"], "chat")
+        self.assertFalse(metadata["models"]["qwen3-embedding:0.6b"]["ready"])
+        self.assertNotIn("Private synthetic evidence", json.dumps(metadata))
+        self.assertNotIn("Fixture answer", json.dumps(metadata))
+
+    def test_busy_worker_is_ready_but_disconnected_or_stale_execution_is_not(self):
+        operations = {MODEL: {"chat", "generate"}}
+        self.enqueue()
+        task = self.store.claim("worker", CAPABILITIES)
+        self.store.complete(task["id"], "worker", task["lease_token"], result_body())
+        self.enqueue()
+        running = self.store.claim("worker", CAPABILITIES)
+        self.enqueue()
+        busy = self.store.readiness(operations)
+        self.assertEqual(busy["models"][MODEL]["state"], "ready_busy")
+        self.assertEqual((busy["queued_count"], busy["running_count"]), (1, 1))
+        self.now += WORKER_MAX_AGE_SECONDS + 1
+        disconnected = self.store.readiness(operations)
+        self.assertFalse(disconnected["models"][MODEL]["ready"])
+        self.assertEqual(disconnected["models"][MODEL]["state"], "worker_disconnected")
+        self.now = 1000 + SUCCESS_MAX_AGE_SECONDS + 1
+        self.store.claim("worker", CAPABILITIES)
+        stale = self.store.readiness(operations)["models"][MODEL]
+        self.assertTrue(stale["worker_fresh"])
+        self.assertFalse(stale["ready"])
+        self.assertEqual(stale["state"], "execution_unverified")
+
+    def test_proof_is_worker_specific_matching_operation_and_replay_does_not_renew_it(self):
+        self.enqueue()
+        task = self.store.claim("one", CAPABILITIES)
+        self.store.complete(task["id"], "one", task["lease_token"], result_body())
+        self.now += 40
+        self.store.claim("two", CAPABILITIES)
+        self.assertFalse(self.store.readiness({MODEL: {"chat"}})["models"][MODEL]["ready"])
+        self.store.complete(task["id"], "one", task["lease_token"], result_body())
+        replay = self.store.readiness({MODEL: {"chat"}})["models"][MODEL]
+        self.assertTrue(replay["ready"])
+        self.assertEqual(replay["last_success_at"], 1000.0)
+        self.assertFalse(self.store.readiness({MODEL: {"embed"}})["models"][MODEL]["ready"])
 
     def test_hash_binds_operation_and_exact_request(self):
         body = request_body()

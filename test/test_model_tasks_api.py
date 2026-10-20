@@ -78,6 +78,31 @@ class ModelTaskApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Private synthetic passage", response.text)
         self.assertEqual(self.store.status()["pending_count"], 0)
 
+    async def test_authenticated_health_reads_proof_without_submitting_inference(self):
+        headers = {"Authorization": "Bearer " + GATEWAY}
+        path = ROOT + "/model-gateway/health"
+        self.assertEqual((await self.client.get(path)).status_code, 401)
+        self.assertEqual((await self.client.get(path, headers={"Authorization": "Bearer " + WORKER})).status_code, 401)
+        empty = await self.client.get(path, headers=headers)
+        self.assertEqual(empty.status_code, 200)
+        self.assertEqual(empty.headers["cache-control"], "no-store")
+        self.assertFalse(empty.json()["models"]["qwen3:8b"]["ready"])
+        self.assertEqual(self.store.status()["pending_count"], 0)
+        await self.enqueue()
+        task = (await self.claim()).json()["task"]
+        result = {"model": "qwen3:8b", "done": True, "message": {"content": "Private fixture answer"}}
+        self.assertEqual((await self.post("/model-workers/result", self.result_payload(task, result))).status_code, 200)
+        await self.enqueue()
+        before = self.store.status()["pending_count"]
+        health = await self.client.get(path, headers=headers)
+        self.assertTrue(health.json()["models"]["qwen3:8b"]["ready"])
+        self.assertFalse(health.json()["models"]["qwen3-vl:8b-instruct"]["ready"])
+        self.assertEqual(health.json()["models"]["qwen3:8b"]["last_success_at"], self.now)
+        self.assertEqual(self.store.status()["pending_count"], before)
+        self.assertNotIn("Private fixture answer", health.text)
+        self.assertNotIn("Private synthetic passage", health.text)
+        self.assertNotIn(task["lease_token"], health.text)
+
     async def test_duplicate_keys_nonfinite_and_unknown_fields_are_rejected(self):
         for raw in ('{"worker_id":"one","worker_id":"two"}', '{"worker_id":NaN}', '[]'):
             response = await self.client.post(ROOT + "/model-workers/claim", content=raw,

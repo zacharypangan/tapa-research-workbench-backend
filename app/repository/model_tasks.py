@@ -35,6 +35,8 @@ LEASE_SECONDS = 20
 MAX_ATTEMPTS = 3
 RETENTION_SECONDS = 300
 WORKER_MAX_AGE_SECONDS = 35
+SUCCESS_MAX_AGE_SECONDS = 300
+READINESS_VERSION = "model-worker-readiness/1"
 _WORKER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 
 
@@ -280,15 +282,20 @@ class ModelTaskStore:
                 tasks.append(task)
         return tasks
 
-    def _worker_seen(self, worker_id, now, capabilities=None):
+    def _worker_seen(self, worker_id, now, capabilities=None, success=None):
         path = self.root / "_workers.json"
         workers = self._read(path) if path.exists() else {}
         workers = {key: row for key, row in workers.items() if now - row["last_seen"] <= RETENTION_SECONDS}
         if worker_id not in workers and len(workers) >= MAX_PENDING:
             raise ModelTaskCapacity("Model worker registration capacity is reached")
         previous = workers.get(worker_id, {})
+        last_success = dict(previous.get("last_success", {}))
+        if success is not None:
+            model, operation, completed_at = success
+            last_success[model] = {"at": completed_at, "operation": operation}
         workers[worker_id] = {"worker_id": worker_id, "last_seen": now,
-                              "capabilities": capabilities if capabilities is not None else previous.get("capabilities", _capabilities(None))}
+                              "capabilities": capabilities if capabilities is not None else previous.get("capabilities", _capabilities(None)),
+                              "last_success": last_success}
         self._save(path, workers)
 
     def enqueue(self, operation: str, body: dict, timeout_seconds: float = 80,
@@ -325,7 +332,7 @@ class ModelTaskStore:
             for task in tasks:
                 if task["status"] == "running" and task["worker_id"] == worker_id:
                     return task if eligible(task) else None
-            for task in sorted(tasks, key=lambda task: (task["created_at"], task["id"])):
+            for task in sorted(tasks, key=lambda task: (task["deadline_at"], task["created_at"], task["id"])):
                 if task["status"] == "queued" and task["available_at"] <= now and eligible(task):
                     task.update(status="running", worker_id=worker_id, lease_token=secrets.token_urlsafe(32),
                                 lease_until=min(now + LEASE_SECONDS, task["deadline_at"]),
@@ -363,6 +370,9 @@ class ModelTaskStore:
             if (existing["status"] == "succeeded" and existing["worker_id"] == worker_id
                     and isinstance(lease_token, str) and secrets.compare_digest(existing["lease_token"] or "", lease_token)
                     and hashlib.sha256(_json_bytes(result)).hexdigest() == existing["result_hash"]):
+                if existing.get("request_summary"):
+                    self._worker_seen(worker_id, now, success=(existing["request_summary"]["model"],
+                                                              existing["operation"], existing["finished_at"]))
                 return existing
             task = self._leased(task_id, worker_id, lease_token, now)
             result, digest = _result(task, result)
@@ -371,8 +381,9 @@ class ModelTaskStore:
             audit = json.loads(_json_bytes(audit or {}, 16 * 1024))
             task.update(status="succeeded", result=result, result_hash=digest,
                         result_audit=audit, finished_at=now, body=None, lease_until=None)
-            self._worker_seen(worker_id, now)
             self._save(self._path(task_id), task)
+            summary = task.get("request_summary") or existing["body"]
+            self._worker_seen(worker_id, now, success=(summary["model"], task["operation"], task["finished_at"]))
             return task
 
     def fail(self, task_id: str, worker_id: str, lease_token: str,
@@ -406,13 +417,53 @@ class ModelTaskStore:
             views = [{"worker_id": row["worker_id"], "last_seen": row["last_seen"],
                       "age_seconds": max(0, now - row["last_seen"]),
                       "available": now - row["last_seen"] <= WORKER_MAX_AGE_SECONDS,
-                      "models": row["capabilities"]["models"], "digests": row["capabilities"]["digests"]}
+                      "models": row["capabilities"]["models"], "digests": row["capabilities"]["digests"],
+                      "last_success": row.get("last_success", {})}
                      for row in workers.values() if now - row["last_seen"] <= RETENTION_SECONDS]
             queued = sum(task["status"] == "queued" for task in tasks)
             running = sum(task["status"] == "running" for task in tasks)
-            return {"pending_count": queued + running, "queued_count": queued,
+            return {"checked_at": now, "pending_count": queued + running, "queued_count": queued,
                     "running_count": running, "storage_bytes": self._storage_bytes(),
                     "workers": sorted(views, key=lambda row: row["worker_id"])}
+
+    def readiness(self, model_operations: dict[str, set[str]]) -> dict:
+        """Read heartbeat and validated execution metadata without model inference.
+
+        Proof must belong to the same currently advertised worker/model. Claims,
+        polls and heartbeats never renew its original successful-execution time.
+        A busy queue affects latency, not this bounded operational readiness test.
+        """
+        status = self.status()
+        now, models = status["checked_at"], {}
+        for model, operations in sorted(model_operations.items()):
+            workers = [row for row in status["workers"] if model in row["models"]]
+            fresh = [row for row in workers if 0 <= now - row["last_seen"] <= WORKER_MAX_AGE_SECONDS]
+            proofs = []
+            for row in fresh:
+                proof = row.get("last_success", {}).get(model, {})
+                at = proof.get("at")
+                if (type(at) in (int, float) and math.isfinite(at)
+                        and 0 <= now - at <= SUCCESS_MAX_AGE_SECONDS
+                        and proof.get("operation") in operations):
+                    proofs.append((row, proof))
+            selected, proof = max(proofs, key=lambda item: item[1]["at"], default=(
+                max(fresh or workers, key=lambda row: row["last_seen"], default={}), {}))
+            ready = bool(proofs)
+            if not proof:
+                proof = selected.get("last_success", {}).get(model, {})
+            models[model] = {
+                "ready": ready, "worker_fresh": bool(fresh),
+                "state": ("ready_busy" if status["pending_count"] else "ready") if ready else
+                         "execution_unverified" if fresh else "worker_disconnected",
+                "last_seen_at": selected.get("last_seen"),
+                "last_success_at": proof.get("at"),
+                "last_success_operation": proof.get("operation"),
+            }
+        return {"version": READINESS_VERSION, "checked_at": now,
+                "worker_max_age_seconds": WORKER_MAX_AGE_SECONDS,
+                "success_max_age_seconds": SUCCESS_MAX_AGE_SECONDS,
+                "queued_count": status["queued_count"], "running_count": status["running_count"],
+                "pending_count": status["pending_count"], "models": models}
 
     def available_worker(self, model: str, max_age_seconds: float = WORKER_MAX_AGE_SECONDS) -> bool:
         if isinstance(max_age_seconds, bool) or not isinstance(max_age_seconds, (int, float)) or not 0 < max_age_seconds <= 300:
