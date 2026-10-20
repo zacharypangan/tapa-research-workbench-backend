@@ -459,6 +459,7 @@ class ProcessingScheduler:
                     **{name: totals[name] + snapshot.get(name, 0) for name in counter_names},
                     "failed_count": len(set(failures) | set(batch_failures)),
                     "failed_ids": sorted(set(failures) | set(batch_failures), key=str),
+                    "pass_processed_image_count": len(seen) + snapshot.get("processed_image_count", 0),
                     "pending_count": snapshot["pending_count"], "batch": batch + 1,
                     "last_outcomes": [outcome]}
                 await asyncio.to_thread(self.update, job["job_id"], stage_progress=progress)
@@ -482,6 +483,7 @@ class ProcessingScheduler:
                 errors[key] = errors.get(key, 0) + 1
             stage_progress = self.get(job["job_id"]).get("stage_progress", {})
             stage_progress[stage] = {**totals, "failed_count": len(failures),
+                                     "pass_processed_image_count": len(seen),
                                      "failed_ids": sorted(failures, key=str),
                                      "pending_count": result.get("pending_count"), "batch": batch + 1,
                                      "error_summary": [{"error_category": category, "http_status": status,

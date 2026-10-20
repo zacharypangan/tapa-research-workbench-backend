@@ -50,6 +50,7 @@ class PreparationJobTests(unittest.TestCase):
         final = scheduler.get(job["job_id"])
         self.assertEqual(final["status"], "done")
         self.assertEqual(final["stage_progress"]["image_describe"]["captioned_count"], 1)
+        self.assertEqual(final["stage_progress"]["image_describe"]["pass_processed_image_count"], 1)
         self.assertIn("image_describe", final["completed_stages"])
 
     def test_description_failure_preserves_progress_and_processes_other_images(self):
