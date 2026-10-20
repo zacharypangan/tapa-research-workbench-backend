@@ -20,6 +20,7 @@ import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from app.repository import embedding_index, image_descriptions, lexical_search
+from app.repository.service_readiness import local_ocr_runtime, service_capabilities
 from app.repository.schemas import (
     AskCorpusRequest,
     BuildSemanticIndexRequest,
@@ -130,15 +131,16 @@ def ollama_provider_name() -> str:
 
 def ollama_status_message(is_available: bool = False) -> str:
     base_url = effective_ollama_base_url()
+    provider_label = "Ollama Cloud" if ollama_provider_name() == "ollama-cloud" else "Ollama"
     if not base_url:
-        return "Ollama Cloud is not configured. Exact search and observations still work."
+        return "Ollama is not configured. Exact search and observations still work."
     if ollama_base_requires_auth(base_url) and not OLLAMA_REPOSITORY_API_KEY:
         return "Ollama Cloud API key is missing. Exact search and observations still work."
     if not OLLAMA_RETRIEVAL_MODEL:
-        return "Ollama Cloud chat model setting is incomplete. Exact search and observations still work."
+        return f"{provider_label} chat model setting is incomplete. Exact search and observations still work."
     if is_available:
-        return "Ollama Cloud generation is ready for assisted review."
-    return "Ollama Cloud is configured but not reachable from the backend. Exact search and observations still work."
+        return f"{provider_label} generation is ready for assisted review."
+    return f"{provider_label} is configured but not reachable from the backend. Exact search and observations still work."
 
 
 def active_embedding_provider() -> str:
@@ -157,13 +159,19 @@ def active_embedding_index_key() -> str:
     return f"{active_embedding_model_name()}|{embedding_index.INDEX_METHOD}"
 
 
+def embedding_runtime_identity() -> tuple:
+    """Cache partition only; persisted vector/model identities remain unchanged."""
+    endpoint = GEMINI_API_BASE_URL if active_embedding_provider() == "gemini" else effective_ollama_base_url()
+    return active_embedding_provider(), endpoint, active_embedding_model_name()
+
+
 _QUERY_EMBEDDINGS: OrderedDict = OrderedDict()
 _QUERY_INFLIGHT: dict = {}
 _READINESS_CACHE: dict = {}
 
 
 async def query_embedding_for_search(query: str) -> list[float]:
-    key = (active_embedding_model_name(), id(request_embedding), query)
+    key = (embedding_runtime_identity(), id(request_embedding), query)
     cached = _QUERY_EMBEDDINGS.get(key)
     if cached and time.monotonic() - cached[0] < 300:
         _QUERY_EMBEDDINGS.move_to_end(key)
@@ -849,7 +857,7 @@ async def check_ollama_generation_readiness() -> tuple[bool, str]:
 
 
 async def check_embedding_readiness() -> tuple[bool, str]:
-    key = (active_embedding_model_name(), id(request_embedding), id(_probe_embedding_readiness))
+    key = (embedding_runtime_identity(), id(request_embedding), id(_probe_embedding_readiness))
     return await _cached_readiness("embedding", key, _probe_embedding_readiness)
 
 
@@ -3705,12 +3713,16 @@ async def get_material_extracted(material_id: str, limit: int = Query(200, ge=1,
 @router.get("/ai/status")
 async def get_ai_status():
     init_repository_db()
-    (is_chat_available, chat_status_detail), (is_embedding_available, embedding_status_detail) = await asyncio.gather(
-        check_ollama_generation_readiness(), check_embedding_readiness())
+    (is_chat_available, chat_status_detail), (is_embedding_available, embedding_status_detail), ocr_runtime = await asyncio.gather(
+        check_ollama_generation_readiness(), check_embedding_readiness(), local_ocr_runtime())
     ollama_base_url = effective_ollama_base_url()
     embedding_model_name = active_embedding_model_name()
     with get_connection() as con:
         coverage = embedding_coverage(con)
+    vision_diagnostics = image_description_diagnostics()
+    provider_label = "Ollama Cloud" if ollama_provider_name() == "ollama-cloud" else "Ollama"
+    vision_configured = bool(ollama_base_url and OLLAMA_VISION_MODEL and (
+        not ollama_base_requires_auth(ollama_base_url) or OLLAMA_REPOSITORY_API_KEY))
 
     return {
         # Keep provider_configured true when generation works so the existing frontend
@@ -3726,17 +3738,27 @@ async def get_ai_status():
         "embedding_model": embedding_model_name,
         "chat_model": OLLAMA_RETRIEVAL_MODEL,
         "vision_model": OLLAMA_VISION_MODEL,
-        "vision_diagnostics": image_description_diagnostics(),
+        "vision_diagnostics": vision_diagnostics,
+        "services": service_capabilities(
+            generation_configured=ai_chat_configured(), generation_ready=is_chat_available,
+            generation_detail=chat_status_detail, generation_provider=ollama_provider_name(),
+            generation_model=OLLAMA_RETRIEVAL_MODEL,
+            embedding_configured=ai_embedding_configured(), embedding_ready=is_embedding_available,
+            embedding_detail=embedding_status_detail, embedding_provider=active_embedding_provider(),
+            embedding_model=embedding_model_name, vision_configured=vision_configured,
+            vision_model=OLLAMA_VISION_MODEL, vision_failure=vision_diagnostics["provider_failure"],
+            ocr_runtime=ocr_runtime),
         **coverage,
         "readiness_cache_seconds": 60,
+        "failed_readiness_cache_seconds": 10,
         "coverage_note": "Current full-coverage span indexes only; legacy truncated vectors remain searchable while reindexing.",
         "default_mode": "evidence_only",
         "status_message": (
-            "Ollama Cloud generation and embeddings are ready."
+            f"{provider_label} generation and {active_embedding_provider()} embeddings are ready."
             if is_chat_available and is_embedding_available
-            else "Ollama Cloud generation is ready. Assisted review can use keyword matching; semantic and image similarity are unavailable."
+            else f"{provider_label} generation is ready. Assisted review can use keyword matching; semantic and image similarity are unavailable."
             if is_chat_available
-            else "Ollama Cloud generation is not ready. Exact search and observations still work."
+            else f"{provider_label} generation is not ready. Exact search and observations still work."
         ),
         "status_detail": chat_status_detail,
         "chat_status_detail": chat_status_detail,
@@ -3745,11 +3767,13 @@ async def get_ai_status():
 
 @router.post("/ai/index")
 async def build_semantic_index(payload: BuildSemanticIndexRequest):
-    if not await ollama_available():
+    is_ready, detail = await check_embedding_readiness()
+    if not is_ready:
         return {
             "provider_configured": False,
             "indexed_count": 0,
-            "message": ollama_status_message(),
+            "message": embedding_status_message(),
+            "status_detail": detail,
         }
     with get_connection() as con:
         if payload.material_id:
@@ -3765,12 +3789,14 @@ async def build_semantic_index(payload: BuildSemanticIndexRequest):
 
 @router.post("/ai/image-index")
 async def build_image_index(payload: BuildSemanticIndexRequest):
-    if not await ollama_available():
+    is_ready, detail = await check_embedding_readiness()
+    if not is_ready:
         return {
             "provider_configured": False,
             "indexed_count": 0,
             "captioned_count": 0,
-            "message": ollama_status_message(),
+            "message": embedding_status_message(),
+            "status_detail": detail,
         }
     with get_connection() as con:
         if payload.material_id:

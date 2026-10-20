@@ -2,6 +2,8 @@
 
 Reviewed 18 October 2026 (Japan time). This document distinguishes verified current behavior, the small fixes in this change, and proposed work. The proposed unified pipeline is not implemented by this change.
 
+**21 October follow-up:** independent service readiness, optional embedding-free image preparation and the concrete GPU hosting rollout are documented in [Minpaku model services](minpaku-model-services.md). The inventory below is the original audit baseline, not today's live coverage.
+
 **Implementation follow-up, 19 October:** this is the original production audit, retained as a baseline. The isolated `codex/document-processing-poc` branch implements the shared representation and preparation worker. See [implementation and acceptance status](document-preparation-poc.md), [graph recovery](graph-pipeline-recovery.md), and [indexing/search](indexing-and-search.md). The staging POC includes all four Watanabe papers; the production inventory below is not a current staging result.
 
 ## Findings that determine the next work

@@ -28,6 +28,59 @@ class PreparationJobTests(unittest.TestCase):
         self.assertEqual(first["input_hash"], second["input_hash"])
         self.assertNotEqual(first["job_id"], scheduler.enqueue("fixture", force=True)["job_id"])
 
+    def test_stage_selection_preserves_dependency_order_and_default_identity(self):
+        scheduler = ProcessingScheduler(self.root)
+        ordered = scheduler.enqueue("fixture", ("extract", "graph", "text_index", "image_index"))
+        repeated = scheduler.enqueue("fixture", ("image_index", "text_index", "extract", "graph", "extract"))
+        self.assertEqual(ordered["job_id"], repeated["job_id"])
+        self.assertEqual(ordered["job_id"], scheduler.enqueue("fixture")["job_id"])
+        describe = scheduler.enqueue("fixture", ("graph", "image_describe", "extract"))
+        self.assertEqual(describe["stages"], ["extract", "image_describe", "graph"])
+
+    def test_image_description_stage_does_not_require_embeddings(self):
+        scheduler = ProcessingScheduler(self.root)
+        job = scheduler.enqueue("fixture", ("image_describe",))
+        result = {"processed_image_count": 1, "captioned_count": 1, "ocr_count": 1,
+                  "pending_count": 0, "outcomes": [{"id": "image", "status": "complete"}]}
+        operation = AsyncMock(return_value=result)
+        with patch("app.api.repository.ai_embedding_configured", side_effect=AssertionError("Embedding gate reached")), \
+                patch("app.api.repository.get_connection", return_value=MagicMock()), \
+                patch("app.repository.image_preparation.prepare_images", operation):
+            asyncio.run(scheduler.process(job["job_id"]))
+        final = scheduler.get(job["job_id"])
+        self.assertEqual(final["status"], "done")
+        self.assertEqual(final["stage_progress"]["image_describe"]["captioned_count"], 1)
+        self.assertIn("image_describe", final["completed_stages"])
+
+    def test_description_failure_preserves_progress_and_processes_other_images(self):
+        scheduler = ProcessingScheduler(self.root)
+        job = scheduler.enqueue("fixture", ("image_describe",))
+        operation = AsyncMock(side_effect=[
+            {"processed_image_count": 1, "ocr_count": 1, "captioned_count": 0, "pending_count": 2,
+             "outcomes": [{"id": "bad", "status": "failed", "retryable": False,
+                           "http_status": 404, "error_category": "provider_http_error"}]},
+            {"processed_image_count": 1, "ocr_count": 1, "captioned_count": 1, "pending_count": 1,
+             "outcomes": [{"id": "healthy", "status": "complete"}]},
+            {"processed_image_count": 0, "pending_count": 1, "outcomes": []},
+        ])
+        with patch("app.api.repository.get_connection", return_value=MagicMock()), \
+                patch("app.repository.image_preparation.prepare_images", operation):
+            with self.assertRaises(ProcessingStageError) as caught:
+                asyncio.run(scheduler.run_stage("image_describe", job))
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(operation.await_count, 3)
+        self.assertEqual(operation.await_args_list[1].kwargs["skip_ids"], {"bad"})
+        self.assertEqual(operation.await_args_list[2].kwargs["skip_ids"], {"bad", "healthy"})
+        progress = scheduler.get(job["job_id"])["stage_progress"]["image_describe"]
+        self.assertEqual(progress["processed_image_count"], 2)
+        self.assertEqual(progress["ocr_count"], 2)
+        self.assertEqual(progress["captioned_count"], 1)
+        self.assertEqual(progress["failed_ids"], ["bad"])
+        scheduler.update(job["job_id"], status="error")
+        with patch("app.api.repository.clear_image_description_failure_guard") as clear:
+            scheduler.retry(job["job_id"])
+        clear.assert_called_once()
+
     def test_checkpoint_survives_failure_and_new_scheduler(self):
         calls = []
 
@@ -258,6 +311,32 @@ class PreparationJobTests(unittest.TestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await task
             self.assertEqual(scheduler.get(job["job_id"])["status"], "queued")
+        asyncio.run(scenario())
+
+    def test_discovery_failure_does_not_stop_existing_queue(self):
+        async def scenario():
+            processed = asyncio.Event()
+
+            async def runner(stage, job):
+                processed.set()
+                return {"synthetic": True}
+
+            scheduler = ProcessingScheduler(self.root, stage_runner=runner)
+            job = scheduler.enqueue("fixture", ("extract",))
+            with patch.object(scheduler, "bootstrap", side_effect=RuntimeError("database temporarily locked")):
+                scheduler.start()
+                try:
+                    await asyncio.wait_for(processed.wait(), timeout=2)
+                    # The stage event fires before the final checkpoint is saved.
+                    async def wait_for_checkpoint():
+                        while scheduler.get(job["job_id"])["status"] != "done":
+                            await asyncio.sleep(0)
+                    await asyncio.wait_for(wait_for_checkpoint(), timeout=2)
+                    self.assertFalse(scheduler._task.done())
+                    self.assertEqual(scheduler.get(job["job_id"])["status"], "done")
+                finally:
+                    await scheduler.stop()
+
         asyncio.run(scenario())
 
     def test_invalid_job_id_cannot_escape_storage(self):

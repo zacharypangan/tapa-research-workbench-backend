@@ -18,6 +18,7 @@ import uuid
 LOG = logging.getLogger(__name__)
 PIPELINE_VERSION = "document-preparation-v1"
 STAGES = ("extract", "graph", "text_index", "image_index")
+SUPPORTED_STAGES = ("extract", "image_describe", "graph", "text_index", "image_index")
 _scheduler = None
 
 
@@ -118,8 +119,11 @@ class ProcessingScheduler:
 
     def enqueue(self, material_id, stages=STAGES, force=False):
         from app.api import repository
-        if not stages or any(stage not in STAGES for stage in stages):
-            raise ValueError("Choose extract, graph, text_index or image_index stages")
+        if not stages or any(stage not in SUPPORTED_STAGES for stage in stages):
+            raise ValueError("Choose extract, image_describe, graph, text_index or image_index stages")
+        # Preparation dependencies have one order even when the caller selects
+        # stages in a different order or repeats one in an API request.
+        stages = tuple(stage for stage in SUPPORTED_STAGES if stage in stages)
         inputs = material_inputs(material_id)
         from .document_representation import REPRESENTATION_VERSION, representation_signature
         from .knowledge_pipeline.processing import PROMPT_VERSION
@@ -189,7 +193,7 @@ class ProcessingScheduler:
             for child in job["child_job_ids"]:
                 if self.resolve(child)["status"] == "error":
                     self.retry(child)
-        elif "image_index" in job.get("stages", []):
+        elif {"image_describe", "image_index"}.intersection(job.get("stages", [])):
             from app.api.repository import clear_image_description_failure_guard
             clear_image_description_failure_guard()
         changes = {"completed_stages": {}} if job["status"] == "done" else {}
@@ -321,8 +325,10 @@ class ProcessingScheduler:
         return True
 
     async def work(self):
-        await asyncio.to_thread(self.bootstrap)
         semaphore = asyncio.Semaphore(self.workers)
+        bootstrapped = False
+        next_bootstrap = 0.0
+        loop = asyncio.get_running_loop()
 
         async def bounded(job):
             async with semaphore:
@@ -335,6 +341,16 @@ class ProcessingScheduler:
 
         while True:
             self._wake.clear()
+            if not bootstrapped and loop.time() >= next_bootstrap:
+                try:
+                    await asyncio.to_thread(self.bootstrap)
+                except Exception as exc:
+                    # A startup database lock must not stop the durable queue or
+                    # require an application restart to discover existing sources.
+                    LOG.warning("Preparation discovery will retry: error=%s", type(exc).__name__)
+                    next_bootstrap = loop.time() + 30
+                else:
+                    bootstrapped = True
             await asyncio.gather(*(bounded(job) for job in await asyncio.to_thread(self.pending)))
             try:
                 await asyncio.wait_for(self._wake.wait(), timeout=2)
@@ -349,6 +365,8 @@ class ProcessingScheduler:
             return await repo.extract_material_text(material_id, None,
                 ExtractRequest(include_links=bool(job["inputs"].get("source_url")), max_link_depth=0,
                                max_link_pages=1, max_segments=5000), force=True)
+        if stage == "image_describe":
+            return await self.describe_images(job)
         if stage == "graph":
             from .knowledge_pipeline.jobs import get_scheduler
             from .graph_generation_profiles import prepare_generation_config, GENERATION_PROFILE_VERSION
@@ -417,6 +435,54 @@ class ProcessingScheduler:
                 return {**result, "total_indexed_count": total}
             if result.get("indexed_count", 0) == 0 and result.get("skipped_count", 0) == 0 and not result.get("failed_count", 0):
                 raise RuntimeError(f"{stage}: processing made no progress; inspect item outcomes")
+        raise RuntimeError(f"{stage}: batch budget reached; successful checkpoints are preserved")
+
+    async def describe_images(self, job):
+        """Save OCR and descriptions independently of semantic vector providers."""
+        from app.api import repository as repo
+        from .image_preparation import prepare_images
+
+        stage = "image_describe"
+        previous = self.get(job["job_id"]).get("stage_progress", {}).get(stage, {})
+        counter_names = ("processed_image_count", "captioned_count", "ocr_count", "skipped_count")
+        totals = {name: previous.get(name, 0) for name in counter_names}
+        seen, failures = set(), {}
+        for batch in range(100):
+            with repo.get_connection() as connection:
+                result = await prepare_images(connection, material_id=job["material_id"], limit=200, skip_ids=set(seen))
+            outcomes = result.get("outcomes", [])
+            selected = {outcome["id"] for outcome in outcomes if outcome.get("id") is not None}
+            fresh = selected - seen
+            seen.update(selected)
+            for outcome in outcomes:
+                if outcome.get("status") == "failed":
+                    failures[outcome["id"]] = outcome
+            for name in counter_names:
+                totals[name] += result.get(name, 0)
+            errors = {}
+            for outcome in failures.values():
+                key = (outcome.get("error_category", "processing_error"), outcome.get("http_status"),
+                       outcome.get("retryable", True) is not False)
+                errors[key] = errors.get(key, 0) + 1
+            stage_progress = self.get(job["job_id"]).get("stage_progress", {})
+            stage_progress[stage] = {**totals, "failed_count": len(failures),
+                                     "failed_ids": sorted(failures, key=str),
+                                     "pending_count": result.get("pending_count"), "batch": batch + 1,
+                                     "error_summary": [{"error_category": category, "http_status": status,
+                                                        "retryable": retryable, "count": count}
+                                                       for (category, status, retryable), count in errors.items()],
+                                     "last_outcomes": outcomes[-20:]}
+            self.update(job["job_id"], stage_progress=stage_progress)
+            with (self.root / (job["job_id"] + "." + stage + ".outcomes.jsonl")).open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"at": stamp(), "outcomes": outcomes}, ensure_ascii=False) + "\n")
+            if not result.get("pending_count", 0) or not fresh:
+                if failures:
+                    raise ProcessingStageError(
+                        f"{stage}: {len(failures)} image(s) need retry or correction; available OCR and descriptions were saved",
+                        retryable=any(outcome.get("retryable", True) is not False for outcome in failures.values()))
+                if result.get("pending_count", 0):
+                    raise RuntimeError(f"{stage}: processing made no progress; inspect item outcomes")
+                return {**result, **totals}
         raise RuntimeError(f"{stage}: batch budget reached; successful checkpoints are preserved")
 
 

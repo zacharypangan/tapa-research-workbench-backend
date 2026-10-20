@@ -55,3 +55,14 @@ class ProcessingApiTests(TestCase):
         self.assertEqual(result.json()["job_id"], original["job_id"])
         self.assertEqual(result.json()["stage_errors"], {})
         self.assertEqual(result.json()["status"], "queued")
+
+    def test_explicit_image_action_starts_fresh_job_and_clears_vision_guard(self):
+        with patch("app.api.repository.clear_image_description_failure_guard") as clear, \
+                patch.object(processing, "enqueue_material", side_effect=self.scheduler.enqueue):
+            first = self.client.post("/api/v1/repository/materials/fixture/process", json={"stages": ["image_describe"], "force": True})
+            self.scheduler.update(first.json()["job_id"], status="done")
+            second = self.client.post("/api/v1/repository/materials/fixture/process", json={"stages": ["image_describe"], "force": True})
+        self.assertEqual(second.status_code, 202)
+        self.assertNotEqual(first.json()["job_id"], second.json()["job_id"])
+        self.assertEqual(clear.call_count, 2)
+        self.assertEqual(second.json()["stages"], ["image_describe"])

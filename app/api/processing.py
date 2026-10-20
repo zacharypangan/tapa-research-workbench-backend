@@ -11,13 +11,16 @@ router = APIRouter(prefix="/repository", tags=["document-preparation"])
 
 
 class ProcessRequest(BaseModel):
-    stages: list[Literal["extract", "graph", "text_index", "image_index"]] = Field(default_factory=lambda: list(STAGES), min_length=1, max_length=4)
+    stages: list[Literal["extract", "image_describe", "graph", "text_index", "image_index"]] = Field(default_factory=lambda: list(STAGES), min_length=1, max_length=5)
     force: bool = False
 
 
 @router.post("/materials/{material_id}/process", status_code=202)
 async def process_material(material_id: str, payload: ProcessRequest):
     try:
+        if payload.force and "image_describe" in payload.stages:
+            from app.api.repository import clear_image_description_failure_guard
+            clear_image_description_failure_guard()
         return await run_in_threadpool(enqueue_material, material_id, payload.stages, payload.force)
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(422, str(exc)) from exc
