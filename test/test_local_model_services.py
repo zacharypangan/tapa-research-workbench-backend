@@ -61,3 +61,11 @@ class LocalServiceTests(unittest.TestCase):
                 return {"message": {"content": "blue, not red"}}
             return fixture(path, payload)
         self.assertFalse(check.run_checks(wrong_color, "chat", "embed", "vision")["vision"]["ready"])
+
+    def test_truncated_response_cannot_pass_even_if_text_looks_valid(self):
+        def truncated(path, payload):
+            data = fixture(path, payload)
+            if path == "chat":
+                data["done_reason"] = "length"
+            return data
+        self.assertFalse(check.run_checks(truncated, "chat", "embed", "vision")["generation"]["ready"])

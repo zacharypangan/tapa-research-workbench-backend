@@ -55,7 +55,7 @@ def red_square():
 
 def message(data):
     value = data.get("message", {}).get("content")
-    if not isinstance(value, str) or not value.strip() or data.get("done") is False:
+    if not isinstance(value, str) or not value.strip() or data.get("done") is False or data.get("done_reason") == "length":
         raise ValueError("Missing or incomplete model answer")
     return value.strip()
 
@@ -119,7 +119,7 @@ def run_checks(client, chat_model, embedding_model, vision_model):
 
     def vision(model):
         payload = {"model": model, "stream": False, "think": False, "keep_alive": 0,
-                   "options": {"temperature": 0, "num_predict": 32, "num_ctx": 4096},
+                   "options": {"temperature": 0, "num_predict": 256, "num_ctx": 4096},
                    "messages": [{"role": "user", "content": "What is the dominant color? Return just the color name in English.", "images": [red_square()]}]}
         if message(client("chat", payload)).lower().strip(' .\"\n') != "red":
             raise ValueError("Vision color fixture failed")

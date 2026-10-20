@@ -2,7 +2,7 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.db import init_db
-from app.api import tiles, chat, data, repository, research_runs, processing, translations, graph_networks
+from app.api import tiles, chat, data, repository, research_runs, processing, translations, graph_networks, model_tasks
 from app.repository.knowledge_pipeline.jobs import get_scheduler
 from app.repository.processing_jobs import get_processing_scheduler
 from app.repository.translations import get_translation_scheduler
@@ -41,6 +41,7 @@ app.include_router(research_runs.router, prefix="/api/v1")
 app.include_router(processing.router, prefix="/api/v1")
 app.include_router(translations.router, prefix="/api/v1")
 app.include_router(graph_networks.router, prefix="/api/v1")
+app.include_router(model_tasks.router, prefix="/api/v1")
 
 
 @app.on_event("startup")

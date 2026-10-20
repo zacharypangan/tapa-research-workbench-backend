@@ -1,0 +1,10 @@
+{
+  "version": "0.40.6",
+  "checked_on": "2026-10-21",
+  "release_url": "https://github.com/ollama/ollama/releases/tag/v0.40.6",
+  "archive_url": "https://github.com/ollama/ollama/releases/download/v0.40.6/ollama-linux-amd64.tar.zst",
+  "archive_size": 1438364593,
+  "archive_sha256": "c164ab8b1b28e2a247c29719b8e404c423c5b83ae64c3ab4e59d50c7ff7fc5e0",
+  "budget_bytes": 25000000000,
+  "models": ["qwen3:8b", "qwen3-vl:8b-instruct", "qwen3-embedding:0.6b"]
+}

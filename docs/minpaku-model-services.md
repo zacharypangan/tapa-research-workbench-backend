@@ -28,10 +28,12 @@ evidence of GPU computation, not a deployed inference service. The setup uses
 individual users and Slurm allocations. Shared-tools administrator installation
 was left pending; the GPU notebook allocation has a two-hour limit.
 
-A new read-only `ssh stl_workstation` attempt on 21 October stopped at the saved
-VPN proxy: the Minpaku VPN DNS route was missing. No host configuration, keys,
-accounts or model installation were changed. Current free VRAM, disk space,
-runtime installation and network egress remain unverified until reconnection.
+After the user restored VPN/SSH access, live Slurm inspection verified an RTX
+5090 (32 GB VRAM), available storage and outbound model downloads. The approved
+isolated Ollama 0.40.6 installation now passes all five synthetic checks,
+including observed GPU use. Text, instruction vision and embedding model
+digests are archived with the evaluation reports. Real-document acceptance and
+hosted transport are separate checks; see the pilot runbook below.
 
 Production checks on the same date returned HTTP 200 for application, search,
 graph capabilities and AI status. The small text-generation and embedding
@@ -77,8 +79,10 @@ from production. No automatic production model-setting change is included here.
   generation, schema-shaped exact-quote extraction, Chinese/Japanese translation,
   finite same-dimension embedding batches, and image input. It installs nothing.
 
-No dependencies, database schema, credentials, environment files or deployment
-configuration are changed. Hash-pinned graph/translation/representation modules
+The initial status/image-stage patch changed no dependencies or schema. The
+subsequently approved Minpaku pilot adds dedicated staging worker authentication
+and staging provider configuration; production routing stays unchanged.
+Hash-pinned graph/translation/representation modules
 remain unchanged, so existing evidence and completed translations are preserved.
 
 ### Staging proof and remaining document failures
@@ -112,9 +116,11 @@ flowchart TD
   DRAFT --> REVIEW[Researcher review and immutable release]
 ```
 
-The outbound leased-task transport in this diagram is the proposed next phase;
-it is **not implemented or deployed by the status/image-stage patch**. The current
-durable workers run beside the API and use its local storage. Do not mount or
+The outbound leased-task transport is now implemented as a separately approved
+staging bridge with private tokens, request hashes, deadlines and renewable
+leases. Its focused tests cover failure recovery and result replay. Deployment
+and actual-document results must be recorded separately from these unit tests.
+The existing durable document workers run beside the API and use its local storage. Do not mount or
 copy a live SQLite database over the VPN, and do not run two independent queues
 that both believe they own the same job.
 
@@ -155,7 +161,7 @@ concurrency only after measuring peak VRAM and latency inside Slurm. An always-o
 GPU endpoint would monopolize the allocation and requires an administrator-
 approved reservation; the existing shared queue does not promise 24/7 service.
 
-## Concrete provisioning proposal — approval required, not executed
+## Approved provisioning and acceptance sequence
 
 1. Reconnect GlobalProtect and inspect `nvidia-smi`, available disk, Slurm limits,
    installed runtimes, reboot behavior and allowed outbound HTTPS. Reuse the
@@ -273,3 +279,13 @@ retrieval/graph needs justify the additional service.
 * [Qwen3 embedding 0.6B Ollama tag](https://ollama.com/library/qwen3-embedding:0.6b)
 * [Qwen3 multilingual embedding model card](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B)
 * [Slurm GPU resource allocation](https://slurm.schedmd.com/gres.html)
+
+
+## Replicable pilot implementation
+
+See [the Minpaku pilot runbook](../scripts/minpaku_pilot/README.md) for pinned
+runtime installation, Slurm lifecycle, model inventories, private worker setup,
+gateway limits, real-document evaluation, staging routing and rollback. The
+explicit `qwen3-vl:8b-instruct` tag replaces the thinking variant for the active
+pilot after thinking-only truncation was observed. No always-on availability
+or research accuracy is inferred from the synthetic checks.
