@@ -61,8 +61,13 @@ class GraphGenerationProfilesTest(unittest.TestCase):
         prepared = prepare_generation_config(config)
         validated = validate_config(config)
         self.assertEqual(config, before)
-        for key in ("processing", "augmentation", "research_topic"):
+        for key in ("augmentation", "research_topic"):
             self.assertEqual(prepared[key], validated[key])
+        self.assertEqual(prepared["processing"], {**validated["processing"], "batch_chars": 1500})
+        identity = prepared["ontology"]["extraction_guidance"]["candidate_provider"]
+        self.assertEqual(identity["method"], "staged_document_claims")
+        self.assertEqual(len(identity["code_sha256"]), 64)
+        self.assertTrue(identity["requires_review"])
         self.assertEqual(prepared["ontology"]["extraction_guidance"]["profile_version"], GENERATION_PROFILE_VERSION)
         self.assertEqual(prepare_generation_config(prepared), prepared)
         self.assertEqual(validate_config(prepared), prepared)

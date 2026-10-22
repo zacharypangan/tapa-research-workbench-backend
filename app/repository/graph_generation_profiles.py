@@ -12,7 +12,7 @@ from app.repository.knowledge_pipeline.processing import extraction_schema
 from app.repository.knowledge_pipeline.service import validate_config
 
 
-GENERATION_PROFILE_VERSION = "source-relationships/1"
+GENERATION_PROFILE_VERSION = "document-graph-staged/1"
 
 _INSTRUCTIONS = (
     "Review each supplied passage for explicitly named participants, activities, tools, "
@@ -79,6 +79,8 @@ def generation_ontology(ontology: dict) -> dict:
         "requires_researcher_review": True,
         "instructions": list(_INSTRUCTIONS),
     }
+    from .document_graph_runtime import candidate_identity, execution_identity
+    result["extraction_guidance"].update(candidate_provider=candidate_identity(), execution_identity=execution_identity())
     return result
 
 
@@ -91,4 +93,7 @@ def prepare_generation_config(config: dict) -> dict:
     result = copy.deepcopy(validate_config(copy.deepcopy(config)))
     if result["processing"]["mode"] == "ollama":
         result["ontology"] = generation_ontology(result["ontology"])
+        # The source pipeline preserves parent offsets when splitting; smaller
+        # batches bound multi-stage requests without silently dropping passages.
+        result["processing"]["batch_chars"] = min(result["processing"]["batch_chars"], 1500)
     return result

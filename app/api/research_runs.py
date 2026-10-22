@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from app.repository.knowledge_pipeline.jobs import get_scheduler
+from app.repository.document_graph_runtime import get_scheduler
 from app.repository.knowledge_pipeline.service import ResearchPipeline
 from app.repository.graph_generation_profiles import prepare_generation_config, generation_ontology, GENERATION_PROFILE_VERSION
 
@@ -185,6 +185,7 @@ def get_capabilities():
     configured = repository.ai_chat_configured()
     from app.repository.knowledge_pipeline.processing import provider_capabilities, PROMPT_VERSION
     from app.repository.knowledge_pipeline.ontologies import ONTOLOGY_TEMPLATES
+    from app.repository.document_graph_runtime import candidate_identity, execution_identity, pipeline_identity
     compatibility = provider_capabilities(repository.effective_ollama_base_url())
     collection_available = (find_spec("bs4") is not None and find_spec("httpx") is not None) or APPROVED_LOCAL_RUNTIME.is_file()
     return {
@@ -192,6 +193,9 @@ def get_capabilities():
         "can_review": True,
         "extraction": {
             "configured": configured,
+            "candidate_provider": candidate_identity(),
+            "execution_identity": execution_identity(),
+            "pipeline_implementation_sha256": pipeline_identity(),
             "processing_version": PROMPT_VERSION,
             "default_mode": "ollama" if configured else "manual",
             "modes": [{"id": "ollama", "label": "Extract concepts automatically", "available": configured},
@@ -221,6 +225,15 @@ def get_capabilities():
                      "awaiting_readable_documents": "Readable text needed", "awaiting_review": "Ready for review",
                      "released": "Published graph", "failed": "Needs attention", "queue_failed": "Queue unavailable"},
     }
+
+
+@router.get("/extraction-inventory/{material_id}")
+async def get_extraction_inventory(material_id: str):
+    from app.repository.document_graph_inventory import extraction_inventory
+    try:
+        return await run_in_threadpool(extraction_inventory, material_id)
+    except (ValueError, FileNotFoundError) as exc:
+        raise mapped_error(exc) from exc
 
 
 @router.get("/ontologies/{template_id}")

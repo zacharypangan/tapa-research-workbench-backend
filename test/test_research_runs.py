@@ -138,7 +138,8 @@ class ResearchRunApiTests(unittest.TestCase):
         config = read_json(self.scheduler.store.path(draft['run_id']) / 'inputs.json')['config']
         self.assertEqual(config['processing']['max_auto_batches'], 3)
         self.assertEqual(config['processing']['mode'], 'ollama')
-        self.assertEqual(config['ontology']['extraction_guidance']['profile_version'], 'source-relationships/1')
+        from app.repository.graph_generation_profiles import GENERATION_PROFILE_VERSION
+        self.assertEqual(config['ontology']['extraction_guidance']['profile_version'], GENERATION_PROFILE_VERSION)
         for name, data in before.items():
             self.assertEqual((path / name).read_bytes(), data)
 

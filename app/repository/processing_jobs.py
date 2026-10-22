@@ -132,6 +132,9 @@ class ProcessingScheduler:
         fingerprint = digest([inputs, PIPELINE_VERSION, REPRESENTATION_VERSION, representation_signature(), PROMPT_VERSION,
                               DESCRIPTION_VERSION, repository.OLLAMA_VISION_MODEL,
                               index_key, list(stages)])
+        if "graph" in stages:
+            from .document_graph_runtime import candidate_identity, execution_identity
+            fingerprint = digest([fingerprint, candidate_identity(), execution_identity()])
         job_id = str(uuid.uuid4()) if force else str(uuid.uuid5(uuid.NAMESPACE_URL, fingerprint))
         path = self.path(job_id)
         with lock(path.with_suffix(".state.lock")):
@@ -368,28 +371,33 @@ class ProcessingScheduler:
         if stage == "image_describe":
             return await self.describe_images(job)
         if stage == "graph":
-            from .knowledge_pipeline.jobs import get_scheduler
+            from .document_graph_runtime import get_scheduler
             from .graph_generation_profiles import prepare_generation_config, GENERATION_PROFILE_VERSION
             from .knowledge_pipeline.ontologies import ontology_template
-            from app.api.research_runs import DocumentRef, resolve_documents
+            from .knowledge_pipeline.registered_extraction import registered_documents
             with repo.get_connection() as connection:
                 material = dict(repo.ensure_material(connection, material_id))
-                files = connection.execute("SELECT * FROM files WHERE material_id=? ORDER BY id", (material_id,)).fetchall()
-            refs = [DocumentRef(material_id=material_id, file_id=row["id"]) for row in files
-                    if Path(row["original_filename"]).suffix.lower() in {".pdf", ".txt", ".md", ".json", ".docx"}]
-            if not refs:
-                return {"status": "skipped", "reason": "No supported graph documents"}
-            if len(refs) > 20:
+            from .document_graph_inventory import extraction_inventory
+            inventory = await asyncio.to_thread(extraction_inventory, material_id)
+            file_ids = [row["file_id"] for row in inventory["files"] if row["eligible"]]
+            if not file_ids:
+                return {"status": "skipped", "reason": "No registered readable graph documents", "inventory": inventory}
+            if len(file_ids) > 20:
                 return {"status": "blocked", "reason": "Select up to 20 files for a graph"}
-            documents = await asyncio.to_thread(resolve_documents, refs)
+            documents = await asyncio.to_thread(registered_documents, material_id, file_ids)
             config = prepare_generation_config({"ontology": ontology_template("general"),
                                       "research_topic": material.get("collection") or "documented research evidence",
                                       "processing": {"mode": "ollama" if repo.ai_chat_configured() else "manual",
-                                                     "max_auto_batches": 2},
+                                                     "batch_chars": 1500, "max_auto_batches": None},
                                       "augmentation": {"enabled": False}})
             scheduler = get_scheduler()
+            from .knowledge_pipeline.store import file_hash
+            snapshot_identity = [{"locator": document["locator"], "title": document.get("title"),
+                                  "sha256": file_hash(document["path"])} for document in documents]
+            graph_key = "auto-prepare:" + digest([job["input_hash"], GENERATION_PROFILE_VERSION,
+                                                  snapshot_identity, config])
             run = await asyncio.to_thread(scheduler.store.create, documents, config, "workbench-researcher",
-                                          "auto-prepare:" + job["input_hash"] + ":" + GENERATION_PROFILE_VERSION, material["title"])
+                                          graph_key, material["title"])
             if run["status"] == "created":
                 await asyncio.to_thread(scheduler.enqueue, run["run_id"])
                 scheduler.wake()
