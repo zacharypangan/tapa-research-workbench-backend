@@ -30,6 +30,47 @@ semantic completeness still need evaluation.
 The backend code must be deployed before the CLI is used. Existing service
 settings and database schema remain sufficient.
 
+## Where execution lives
+
+Railway hosts the API and durable graph scheduler on its existing persistent
+volume. API startup discovers queued or interrupted `.job.json` records; saved
+batch checkpoints prevent completed work from being repeated. A per-run
+execution lock prevents two consumers from processing the same run on shared
+storage. The CLI may run on a researcher's computer or another administration
+host: it submits and monitors server jobs rather than performing extraction.
+Closing it does not cancel an accepted hosted job. Availability failures and
+validation stops still require explicit attention or resumption.
+
+Inference goes to the backend's configured provider. The current production
+rollout uses Ollama Cloud; installing this script does not redirect production
+to Minpaku. A configured, available Minpaku worker can handle inference through
+the existing worker bridge. Model stages run sequentially within a passage,
+while the graph scheduler has two consumers **per API process**. Translation,
+OCR and other processing schedulers have their own work, so two graph consumers
+are not a global server or GPU concurrency cap. Additional API replicas would
+also add consumers. The Minpaku pilot currently enforces unloading after each
+request (`keep_alive=0`); keeping a model warm across stages needs a separately
+reviewed resource policy before high-throughput self-hosting.
+
+Before each staged passage, the runtime checks free space on the checkpoint
+volume against a conservative allowance:
+
+`max(128 MiB, 2 jobs × max_calls × (4 × response_bytes + 2 × prompt_bytes) + 16 MiB)`
+
+The fourfold response allowance covers the persisted provider envelope and
+parsed stage response, with a twofold allowance for pretty-printed JSON. Request
+audits receive their own allowance. Stage responses are capped at 128 KiB;
+larger responses are explicitly rejected before their bodies enter saved audits.
+With current limits, the 128 MiB minimum applies before starting another
+passage. The check adapts to the provider's
+versioned call/response limits and leaves existing checkpoints available when it
+stops. It is an admission check, **not a disk reservation or safety guarantee**:
+other services, replicas, atomic rewrites and unusually expansive JSON can still
+fill a shared volume. Full-library processing has no aggregate storage or model
+call budget; monitor actual volume use and reported failures throughout a
+backfill. This check does not expand the user's storage allocation or remove
+audit artifacts.
+
 ## Backfill command
 
 `scripts/reprocess_document_graphs.py` applies the deployed staged document-claim

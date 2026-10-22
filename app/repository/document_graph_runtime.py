@@ -10,6 +10,18 @@ from app.repository.knowledge_pipeline import jobs
 from app.repository.knowledge_pipeline.store import digest
 
 
+def checkpoint_headroom_bytes():
+    """Conservative admission allowance, not a reservation on shared storage."""
+    from .document_graph_candidates import LIMITS
+    # Each stage saves its provider envelope and parsed response in the attempt
+    # audit. Allow twice their compact size for pretty JSON, plus request JSON.
+    # Two jobs can already be in flight in this API process. Other processes,
+    # services and unusually expansive JSON can still consume this allowance.
+    per_batch = LIMITS["max_calls"] * (
+        4 * LIMITS["response_bytes"] + 2 * LIMITS["prompt_bytes"])
+    return max(128 * 1024 * 1024, 2 * per_batch + 16 * 1024 * 1024)
+
+
 def candidate_identity():
     from .document_graph_candidates import profile_identity
     identity = profile_identity()
@@ -58,7 +70,7 @@ def configured_pipeline(store):
         from app.api import repository
         from .document_graph_candidates import provider as staged_provider
         storage = Path(repository.STORAGE_ROOT)
-        if storage.is_dir() and shutil.disk_usage(storage).free < 16 * 1024 * 1024:
+        if storage.is_dir() and shutil.disk_usage(storage).free < checkpoint_headroom_bytes():
             raise OSError(errno.ENOSPC, "Graph processing paused because checkpoint storage is low")
         result = await staged_provider(units, ontology, repository.effective_ollama_base_url(),
                                        repository.OLLAMA_RETRIEVAL_MODEL, repository.ollama_headers())

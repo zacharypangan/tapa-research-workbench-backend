@@ -350,6 +350,32 @@ class DocumentGraphCandidatesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured[0]["options"]["num_predict"], 4096)
         self.assertEqual(result["provider_metadata"]["request_policy"]["thinking"], "low")
 
+    async def test_response_byte_limit_rejects_oversize_before_retaining_body(self):
+        envelope = {"model": "test-model", "done": True,
+                    "message": {"content": '{"mentions":[],"complete":true}'}, "padding": ""}
+        prefix = json.dumps(envelope, separators=(",", ":")).encode()
+        limit = candidates.LIMITS["response_bytes"]
+        self.assertEqual(limit, 128 * 1024)
+        for extra in (0, 1):
+            with self.subTest(bytes=limit + extra):
+                envelope["padding"] = "x" * (limit + extra - len(prefix))
+                content = json.dumps(envelope, separators=(",", ":")).encode()
+                self.assertEqual(len(content), limit + extra)
+                def handler(request):
+                    return httpx.Response(200, content=content)
+                result = await candidates.provider([unit()], ONTOLOGY, "https://ollama.com", "test-model",
+                                                   transport=httpx.MockTransport(handler))
+                attempt = result["provider_attempts"][0]
+                if extra:
+                    self.assertEqual(attempt["failure_category"], "provider_response_too_large")
+                    self.assertNotIn("provider_response", attempt)
+                    self.assertNotIn("stage_response", attempt)
+                    self.assertTrue(any("provider_response_too_large" in item["reason"]
+                                        for item in result["rejections"]))
+                else:
+                    self.assertIn("provider_response", attempt)
+                    self.assertEqual(result["rejections"], [])
+
     async def test_gateway_model_digest_and_policy_audit_are_preserved(self):
         digest = "sha256:" + "a" * 64
         def handler(request):

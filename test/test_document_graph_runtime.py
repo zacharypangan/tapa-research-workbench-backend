@@ -110,13 +110,34 @@ class DocumentGraphRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await configured.provider(self.units, self.ontology())
         self.staged_provider.assert_awaited_once()
 
-    async def test_low_storage_stops_inference_before_a_checkpoint_cannot_be_saved(self):
+    async def test_storage_above_old_guard_but_below_batch_headroom_stops_inference(self):
         configured = runtime.configured_pipeline(self.store)
         with tempfile.TemporaryDirectory() as directory, patch.object(repository, "STORAGE_ROOT", directory), \
-                patch.object(runtime.shutil, "disk_usage", return_value=SimpleNamespace(free=1024)):
+                patch.object(runtime.shutil, "disk_usage", return_value=SimpleNamespace(free=64 * 1024 * 1024)):
             with self.assertRaisesRegex(OSError, "checkpoint storage is low"):
                 await configured.provider(self.units, self.ontology())
         self.staged_provider.assert_not_awaited()
+
+    async def test_storage_headroom_boundary_prevents_model_call_below_but_allows_at_limit(self):
+        configured = runtime.configured_pipeline(self.store)
+        required = runtime.checkpoint_headroom_bytes()
+        with tempfile.TemporaryDirectory() as directory, patch.object(repository, "STORAGE_ROOT", directory), \
+                patch.object(runtime.shutil, "disk_usage") as usage:
+            usage.return_value = SimpleNamespace(free=required - 1)
+            with self.assertRaisesRegex(OSError, "checkpoint storage is low"):
+                await configured.provider(self.units, self.ontology())
+            self.staged_provider.assert_not_awaited()
+            usage.return_value = SimpleNamespace(free=required)
+            self.assertEqual(await configured.provider(self.units, self.ontology()), {"staged": True})
+        self.staged_provider.assert_awaited_once()
+
+    def test_storage_headroom_tracks_call_and_response_limits_with_minimum_floor(self):
+        with patch.dict(candidates.LIMITS, {"max_calls": 20, "response_bytes": 2 * 1024 * 1024,
+                                           "prompt_bytes": 11000}):
+            self.assertEqual(runtime.checkpoint_headroom_bytes(),
+                             2 * 20 * (4 * 2 * 1024 * 1024 + 2 * 11000) + 16 * 1024 * 1024)
+        with patch.dict(candidates.LIMITS, {"max_calls": 1, "response_bytes": 1, "prompt_bytes": 1}):
+            self.assertEqual(runtime.checkpoint_headroom_bytes(), 128 * 1024 * 1024)
 
     async def test_equivalent_trailing_slash_does_not_change_provider_identity(self):
         ontology = self.ontology()
