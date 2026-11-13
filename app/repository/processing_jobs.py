@@ -368,8 +368,7 @@ class ProcessingScheduler:
         if stage == "image_describe":
             return await self.describe_images(job)
         if stage == "graph":
-            from .knowledge_pipeline.jobs import get_scheduler
-            from .graph_generation_profiles import prepare_generation_config, GENERATION_PROFILE_VERSION
+            from .graph_generation_profiles import get_scheduler, prepare_generation_config, GENERATION_PROFILE_VERSION, minpaku_graph_identity
             from .knowledge_pipeline.ontologies import ontology_template
             from app.api.research_runs import DocumentRef, resolve_documents
             with repo.get_connection() as connection:
@@ -388,8 +387,12 @@ class ProcessingScheduler:
                                                      "max_auto_batches": 2},
                                       "augmentation": {"enabled": False}})
             scheduler = get_scheduler()
+            key = "auto-prepare:" + job["input_hash"] + ":" + GENERATION_PROFILE_VERSION
+            route = minpaku_graph_identity()
+            if route:
+                key += ":" + digest(route)
             run = await asyncio.to_thread(scheduler.store.create, documents, config, "workbench-researcher",
-                                          "auto-prepare:" + job["input_hash"] + ":" + GENERATION_PROFILE_VERSION, material["title"])
+                                          key, material["title"])
             if run["status"] == "created":
                 await asyncio.to_thread(scheduler.enqueue, run["run_id"])
                 scheduler.wake()

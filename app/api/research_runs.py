@@ -10,9 +10,8 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from app.repository.knowledge_pipeline.jobs import get_scheduler
 from app.repository.knowledge_pipeline.service import ResearchPipeline
-from app.repository.graph_generation_profiles import prepare_generation_config, generation_ontology, GENERATION_PROFILE_VERSION
+from app.repository.graph_generation_profiles import prepare_generation_config, generation_ontology, GENERATION_PROFILE_VERSION, get_scheduler
 
 router = APIRouter(prefix="/research-runs", tags=["research-knowledge-graphs"])
 

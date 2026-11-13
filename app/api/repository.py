@@ -20,6 +20,7 @@ import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from app.repository import embedding_index, image_descriptions, lexical_search
+from app.repository.model_worker_readiness import MINPAKU_TEXT_MODEL, PRODUCTION_GATEWAY, WorkerReadiness, minpaku_text_readiness
 from app.repository.service_readiness import local_ocr_runtime, service_capabilities
 from app.repository.schemas import (
     AskCorpusRequest,
@@ -69,6 +70,10 @@ OLLAMA_REPOSITORY_API_KEY = os.getenv(
     "REPOSITORY_OLLAMA_API_KEY",
     os.getenv("OLLAMA_API_KEY", ""),
 ).strip()
+MINPAKU_TEXT_ENABLED = os.getenv("REPOSITORY_MINPAKU_TEXT_ENABLED", "").strip() == "1"
+MINPAKU_GATEWAY_TOKEN = os.getenv("MODEL_GATEWAY_TOKEN", "").strip()
+if MINPAKU_TEXT_ENABLED:
+    OLLAMA_RETRIEVAL_MODEL = MINPAKU_TEXT_MODEL
 
 EMBEDDING_PROVIDER = os.getenv(
     "REPOSITORY_EMBEDDING_PROVIDER",
@@ -92,7 +97,7 @@ GEMINI_API_BASE_URL = os.getenv(
 ).rstrip("/")
 
 
-def effective_ollama_base_url() -> str:
+def shared_ollama_base_url() -> str:
     if OLLAMA_REPOSITORY_BASE_URL:
         return OLLAMA_REPOSITORY_BASE_URL.rstrip("/")
     if OLLAMA_REPOSITORY_API_KEY:
@@ -100,20 +105,28 @@ def effective_ollama_base_url() -> str:
     return ""
 
 
+def effective_ollama_base_url() -> str:
+    """The text route; vision and Ollama embeddings retain their shared route."""
+    return PRODUCTION_GATEWAY if MINPAKU_TEXT_ENABLED else shared_ollama_base_url()
+
+
 def ollama_base_requires_auth(base_url: str) -> bool:
     host = urlparse(base_url).netloc.lower()
     return host.endswith("ollama.com")
 
 
-def ollama_headers() -> dict[str, str]:
+def _ollama_headers(api_key: str) -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
-    if OLLAMA_REPOSITORY_API_KEY:
-        headers["Authorization"] = f"Bearer {OLLAMA_REPOSITORY_API_KEY}"
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     return headers
 
 
-def ollama_endpoint(path: str) -> str:
-    base_url = effective_ollama_base_url()
+def ollama_headers() -> dict[str, str]:
+    return _ollama_headers(MINPAKU_GATEWAY_TOKEN if MINPAKU_TEXT_ENABLED else OLLAMA_REPOSITORY_API_KEY)
+
+
+def _ollama_endpoint(base_url: str, path: str) -> str:
     clean_path = path.lstrip("/")
     if clean_path.startswith("api/"):
         clean_path = clean_path[4:]
@@ -122,14 +135,25 @@ def ollama_endpoint(path: str) -> str:
     return f"{base_url}/api/{clean_path}"
 
 
-def ollama_provider_name() -> str:
-    base_url = effective_ollama_base_url()
+def ollama_endpoint(path: str) -> str:
+    return _ollama_endpoint(effective_ollama_base_url(), path)
+
+
+def _ollama_provider_name(base_url: str) -> str:
     if not base_url:
         return "ollama-cloud"
     return "ollama-cloud" if ollama_base_requires_auth(base_url) else "ollama"
 
 
+def ollama_provider_name() -> str:
+    return "minpaku" if MINPAKU_TEXT_ENABLED else _ollama_provider_name(effective_ollama_base_url())
+
+
 def ollama_status_message(is_available: bool = False) -> str:
+    if MINPAKU_TEXT_ENABLED:
+        if len(MINPAKU_GATEWAY_TOKEN) < 32:
+            return "Minpaku text routing requires a configured gateway credential."
+        return "Minpaku text worker is connected." if is_available else "Minpaku text worker is not reachable."
     base_url = effective_ollama_base_url()
     provider_label = "Ollama Cloud" if ollama_provider_name() == "ollama-cloud" else "Ollama"
     if not base_url:
@@ -161,7 +185,7 @@ def active_embedding_index_key() -> str:
 
 def embedding_runtime_identity() -> tuple:
     """Cache partition only; persisted vector/model identities remain unchanged."""
-    endpoint = GEMINI_API_BASE_URL if active_embedding_provider() == "gemini" else effective_ollama_base_url()
+    endpoint = GEMINI_API_BASE_URL if active_embedding_provider() == "gemini" else shared_ollama_base_url()
     return active_embedding_provider(), endpoint, active_embedding_model_name()
 
 
@@ -765,6 +789,8 @@ def get_related_observations_for_segments(
 
 
 def ai_chat_configured() -> bool:
+    if MINPAKU_TEXT_ENABLED:
+        return len(MINPAKU_GATEWAY_TOKEN) >= 32
     base_url = effective_ollama_base_url()
     return bool(
         base_url
@@ -778,7 +804,7 @@ def ai_embedding_configured() -> bool:
     if provider == "gemini":
         return bool(GEMINI_API_KEY and GEMINI_EMBEDDING_MODEL)
     if provider == "ollama":
-        base_url = effective_ollama_base_url()
+        base_url = shared_ollama_base_url()
         return bool(
             base_url
             and OLLAMA_EMBEDDING_MODEL
@@ -852,8 +878,31 @@ async def _cached_readiness(kind: str, key: tuple, probe) -> tuple[bool, str]:
 
 
 async def check_ollama_generation_readiness() -> tuple[bool, str]:
+    if MINPAKU_TEXT_ENABLED:
+        status = await check_minpaku_worker()
+        return status.verified, status.detail
     key = (effective_ollama_base_url(), OLLAMA_RETRIEVAL_MODEL, id(_probe_ollama_generation_readiness))
     return await _cached_readiness("generation", key, _probe_ollama_generation_readiness)
+
+
+async def check_minpaku_worker() -> WorkerReadiness:
+    if not ai_chat_configured():
+        return WorkerReadiness(False, False, ollama_status_message())
+    return await minpaku_text_readiness(ollama_headers())
+
+
+async def check_generation_admission() -> tuple[bool, str]:
+    if MINPAKU_TEXT_ENABLED:
+        status = await check_minpaku_worker()
+        return status.connected, status.detail
+    return await check_ollama_generation_readiness()
+
+
+async def _generation_service_status() -> WorkerReadiness:
+    if MINPAKU_TEXT_ENABLED:
+        return await check_minpaku_worker()
+    ready, detail = await check_ollama_generation_readiness()
+    return WorkerReadiness(ready, ready, detail)
 
 
 async def check_embedding_readiness() -> tuple[bool, str]:
@@ -875,8 +924,8 @@ async def request_ollama_embedding(text: str) -> list[float]:
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
-                ollama_endpoint("embed"),
-                headers=ollama_headers(),
+                _ollama_endpoint(shared_ollama_base_url(), "embed"),
+                headers=_ollama_headers(OLLAMA_REPOSITORY_API_KEY),
                 json={
                     "model": OLLAMA_EMBEDDING_MODEL,
                     "input": text,
@@ -1138,7 +1187,7 @@ _IMAGE_DESCRIPTION_CONTEXT_LIMIT = 1600
 
 
 def _image_description_guard_key():
-    return (STORAGE_ROOT, effective_ollama_base_url(), OLLAMA_VISION_MODEL, image_descriptions.PROMPT_VERSION)
+    return (STORAGE_ROOT, shared_ollama_base_url(), OLLAMA_VISION_MODEL, image_descriptions.PROMPT_VERSION)
 
 
 def clear_image_description_failure_guard():
@@ -1242,7 +1291,7 @@ async def _request_image_caption_uncached(image_path: str, context_text: str = "
         for attempt in range(2):
             item = {"at": now_iso(), "attempt": attempt + 1}
             try:
-                async with client.stream("POST", ollama_endpoint("chat"), headers=ollama_headers(), json={
+                async with client.stream("POST", _ollama_endpoint(shared_ollama_base_url(), "chat"), headers=_ollama_headers(OLLAMA_REPOSITORY_API_KEY), json={
                     "model": OLLAMA_VISION_MODEL, "messages": [{"role": "user", "content": prompt, "images": [encoded]}],
                     "stream": False, "options": {"temperature": 0.1, "num_predict": _IMAGE_DESCRIPTION_TOKEN_LIMIT}}) as response:
                     item["http_status"] = response.status_code
@@ -1328,7 +1377,7 @@ async def request_evidence_answer(question: str, evidence: list[dict]) -> str:
     )
 
     try:
-        async with httpx.AsyncClient(timeout=90.0) as client:
+        async with httpx.AsyncClient(timeout=90.0, follow_redirects=False) as client:
             response = await client.post(
                 ollama_endpoint("chat"),
                 headers=ollama_headers(),
@@ -1354,6 +1403,7 @@ async def request_evidence_answer(question: str, evidence: list[dict]) -> str:
         raise HTTPException(
             status_code=502,
             detail=(
+                "Minpaku text service is not reachable from the backend." if MINPAKU_TEXT_ENABLED else
                 "Ollama Cloud chat service is not reachable from the backend. "
                 "Check REPOSITORY_OLLAMA_BASE_URL, REPOSITORY_OLLAMA_API_KEY, "
                 f"and the `{OLLAMA_RETRIEVAL_MODEL}` model setting."
@@ -3713,9 +3763,10 @@ async def get_material_extracted(material_id: str, limit: int = Query(200, ge=1,
 @router.get("/ai/status")
 async def get_ai_status():
     init_repository_db()
-    (is_chat_available, chat_status_detail), (is_embedding_available, embedding_status_detail), ocr_runtime = await asyncio.gather(
-        check_ollama_generation_readiness(), check_embedding_readiness(), local_ocr_runtime())
-    ollama_base_url = effective_ollama_base_url()
+    generation, (is_embedding_available, embedding_status_detail), ocr_runtime = await asyncio.gather(
+        _generation_service_status(), check_embedding_readiness(), local_ocr_runtime())
+    is_chat_available, chat_status_detail = generation.connected, generation.detail
+    ollama_base_url = shared_ollama_base_url()
     embedding_model_name = active_embedding_model_name()
     with get_connection() as con:
         coverage = embedding_coverage(con)
@@ -3740,13 +3791,15 @@ async def get_ai_status():
         "vision_model": OLLAMA_VISION_MODEL,
         "vision_diagnostics": vision_diagnostics,
         "services": service_capabilities(
-            generation_configured=ai_chat_configured(), generation_ready=is_chat_available,
+            generation_configured=ai_chat_configured(), generation_ready=generation.verified,
+            generation_connected=generation.connected if MINPAKU_TEXT_ENABLED else None,
             generation_detail=chat_status_detail, generation_provider=ollama_provider_name(),
             generation_model=OLLAMA_RETRIEVAL_MODEL,
             embedding_configured=ai_embedding_configured(), embedding_ready=is_embedding_available,
             embedding_detail=embedding_status_detail, embedding_provider=active_embedding_provider(),
             embedding_model=embedding_model_name, vision_configured=vision_configured,
-            vision_model=OLLAMA_VISION_MODEL, vision_failure=vision_diagnostics["provider_failure"],
+            vision_model=OLLAMA_VISION_MODEL, vision_provider=_ollama_provider_name(ollama_base_url),
+            vision_failure=vision_diagnostics["provider_failure"],
             ocr_runtime=ocr_runtime),
         **coverage,
         "readiness_cache_seconds": 60,
@@ -3754,6 +3807,7 @@ async def get_ai_status():
         "coverage_note": "Current full-coverage span indexes only; legacy truncated vectors remain searchable while reindexing.",
         "default_mode": "evidence_only",
         "status_message": (
+            chat_status_detail if MINPAKU_TEXT_ENABLED else
             f"{provider_label} generation and {active_embedding_provider()} embeddings are ready."
             if is_chat_available and is_embedding_available
             else f"{provider_label} generation is ready. Assisted review can use keyword matching; semantic and image similarity are unavailable."
@@ -3839,7 +3893,7 @@ async def get_image_index_job(job_id: str):
 
 @router.post("/ai/semantic-search")
 async def semantic_search(payload: SemanticSearchRequest):
-    if not (await check_ollama_generation_readiness())[0]:
+    if not (await check_generation_admission())[0]:
         return {
             "query": payload.query,
             "mode": "semantic_evidence_search",
@@ -3847,7 +3901,7 @@ async def semantic_search(payload: SemanticSearchRequest):
             "results": [],
             "related_observations": [],
             "evidence_note": (
-                "Related-reference search is available when Ollama Cloud is configured and reachable."
+                "Related-reference search requires an available text model."
             ),
         }
 
@@ -3856,7 +3910,7 @@ async def semantic_search(payload: SemanticSearchRequest):
 
 @router.post("/ai/multimodal-search")
 async def multimodal_search(payload: MultimodalSearchRequest):
-    if not (await check_ollama_generation_readiness())[0]:
+    if not (await check_generation_admission())[0]:
         return {
             "query": payload.query,
             "mode": "multimodal_evidence_search",
@@ -3865,7 +3919,7 @@ async def multimodal_search(payload: MultimodalSearchRequest):
             "image_results": [],
             "related_observations": [],
             "evidence_note": (
-                "Text and image assisted review is available when Ollama Cloud is configured and reachable."
+                "Text and image assisted review requires an available text model."
             ),
         }
 
@@ -3898,7 +3952,7 @@ async def multimodal_search(payload: MultimodalSearchRequest):
 
 @router.post("/ai/ask")
 async def ask_corpus(payload: AskCorpusRequest):
-    generation_ready, generation_detail = await check_ollama_generation_readiness()
+    generation_ready, generation_detail = await check_generation_admission()
     if not generation_ready:
         raise HTTPException(status_code=503, detail="Answer generation is unavailable. Exact search remains available. " + generation_detail)
     semantic_payload = SemanticSearchRequest(
@@ -3957,14 +4011,14 @@ async def ask_corpus(payload: AskCorpusRequest):
 
 @router.post("/ai/evidence-report")
 async def generate_ai_evidence_report(payload: SemanticSearchRequest):
-    if not (await check_ollama_generation_readiness())[0]:
+    if not (await check_generation_admission())[0]:
         return {
             "query": payload.query,
             "provider_configured": False,
             "themes": [],
             "related_observations": [],
             "evidence_note": (
-                "Organized assisted review reports are available when Ollama Cloud is configured and reachable."
+                "Organized assisted review reports require an available text model."
             ),
         }
 

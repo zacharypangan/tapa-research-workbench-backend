@@ -6,10 +6,23 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from app.repository.translations import get_translation_scheduler
+from app.repository.translations import TranslationError, configured_model, get_translation_scheduler as shared_scheduler, translate_text
 from app.repository.processing_jobs import material_inputs
 
 router = APIRouter(prefix="/repository", tags=["document-translations"])
+
+
+async def translate_with_current_model(text, model):
+    if model != configured_model():
+        raise TranslationError("The translation model changed; retry to create a reading copy with the current model.", stop_job=True)
+    return await translate_text(text, model)
+
+
+def get_translation_scheduler():
+    scheduler = shared_scheduler()
+    if scheduler.provider is translate_text:
+        scheduler.provider = translate_with_current_model
+    return scheduler
 
 
 class TranslationRequest(BaseModel):
@@ -48,9 +61,19 @@ def translation_job(job_id: str):
 @router.post("/translation-jobs/{job_id}/retry", status_code=202)
 async def retry_translation(job_id: str):
     try:
-        return await run_in_threadpool(get_translation_scheduler().retry, job_id)
+        return await run_in_threadpool(retry_translation_job, job_id)
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(404, "Translation job or current source file not found.") from exc
+
+
+def retry_translation_job(job_id: str):
+    scheduler = get_translation_scheduler()
+    job = scheduler.get(job_id)
+    if job["status"] != "done" and job["model"] != configured_model():
+        # A new job has its own model fingerprint; completed units of the old
+        # copy stay under the model that generated them.
+        return scheduler.enqueue(job["material_id"], job.get("file_id"))
+    return scheduler.retry(job_id)
 
 
 @router.get("/translation-jobs/{job_id}/artifact")

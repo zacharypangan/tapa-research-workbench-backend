@@ -10,6 +10,7 @@ import copy
 
 from app.repository.knowledge_pipeline.processing import extraction_schema
 from app.repository.knowledge_pipeline.service import validate_config
+from app.repository.knowledge_pipeline.store import digest
 
 
 GENERATION_PROFILE_VERSION = "source-relationships/1"
@@ -91,4 +92,39 @@ def prepare_generation_config(config: dict) -> dict:
     result = copy.deepcopy(validate_config(copy.deepcopy(config)))
     if result["processing"]["mode"] == "ollama":
         result["ontology"] = generation_ontology(result["ontology"])
+        route = minpaku_graph_identity()
+        if route:
+            result["ontology"]["extraction_guidance"]["text_route"] = route
     return result
+
+
+def minpaku_graph_identity():
+    from app.api import repository
+    if repository.MINPAKU_TEXT_ENABLED:
+        return {"provider": "minpaku", "model": repository.OLLAMA_RETRIEVAL_MODEL,
+                "endpoint_sha256": digest(repository.effective_ollama_base_url())}
+    return None
+
+
+def configured_pipeline(store):
+    from app.repository.knowledge_pipeline.jobs import configured_pipeline as original
+    pipeline = original(store)
+    provider = pipeline.provider
+    if provider is None:
+        return pipeline
+
+    async def routed_provider(units, ontology):
+        if ontology.get("extraction_guidance", {}).get("text_route") != minpaku_graph_identity():
+            raise ValueError("Graph text routing changed. Start a new graph run to use the current model.")
+        return await provider(units, ontology)
+
+    pipeline.provider = routed_provider
+    return pipeline
+
+
+def get_scheduler():
+    from app.repository.knowledge_pipeline.jobs import configured_pipeline as original, get_scheduler as shared_scheduler
+    scheduler = shared_scheduler()
+    if scheduler.pipeline_factory is original:
+        scheduler.pipeline_factory = configured_pipeline
+    return scheduler

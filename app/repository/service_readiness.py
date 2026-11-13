@@ -62,6 +62,8 @@ def service_capabilities(*, generation_configured: bool, generation_ready: bool,
                          embedding_ready: bool, embedding_detail: str,
                          embedding_provider: str, embedding_model: str,
                          vision_configured: bool, vision_model: str,
+                         vision_provider: str | None = None,
+                         generation_connected: bool | None = None,
                          vision_failure: dict | None = None,
                          ocr_runtime: dict | None = None) -> dict:
     def probed(configured, ready, provider, model, detail):
@@ -72,13 +74,18 @@ def service_capabilities(*, generation_configured: bool, generation_ready: bool,
 
     generation = probed(generation_configured, generation_ready, generation_provider,
                         generation_model, generation_detail)
+    if generation_connected is not None:
+        generation["verification"] = "worker_metadata"
+        if generation_connected and not generation_ready:
+            generation.update(ready=None, state="unverified")
     embeddings = probed(embedding_configured, embedding_ready, embedding_provider,
                         embedding_model, embedding_detail)
     services = {"generation": generation, "embeddings": embeddings}
     for key, task in (("translation", "Document translation"),
                       ("graph_extraction", "Evidence-grounded graph extraction")):
-        services[key] = {**generation, "ready": None if generation_ready else False,
-                         "state": "unverified" if generation_ready else generation["state"],
+        dependency_available = generation_ready or generation_connected
+        services[key] = {**generation, "ready": None if dependency_available else False,
+                         "state": "unverified" if dependency_available else generation["state"],
                          "depends_on": ["generation"], "dependency_ready": generation_ready,
                          "verification": "generation_probe_only",
                          "detail": (f"{task} is implemented. The text model responds; an actual task and its output validation have not been tested by this health check."
@@ -87,7 +94,7 @@ def service_capabilities(*, generation_configured: bool, generation_ready: bool,
         "configured": vision_configured,
         "ready": False if vision_failure or not vision_configured else None,
         "state": "blocked" if vision_failure else "unverified" if vision_configured else "not_configured",
-        "provider": generation_provider, "model": vision_model,
+        "provider": vision_provider if vision_provider is not None else generation_provider, "model": vision_model,
         "verification": "cached_failure" if vision_failure else "configuration_only",
         "detail": (f"Recent image description requests failed: {vision_failure.get('error_category', 'provider failure')}"
                    + (f" (HTTP {vision_failure['http_status']})." if vision_failure.get("http_status") else ".")
